@@ -23,6 +23,10 @@ export const A_LOGIN_SAVE = 'login.save'
 export const A_LOGIN_LOGOUT = 'login.logout'
 export const A_FINANCE = 'finance'
 export const A_KOL = 'kol'
+// 今日盈亏（同花顺投资账本）：读快照 / 校验 Cookie / 写配置。宿主实现见 lib/pnl/。
+export const A_PNL_GET = 'pnl.get'
+export const A_PNL_VERIFY = 'pnl.verify'
+export const A_PNL_CONFIG = 'pnl.config'
 
 // 注：用具名 async 函数表达式（构建器只认 `export function|const|let|var|class` 开头的导出行）。
 export const call = async function (action, args) {

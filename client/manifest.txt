@@ -7,6 +7,7 @@ dom.js
 platform.js
 store/ui.js
 store/market.js
+store/pnl.js
 charts/setup.js
 charts/kline.js
 charts/minute.js
@@ -18,6 +19,7 @@ panel/detail.js
 panel/hot.js
 panel/search.js
 panel/news.js
+panel/pnl.js
 panel/index.js
 badge.js
 dock.js

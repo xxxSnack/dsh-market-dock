@@ -67,8 +67,9 @@ const KLC_PERIOD_MAP = {
 const HOT_MARKETS = [['cn', 'A股'], ['us', '美股'], ['hk', '港股'], ['global', '全球']]
 const HOT_MARKET_LABELS = { cn: 'A股', hk: '港股', us: '美股', global: '全球' }
 
-// ---- 面板 tab 条（key + 文案，顺序不变）----
-const PANEL_TABS = [['market', '行情'], ['hot', '热榜'], ['search', '搜索'], ['news', '快讯']]
+// ---- 面板 tab 条（key + 文案）----
+// 顺序：原有 4 项位置不动，盈亏（pnl）为**追加**的第 5 项（宿主 ui.get 的 tab 白名单同步放行）。
+const PANEL_TABS = [['market', '行情'], ['hot', '热榜'], ['search', '搜索'], ['news', '快讯'], ['pnl', '盈亏']]
 
 // ---- 请求规模参数（属于 call() 参数形状的一部分，与原字面量一致）----
 const NEWS_PAGE_SIZE = 20          // news count
@@ -104,6 +105,8 @@ const POLL_CONTENT_CLOSED_MS = 180000 // 面板：休市热榜/快讯
 const POLL_BADGE_MS = 30000           // 徽标
 const POLL_TICKER_MS = 30000          // 底部指数条
 const POLL_DOCK_SESSION_MS = 60000    // 面板头部交易时段文案重算
+// 今日盈亏：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
+const PNL_POLL_FALLBACK_MS = 60000
 
 // ---- 槽位 id 与 order（7 个注册逐一对应，注册顺序见 slots.js）----
 const SLOT_TOOLVIEW = 'tool.call.toolview'
@@ -246,6 +249,10 @@ const A_LOGIN_SAVE = 'login.save'
 const A_LOGIN_LOGOUT = 'login.logout'
 const A_FINANCE = 'finance'
 const A_KOL = 'kol'
+// 今日盈亏（同花顺投资账本）：读快照 / 校验 Cookie / 写配置。宿主实现见 lib/pnl/。
+const A_PNL_GET = 'pnl.get'
+const A_PNL_VERIFY = 'pnl.verify'
+const A_PNL_CONFIG = 'pnl.config'
 
 // 注：用具名 async 函数表达式（构建器只认 `export function|const|let|var|class` 开头的导出行）。
 const call = async function (action, args) {
@@ -386,6 +393,136 @@ function fetchIndices() { return call(A_QUOTE, { symbols: XQ_INDEX_SYMBOLS }) }
 
 // 自选列表（面板 refreshMarket、徽标主体）
 function fetchWatchlist() { return call(A_WATCHLIST_GET, {}) }
+
+// 今日盈亏共享状态：运行时持有者（与 store/ui.js 同构）+ **单一轮询器**。
+//
+// 为什么是「运行时持有者」而不是模块级单例：状态必须每次 apply 一份，模块级单例会在重新 apply
+// 时残留旧状态、多实例互相串数据。createPnlRuntime(ctx) 由 client/index.js 的 apply 重建。
+//
+// 为什么只有一个轮询器：头部 chip 与「盈亏」tab 展示的是**同一份**今日盈亏快照。若两边各轮一次，
+// 同一时刻会打两次同花顺上游（有风控，且两边数值可能不一致）。所以取数只发生在这里：
+// 订阅者只读 getState()，轮询由引用计数驱动 —— 第一个订阅者启动、最后一个退订停止。
+//
+// 轮询节奏**由宿主决定**（pnl.get 回传 next_poll_ms）：盘中是心跳，盘外是「睡到下一个 09:30/15:00」。
+// 因此非交易时段界面自然冻结在最后一次的值，客户端不需要自己判断交易时段。
+
+// 当前 apply 的运行时（每次 apply 一份）；组件渲染时经 getPnlRuntime() 取。
+let pnlRuntime = null
+
+function getPnlRuntime() { return pnlRuntime }
+
+function createPnlRuntime(ctx) {
+  const listeners = []
+
+  // 定时器句柄归一化：ctx.timeout 可能返回 stop 函数，也可能返回带 dispose() 的对象。
+  function disposer(handle) {
+    if (!handle) return null
+    if (typeof handle === 'function') return handle
+    if (typeof handle.dispose === 'function') return function () { handle.dispose() }
+    return null
+  }
+
+  // 宿主给的节奏不可信时（缺字段 / 过密）一律回退 60s：宁可慢，也不能把上游打穿。
+  function hostDelay(data) {
+    const ms = Number(data && data.next_poll_ms)
+    if (!isFinite(ms) || ms < 5000) return PNL_POLL_FALLBACK_MS
+    return ms
+  }
+
+  const rt = {
+    ctx: ctx,
+    data: null,                    // 最近一次 pnl.get 的返回对象
+    status: 'idle',                // 'idle' | 'loading' | 'ready' | 'error'
+    error: '',
+    listeners: listeners,
+    timer: null,                   // 当前排定的下一次轮询（归一化后的 stop 函数）
+    inflight: null,                // 并发去重：多处同时触发时复用同一个 promise
+    refs: 0,                       // 订阅者引用计数
+    active: false,
+    delay: PNL_POLL_FALLBACK_MS,   // 上次排定的间隔（页面隐藏时按它重排，不会排出更密的节奏）
+
+    subscribe: function (fn) {
+      listeners.push(fn)
+      rt.start()
+      return function () {
+        const i = listeners.indexOf(fn)
+        if (i !== -1) listeners.splice(i, 1)
+        rt.stop()
+      }
+    },
+
+    // 每次返回**新对象**：组件用 useState 存它时靠引用比较判断是否变化。
+    getState: function () {
+      return { data: rt.data, status: rt.status, error: rt.error }
+    },
+
+    notify: function () {
+      const fns = listeners.slice()
+      for (let i = 0; i < fns.length; i++) {
+        try { fns[i]() } catch (e) { /* 单个订阅者抛错不影响其他订阅者 */ }
+      }
+    },
+
+    // force=true 透传给宿主：跳过它的时段缓存判定、立刻打一次上游（「立即刷新」按钮用）。
+    refresh: function (force) {
+      if (rt.inflight) return rt.inflight
+      // 已有数据时不回退到 loading：后台轮询不该把界面上的数字变成省略号。
+      if (rt.data === null) { rt.status = 'loading'; rt.notify() }
+      const p = call(A_PNL_GET, force ? { force: true } : {}).then(function (data) {
+        rt.data = data || null
+        rt.status = 'ready'
+        rt.error = ''
+        rt.inflight = null
+        rt.notify()
+        return rt.data
+      }).catch(function (e) {
+        rt.status = 'error'
+        rt.error = String((e && e.message) || e)
+        rt.inflight = null
+        rt.notify()
+        return null   // 吞掉拒绝：轮询链不能产生未处理的 Promise 拒绝
+      })
+      rt.inflight = p
+      return p
+    },
+
+    start: function () {
+      rt.refs++
+      if (rt.refs !== 1) return   // 已有轮询器在跑，chip 与 tab 共享它
+      rt.active = true
+      cycle()
+    },
+
+    stop: function () {
+      rt.refs--
+      if (rt.refs > 0) return
+      rt.refs = 0
+      rt.active = false
+      if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
+    }
+  }
+
+  function arm(ms) {
+    if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
+    rt.delay = ms
+    rt.timer = disposer(ctx.timeout(cycle, ms))
+  }
+
+  // 一次「取数 → 按宿主给的节奏重排」。
+  // 页面隐藏时跳过请求但**照旧等这么久**：重排更密没有意义（页面不可见），
+  // 重排更疏又会让回到前台的第一屏变旧。
+  function cycle() {
+    if (!rt.active) return
+    if (pageHidden()) { arm(Math.max(rt.delay, PNL_POLL_FALLBACK_MS)); return }
+    rt.refresh().then(function () {
+      if (!rt.active) return
+      arm(rt.status === 'error' ? PNL_POLL_FALLBACK_MS : hostDelay(rt.data))
+    })
+  }
+
+  pnlRuntime = rt
+  return rt
+}
 
 // 图表引擎：KLineChart v10（canvas）。初始化 / 主题同步 / 尺寸自适应 / 销毁 与具体图表无关的部分都在这里。
 
@@ -1245,16 +1382,299 @@ function NewsTab(p) {
     : el('div', { className: 'xq-muted' }, '暂无快讯')
 }
 
+// 今日盈亏（同花顺投资账本）：面板头部常驻 chip + 「盈亏」tab。
+//
+// 两个组件都**自取运行时**（getPnlRuntime / getUiRuntime），不读父级上下文的任何字段，
+// 因此 panel/index.js 里 TAB_CTX 的 pnl 工厂返回空对象即可（本文件不使用任何父级上下文字段）。
+//
+// 展示口径沿用 dsh-ths-pnl 的客户端实现：金额带符号 + 千分位 + 两位小数，百分比两位小数；
+// 涨跌按 **A 股习惯（涨=红、跌=绿）** —— 与雪球页面一致，但与欧美习惯相反。
+
+// 带符号千分位两位小数（金额）。不用 toFixed 是为了千分位分组。
+function fmtYk(value) {
+  const n = Number(value) || 0
+  const sign = n > 0 ? '+' : (n < 0 ? '-' : '')
+  return sign + Math.abs(n).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+// 涨跌配色类（A 股：涨红跌绿）。
+function trendClass(value) {
+  const n = Number(value) || 0
+  if (n > 0) return 'xq-pnl-up'
+  if (n < 0) return 'xq-pnl-down'
+  return ''
+}
+
+// 时段文案。盘外时段（盘前/午间/收盘/休市）要显式标出来，否则用户会以为数字停住是坏了。
+const SESSION_TEXT = { pre: '盘前', morning: '盘中', lunch: '午间', afternoon: '盘中', after: '收盘', weekend: '休市' }
+const OFF_HOURS = { pre: 1, lunch: 1, after: 1, weekend: 1 }
+
+// 订阅盈亏运行时。返回 state 快照；订阅/退订由 store 的引用计数管轮询器的启停，
+// 所以 chip 与 tab 同时挂着也只有一个轮询器、一份数据。
+function usePnlState() {
+  const [state, setState] = React.useState(function () {
+    const rt = getPnlRuntime()
+    return rt ? rt.getState() : { data: null, status: 'idle', error: '' }
+  })
+  React.useEffect(function () {
+    const rt = getPnlRuntime()
+    if (!rt) return function () { }
+    setState(rt.getState())   // 订阅前可能已经有数据（另一个订阅者先拉到了）
+    return rt.subscribe(function () { setState(rt.getState()) })
+  }, [])
+  return state
+}
+
+// 头部常驻 chip：一行小字展示今日盈亏，点击切到「盈亏」tab。
+function PnlChip() {
+  const state = usePnlState()
+  const data = state.data
+
+  let label
+  let cls = 'xq-pnl-dim'
+  let tag = ''
+  if (state.status === 'error') {
+    label = '今日盈亏 数据异常'
+  } else if (!data) {
+    label = '今日盈亏 …'
+  } else if (data.configured === false) {
+    label = '今日盈亏 未配置'
+  } else if (data.token_expired) {
+    label = '今日盈亏 已过期'
+    cls = 'xq-pnl-bad'
+  } else if (data.error) {
+    label = '今日盈亏 数据异常'
+  } else {
+    label = '今日 ' + fmtYk(data.pnl_yk) + ' (' + fmtPct(data.pnl_pct) + ')'
+    cls = trendClass(data.pnl_yk) || 'xq-pnl-dim'
+    tag = OFF_HOURS[data.session] ? (SESSION_TEXT[data.session] || '') : ''
+  }
+
+  let title = '同花顺投资账本 · 今日总盈亏（点击查看盈亏页）'
+  if (data && data.updated_at) title += '\n数据时间：' + new Date(data.updated_at).toLocaleString('zh-CN')
+  if (data && data.frozen) title += '\n非交易时段 · 显示最后一次获取的值'
+  if (state.status === 'error' && state.error) title += '\n' + state.error
+
+  const kids = [el('span', { key: 'v' }, label)]
+  if (tag) kids.push(el('span', { key: 'tag', className: 'xq-pnl-tag' }, tag))
+
+  return el('span', {
+    className: 'xq-pnl-chip ' + cls,
+    title: title,
+    onClick: function () {
+      const ui = getUiRuntime()
+      if (ui) ui.ui.set({ tab: 'pnl', open: true })
+    }
+  }, kids)
+}
+
+// 完整「盈亏」tab：大字盈亏 + 数据时间 + 时段；组合选择、Cookie、刷新间隔三块配置。
+// 形参 p 是 tab 上下文（由 panel/index.js 的 TAB_CTX 提供），本组件不读它的任何字段。
+function PnlTab(p) {
+  const state = usePnlState()
+  const data = state.data
+  const [draft, setDraft] = React.useState('')          // Cookie 草稿
+  const [status, setStatus] = React.useState(null)      // pnl.verify / pnl.config 的结果
+  const [busy, setBusy] = React.useState(false)
+  const [intervalDraft, setIntervalDraft] = React.useState('')
+
+  // 打开本 tab 时校验一次：拿到组合列表、当前生效间隔、宿主给的可调范围。
+  React.useEffect(function () {
+    let alive = true
+    // 先用快照里的生效值即时预填，避免输入框空一瞬
+    const rt = getPnlRuntime()
+    const snap = rt ? rt.data : null
+    if (snap && isFinite(Number(snap.poll_ms)) && Number(snap.poll_ms) > 0) setIntervalDraft(String(Number(snap.poll_ms) / 1000))
+    call(A_PNL_VERIFY, {}).then(function (d) {
+      if (!alive) return
+      setStatus(d || null)
+      if (d && isFinite(Number(d.poll_ms)) && Number(d.poll_ms) > 0) setIntervalDraft(String(Number(d.poll_ms) / 1000))
+    }).catch(function (e) {
+      if (alive) setStatus({ configured: true, valid: false, error: String((e && e.message) || e) })
+    })
+    return function () { alive = false }
+  }, [])
+
+  // 合并而不是整体替换：只改间隔时宿主不回组合列表，整体替换会让「组合」下拉框凭空消失。
+  // checked=true 表示本次真的提交了 Cookie（或清了 Cookie），此时宿主的 valid 才算数；
+  // 只改间隔 / 换组合时宿主不校验、会把 valid 回传成 false，界面不该因此从「有效」退回「待校验」。
+  function applyResult(json, checked) {
+    setStatus(function (prev) {
+      const old = prev || {}
+      const configured = json.configured !== undefined ? json.configured : (old.configured !== undefined ? old.configured : true)
+      return {
+        configured: configured,
+        valid: checked ? (json.valid !== undefined ? json.valid : old.valid) : (old.valid !== undefined ? old.valid : json.valid),
+        // 已清除时不再保留上一轮报错，否则「已清除」旁边还挂着「Cookie 已过期」
+        error: configured === false ? '' : (json.error !== undefined ? json.error : old.error),
+        // 非空数组才覆盖：只改间隔时宿主可能回空列表，直接替换会让下拉框消失
+        portfolios: (json.portfolios && json.portfolios.length) ? json.portfolios : (configured === false ? [] : (old.portfolios || [])),
+        fundKey: json.fundKey !== undefined ? json.fundKey : old.fundKey,
+        poll_ms: json.poll_ms !== undefined ? json.poll_ms : old.poll_ms,
+        min_sec: json.min_sec !== undefined ? json.min_sec : old.min_sec,
+        max_sec: json.max_sec !== undefined ? json.max_sec : old.max_sec,
+        savedSec: json.poll_sec
+      }
+    })
+  }
+
+  // 所有配置写操作走同一条路：提交 → 合并结果 → 让 store 立刻重取一次快照（chip 同步更新）
+  function post(args, checked) {
+    if (busy) return
+    setBusy(true)
+    call(A_PNL_CONFIG, args).then(function (json) {
+      applyResult(json, checked === true)
+      if (json && isFinite(Number(json.poll_sec))) setIntervalDraft(String(json.poll_sec))
+      if (json && json.valid) setDraft('')
+      const rt = getPnlRuntime()
+      if (rt) rt.refresh()
+    }).catch(function (e) {
+      setStatus(function (prev) {
+        return Object.assign({}, prev || {}, { valid: false, error: String((e && e.message) || e) })
+      })
+    }).then(function () { setBusy(false) })
+  }
+
+  function save() {
+    const cookie = draft.trim()
+    const args = { pollSec: intervalDraft }
+    if (cookie) args.cookie = cookie
+    post(args, args.cookie !== undefined)
+  }
+  function clearCookie() { setDraft(''); post({ clear: true }, true) }
+  function chooseFund(key) { post({ fundKey: key }, false) }
+  function forceRefresh() {
+    const rt = getPnlRuntime()
+    if (rt) rt.refresh(true)   // force：跳过宿主时段缓存，立刻打一次上游
+  }
+
+  const cfg = status || {}
+  const portfolios = cfg.portfolios || []
+  const fundKey = cfg.fundKey || ''
+  const minSec = Number(cfg.min_sec) > 0 ? Number(cfg.min_sec) : 5
+  const maxSec = Number(cfg.max_sec) > 0 ? Number(cfg.max_sec) : 3600
+  const currentSec = Number(cfg.poll_ms || (data && data.poll_ms) || 0) / 1000
+  const intervalDirty = intervalDraft !== '' && Number(intervalDraft) !== currentSec
+  const canSave = !busy && (draft.trim().length > 0 || intervalDirty)
+
+  // ---- 大字区：金额 + 百分比 + 时段 ----
+  let amountText
+  let amountCls
+  let subText = ''
+  let subBad = false       // 副标题是「真问题」（红/黄）还是「中性提示」（灰）
+  let hasValue = false
+  if (state.status === 'error') {
+    amountText = '--'
+    amountCls = 'xq-pnl-dim'
+    subText = '数据异常：' + state.error
+    subBad = true
+  } else if (!data) {
+    amountText = '…'
+    amountCls = 'xq-pnl-dim'
+    subText = '加载中…'
+  } else if (data.configured === false) {
+    amountText = '未配置'
+    amountCls = 'xq-pnl-dim'
+    subText = '粘贴同花顺投资账本 Cookie 后即可显示今日盈亏'
+  } else if (data.token_expired) {
+    amountText = '已过期'
+    amountCls = 'xq-pnl-bad'
+    subText = data.error || 'Cookie 已过期，请重新粘贴'
+    subBad = true
+  } else if (data.error) {
+    amountText = '--'
+    amountCls = 'xq-pnl-dim'
+    subText = data.error
+    subBad = true
+  } else {
+    amountText = fmtYk(data.pnl_yk)
+    amountCls = trendClass(data.pnl_yk) || 'xq-pnl-dim'
+    hasValue = true
+  }
+  const sessionText = data && SESSION_TEXT[data.session] ? SESSION_TEXT[data.session] : ''
+  const hero = el('div', { className: 'xq-pnl-hero' }, [
+    el('span', { key: 'a', className: 'xq-pnl-amt ' + amountCls }, amountText),
+    hasValue ? el('span', { key: 'p', className: 'xq-pnl-pct ' + amountCls }, fmtPct(data.pnl_pct)) : null,
+    sessionText ? el('span', { key: 's', className: 'xq-pnl-tag' }, sessionText) : null
+  ])
+
+  const metaParts = []
+  if (data && data.updated_at) metaParts.push('数据时间 ' + new Date(data.updated_at).toLocaleString('zh-CN'))
+  if (data && data.frozen) metaParts.push('非交易时段 · 已冻结在收盘值')
+  if (data && isFinite(Number(data.poll_ms))) metaParts.push('刷新间隔 ' + Math.round(Number(data.poll_ms) / 1000) + ' 秒')
+  const meta = metaParts.length ? el('div', { className: 'xq-pnl-meta' }, metaParts.join(' · ')) : null
+  const sub = subText ? el('div', { className: subBad ? 'xq-pnl-sub xq-pnl-bad' : 'xq-pnl-sub' }, subText) : null
+
+  // ---- 组合账户 ----
+  const fundRow = el('div', { className: 'xq-pnl-field' }, [
+    el('label', { key: 'l' }, '组合账户'),
+    portfolios.length
+      ? el('select', {
+        key: 's', className: 'xq-pnl-sel', value: fundKey, disabled: busy || portfolios.length < 2,
+        onChange: function (e) { chooseFund(e.target.value) }
+      }, portfolios.map(function (it, i) {
+        return el('option', { key: String(i), value: it.fund_key }, it.name || it.manualname || it.brokername || it.fund_key)
+      }))
+      : el('span', { key: 's', className: 'xq-pnl-note' }, '未读到组合（Cookie 有效后自动列出）')
+  ])
+
+  // ---- Cookie ----
+  const cookieBlock = el('div', { className: 'xq-pnl-block' }, [
+    el('div', { key: 't', className: 'xq-pnl-sec' }, 'Cookie（同花顺投资账本）'),
+    el('div', { key: 'tip', className: 'xq-pnl-note' }, '登录 tzzb.10jqka.com.cn 后按 F12 → 控制台执行 copy(document.cookie)，把结果粘贴到这里。与 dsh-ths-pnl 插件共用同一份凭据与快照，粘一次两边都生效。'),
+    el('textarea', {
+      key: 'ta', className: 'xq-pnl-ta',
+      placeholder: '直接粘贴整段 Cookie（形如 v=...; userid=...; pex_userid=...）',
+      value: draft,
+      onChange: function (e) { setDraft(e.target.value) }
+    })
+  ])
+
+  // ---- 刷新间隔 ----
+  const intervalRow = el('div', { className: 'xq-pnl-field' }, [
+    el('label', { key: 'l' }, '刷新间隔'),
+    el('input', {
+      key: 'i', className: 'xq-pnl-num', type: 'number', min: String(minSec), max: String(maxSec), step: '1',
+      value: intervalDraft,
+      onChange: function (e) { setIntervalDraft(e.target.value) },
+      onKeyDown: function (e) { if (e.key === 'Enter') save() }
+    }),
+    el('span', { key: 'u', className: 'xq-pnl-note' }, '秒（' + minSec + '–' + maxSec + '，超出会被夹到边界）')
+  ])
+
+  const btnRow = el('div', { className: 'xq-pnl-row' }, [
+    el('button', { key: 'save', className: 'xq-btn', disabled: !canSave, onClick: save },
+      busy ? '处理中…' : (draft.trim().length > 0 ? '保存并校验' : '保存间隔')),
+    el('button', { key: 'clr', className: 'xq-btn', disabled: busy, title: '只清 Cookie，保留最后一次快照', onClick: clearCookie }, '清除 Cookie'),
+    el('button', { key: 'now', className: 'xq-btn', disabled: busy, title: '跳过宿主时段缓存，立刻打一次上游', onClick: forceRefresh }, '立即刷新')
+  ])
+
+  // ---- 校验结果 ----
+  const msgParts = []
+  if (status) {
+    if (cfg.valid) msgParts.push(el('span', { key: 'v', className: 'xq-pnl-ok' }, '✓ Cookie 有效，' + portfolios.length + ' 个组合'))
+    else if (cfg.configured === false) msgParts.push(el('span', { key: 'v', className: 'xq-pnl-note' }, '未配置 Cookie'))
+    else if (cfg.error) msgParts.push(el('span', { key: 'v', className: 'xq-pnl-bad' }, '✗ ' + cfg.error))
+    else msgParts.push(el('span', { key: 'v', className: 'xq-pnl-note' }, '待校验'))
+    if (cfg.savedSec !== undefined && cfg.savedSec !== null && isFinite(Number(cfg.savedSec))) {
+      msgParts.push(el('span', { key: 's', className: 'xq-pnl-note' }, '刷新间隔已设为 ' + cfg.savedSec + ' 秒'))
+    }
+  }
+  const msg = msgParts.length ? el('div', { className: 'xq-pnl-msg' }, msgParts) : null
+
+  return el('div', { className: 'xq-pnl' }, [hero, meta, sub, fundRow, cookieBlock, intervalRow, btnRow, msg])
+}
+
 // XueqiuPanel：面板内容容器（数据 + tab 条 + 查表分发）。
 //
-// 内层视图（LoginBox / MarketTab / DetailView / HotTab / SearchTab / NewsTab）已提到模块作用域，
+// 内层视图（LoginBox / MarketTab / DetailView / HotTab / SearchTab / NewsTab / PnlTab）已提到模块作用域，
 // 原来靠父级闭包读的 state/句柄改为「调用点组装显式上下文 p」传入；本文件只保留数据逻辑。
 //
 // tab 分发表：ui.tab → 组件。注意 DetailView 不在此表 —— 详情由 view 真值门控（旧 if/else 链
-// 也是先判 view），且宿主 ui.get 会把 tab 白名单化成 market/hot/search/news。把 detail 塞进
+// 也是先判 view），且宿主 ui.get 会把 tab 白名单化成 market/hot/search/news/pnl。把 detail 塞进
 // 查表会让理论上不可达的 tab='detail' 渲染详情骨架（旧行为是落到快讯页），属于行为变化。
 
-const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab }
+const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab, pnl: PnlTab }
 
 // ---------- 面板内容（数据 + tabs + 详情） ----------
 function XueqiuPanel() {
@@ -1571,7 +1991,10 @@ function XueqiuPanel() {
       key: 'btn', className: 'xq-btn', disabled: loading, title: '刷新全部数据',
       onClick: function () {
         setLoading(true)
-        Promise.all([refreshMarket(), refreshContent()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
+        // 盈亏一并刷新：refresh() 内部已做并发去重，与后台轮询不会重复请求；
+        // 它自己吞掉失败（返回 null 而非拒绝），所以这里的 loading 语义与原来完全一致。
+        const pnlRt = getPnlRuntime()
+        Promise.all([refreshMarket(), refreshContent(), pnlRt ? pnlRt.refresh() : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
       }
     }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
   ]))
@@ -1579,7 +2002,7 @@ function XueqiuPanel() {
   const errBox = err ? el('div', { className: 'xq-err' }, err) : null
 
   // 每个 tab 的显式上下文工厂：字段 = 该 tab 函数体里用到的父级 state/句柄
-  // （MarketTab/HotTab/SearchTab/NewsTab 的字段清单见各自文件头部注释）
+  // （MarketTab/HotTab/SearchTab/NewsTab 的字段清单见各自文件头部注释；PnlTab 自取运行时，故返回空对象）
   const TAB_CTX = {
     market: function () {
       return {
@@ -1606,6 +2029,9 @@ function XueqiuPanel() {
       return {
         news: news, newsMore: newsMore, newsNoMore: newsNoMore, loadMoreNews: loadMoreNews
       }
+    },
+    pnl: function () {
+      return {}   // PnlTab 自身订阅盈亏运行时，不需要父级任何字段
     }
   }
 
@@ -1916,6 +2342,7 @@ function DockPanel() {
     el('div', { key: 'head', className: 'xq-dock-head' }, [
       el('span', { key: 'logo', className: 'xq-logo' }, [el('b', { key: 'b' }, '雪球'), ' mini']),
       el('span', { key: 'st', className: 'xq-status', title: 'A股/港股/美股交易时段（本地时区推算，不含节假日）' }, sessionsText() || '行情面板'),
+      el(PnlChip, { key: 'pnl' }),
       el('span', { key: 'hint', className: 'xq-update' }, '已嵌入输入框上方 · Esc 收起'),
       el('span', { key: 'sp', className: 'xq-spacer' }),
       el('button', { key: 'min', className: 'xq-btn-mini', title: '收起（点右下角徽章重新打开）', onClick: function () { ui.set({ open: false }) } }, '收起 —')
@@ -2180,8 +2607,42 @@ const xqClientPlugin = {
 .xq-login-ok{color:var(--dsw-alias-state-success-primary);}
 .xq-login-bad{color:var(--dsw-alias-state-warn-primary);}
 .xq-acc-mark{font-size:10px;color:var(--dsw-alias-label-secondary);}
+/* 今日盈亏（同花顺投资账本）：头部常驻 chip + 「盈亏」tab。
+   配色沿用既有变量，A 股习惯「涨红跌绿」：up 用 state-error-primary、down 用 state-success-primary。 */
+.xq-pnl-chip{display:inline-flex;align-items:baseline;gap:4px;font-size:11px;padding:1px 8px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);white-space:nowrap;cursor:pointer;font-variant-numeric:tabular-nums;transition:color .15s;max-width:300px;overflow:hidden;text-overflow:ellipsis;}
+.xq-pnl-chip:hover{color:var(--dsw-alias-label-primary);}
+.xq-pnl-chip.xq-pnl-up{color:var(--dsw-alias-state-error-primary);font-weight:600;}
+.xq-pnl-chip.xq-pnl-down{color:var(--dsw-alias-state-success-primary);font-weight:600;}
+.xq-pnl-chip.xq-pnl-bad{color:var(--dsw-alias-state-warn-primary);}
+.xq-pnl-tag{font-size:10px;color:var(--dsw-alias-label-tertiary);font-weight:400;}
+.xq-pnl{display:flex;flex-direction:column;gap:9px;max-width:560px;}
+.xq-pnl-hero{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+.xq-pnl-amt{font-size:26px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums;}
+.xq-pnl-pct{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;}
+.xq-pnl-up{color:var(--dsw-alias-state-error-primary);}
+.xq-pnl-down{color:var(--dsw-alias-state-success-primary);}
+.xq-pnl-dim{color:var(--dsw-alias-label-secondary);}
+.xq-pnl-ok{color:var(--dsw-alias-state-success-primary);}
+.xq-pnl-bad{color:var(--dsw-alias-state-warn-primary);}
+.xq-pnl-meta{font-size:11px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
+.xq-pnl-block{display:flex;flex-direction:column;gap:6px;}
+.xq-pnl-sec{font-size:12.5px;font-weight:700;display:flex;align-items:center;gap:8px;}
+.xq-pnl-sec::before{content:"";width:3px;height:12px;border-radius:2px;background:var(--dsw-alias-brand-primary);flex:none;}
+.xq-pnl-field{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.xq-pnl-field label{font-size:12px;color:var(--dsw-alias-label-secondary);flex:none;}
+.xq-pnl-sel{font-size:12.5px;padding:3px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);max-width:100%;}
+.xq-pnl-num{font-size:12.5px;width:88px;padding:3px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;}
+.xq-pnl-num:focus,.xq-pnl-sel:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}
+.xq-pnl-ta{font-size:11.5px;font-family:ui-monospace,Menlo,monospace;width:100%;min-height:64px;resize:vertical;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.xq-pnl-ta:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}
+.xq-pnl-note{font-size:11px;color:var(--dsw-alias-label-tertiary);line-height:1.6;}
+.xq-pnl-sub{font-size:11px;line-height:1.6;color:var(--dsw-alias-label-secondary);}
+.xq-pnl-sub.xq-pnl-bad{color:var(--dsw-alias-state-warn-primary);}
+.xq-pnl-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.xq-pnl-msg{font-size:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}
 `)
     createUiRuntime(ctx)
+    createPnlRuntime(ctx)   // 只建运行时、不取数：首个订阅者（chip）挂载时才启动轮询
     installSlots(ctx)
   }
 }

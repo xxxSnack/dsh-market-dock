@@ -45,6 +45,11 @@ const SYNC_INTERVAL_MS = 10 * 60 * 1000
 // 想与上游彻底隔离就配成 dsh-xueqiu-debug —— 注意切换后不会自动迁移旧数据。
 const DEFAULT_STATE_DIR = 'dsh-xueqiu'
 
+// 今日盈亏（同花顺投资账本）的状态目录名：$DSH_HOME/<pnlStateDir>/。
+// **默认必须与旧插件 dsh-ths-pnl 完全相同** —— 两边共用 config.json（Cookie）/snapshot.json，
+// 并存期用户不用重粘 Cookie，数值也一致。想隔离才改这里（改完不会自动迁移旧数据）。
+const DEFAULT_PNL_STATE_DIR = 'dsh-ths-pnl'
+
 // 默认自选表上限（与重构前 stateWrite 的截断上限一致）
 const WATCHLIST_MAX = 200
 
@@ -65,7 +70,12 @@ function resolveConfig (raw) {
     if (list.length) watchlist = list
   }
 
-  return { stateDir: stateDir, watchlist: watchlist }
+  // 今日盈亏状态目录：与 stateDir 同款白名单校验（非法值退回默认，防路径穿越）
+  const pnlStateDir = (typeof cfg.pnlStateDir === 'string' && /^[A-Za-z0-9._-]+$/.test(cfg.pnlStateDir))
+    ? cfg.pnlStateDir
+    : DEFAULT_PNL_STATE_DIR
+
+  return { stateDir: stateDir, watchlist: watchlist, pnlStateDir: pnlStateDir }
 }
 
 // 纯函数：上游响应 → 插件内部字段形状的归一化。无状态、不依赖 core，直接具名导出。
@@ -421,6 +431,19 @@ function installHttp(core) {
 
 // 状态文件落点：稳定目录（$DSH_HOME/dsh-xueqiu）优先，工作区回退。读/写/旧路径回读都在这里。
 
+/**
+ * $DSH_HOME 基址：`DSH_HOME`，缺失时退回 `(HOME || USERPROFILE) + '/.dsh'`；末尾斜杠剥掉。
+ * 拿不到（无环境变量 / process 不可用）返回 ''，调用方自己决定回退策略。
+ * 抽成独立纯函数是为了让「今日盈亏」侧复用同一套基址（见 lib/pnl/store.js）。
+ */
+function dshHomeBase() {
+  try {
+    const env = (typeof process !== 'undefined' && process && process.env) || {}
+    const home = env.DSH_HOME || ((env.HOME || env.USERPROFILE) ? (env.HOME || env.USERPROFILE) + '/.dsh' : '')
+    return home ? String(home).replace(/[/\\]+$/, '') : ''
+  } catch (e) { return '' }
+}
+
 function installState(core) {
   const ctx = core.ctx
 
@@ -431,10 +454,9 @@ function installState(core) {
   // 读取顺序：稳定文件 → 缺失则回读旧工作区文件（存量数据无缝迁移，首次保存落到稳定目录）。
   function stableStateDir() {
     try {
-      const env = (typeof process !== 'undefined' && process && process.env) || {}
-      const base = env.DSH_HOME || ((env.HOME || env.USERPROFILE) ? (env.HOME || env.USERPROFILE) + '/.dsh' : '')
       // 目录名可由插件配置覆盖（默认 dsh-xueqiu，与上游存量数据无缝继承；见 lib/config.js）
-      return base ? String(base).replace(/[/\\]+$/, '') + '/' + core.config.stateDir : ''
+      const base = dshHomeBase()
+      return base ? base + '/' + core.config.stateDir : ''
     } catch (e) { return '' }
   }
   function stateBase(fs, root) {
@@ -845,7 +867,7 @@ function installUiState(core) {
   async function actUiGet() {
     const s = await loadUiState()
     const hNum = Number(s.dockH)
-    const validTabs = ['market', 'hot', 'search', 'news']
+    const validTabs = ['market', 'hot', 'search', 'news', 'pnl']
     return {
       // 损坏状态文件的非法 tab 一律回退（防类型穿透）
       tab: (typeof s.tab === 'string' && validTabs.indexOf(s.tab) >= 0) ? s.tab : 'market',
@@ -887,6 +909,800 @@ function installUiState(core) {
 
   core.actUiGet = actUiGet
   core.actUiSet = actUiSet
+}
+
+// 今日盈亏（同花顺投资账本）常量：端点 / UA / 轮询钳制 / 与 dsh-ths-pnl 共用的状态文件名。
+//
+// 铁律（INTERFACE.md §0）：本文件属于宿主 lib/ 拼接产物，动态形态下整份源码会被
+// `new Function` 求值 —— 因此**禁止 node: import、禁止裸 setTimeout/fetch**，
+// 一切 IO 都走 ctx（shell / fs / sandboxPolicy），定时走 ctx.timeout。
+
+/** 当日盈亏分时端点（逐字搬自 dsh-ths-pnl，勿改）。 */
+const PNL_URL = 'https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/asset/v1/time_share'
+/** 组合账户列表端点，用来探测 fund_key / 校验 Cookie。 */
+const ACCOUNT_LIST_URL = 'https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/account/v1/account_list'
+/** 账本网页端同款 UA（account_list 网关只认最小请求头，UA 必须与网页一致）。 */
+const PNL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
+/** 金额字段的候选名（接口未公开、字段名可能变），按优先级探测。 */
+const YK_KEYS = ['yk', 'today_yk', 'day_yk', 'todayyk', 'yk_today', 'today_profit', 'profit']
+
+/** 盘中心跳间隔下限：账本接口未公开，调太快会被风控盯上（5 秒）。 */
+const MIN_POLL_MS = 5_000
+/** 盘中心跳间隔上限（1 小时）。 */
+const MAX_POLL_MS = 3_600_000
+/** 盘中心跳默认值（60 秒）。 */
+const DEFAULT_POLL_MS = 60_000
+/** 收盘后隔多久再补拉一次，让收盘价落定（只补一次，之后冻结）。 */
+const CLOSE_SETTLE_MS = 45_000
+/** 宿主启动后的补拉延迟：错开插件加载高峰。 */
+const STARTUP_DELAY_MS = 3_000
+
+/** 状态目录名（**必须与 dsh-ths-pnl 相同**：两边共用同一份 Cookie / 快照）。 */
+const PNL_STATE_DIR = 'dsh-ths-pnl'
+/** 凭据文件（Cookie / fundKey / pollSec），读-改-写合并式。 */
+const CONFIG_FILE = 'config.json'
+/** 快照文件（最后一次已知盈亏），与凭据分离：清 Cookie 不抹掉最后已知值。 */
+const SNAPSHOT_FILE = 'snapshot.json'
+/** Cookie 长度上限：RPC body 上限 1MB，这里再兜一层，防止把整个浏览器 Cookie 灌进状态文件。 */
+const MAX_COOKIE_LEN = 8_192
+
+/**
+ * HTTP 状态码探针标记：curl `-w '\n__HTTP__%{http_code}'` 把状态码追加在 stdout 末尾。
+ * 旧插件用 fetch 的 res.status，宿主侧只能用 curl —— 没有这个标记就拿不到状态码，
+ * 也就无法区分「Cookie 过期(401/403)」和「接口报错(200 + error_code)」。
+ */
+const HTTP_MARK = '__HTTP__'
+
+/**
+ * dsh-ths-pnl — A 股交易时段判定（纯函数，可测试，无依赖）
+ *
+ * 一切以**北京时间**（UTC+8）为准，不依赖机器本地时区。
+ * 中国 1991 年后无夏令时，所以固定偏移即可；读取时用 UTC getter 拿到"北京墙上时间"。
+ *
+ * 时段划分：
+ *   09:30–11:30  上午盘（含 09:30 边界）
+ *   11:31–12:59  午间休市
+ *   13:00–15:00  下午盘（含 15:00 边界）
+ *   其余         盘前 / 收盘后 / 周末
+ *
+ * 已知边界：**法定节假日无法离线判断** —— 节假日按交易日处理，会照常轮询，
+ * 但账本返回的是上一个交易日的收盘值（数值不变，因此界面不会"持续跳动"）。
+ */
+
+/** 中国标准时间 UTC+8（毫秒）。 */
+const CS_OFFSET_MS = 8 * 60 * 60 * 1000
+
+/** 09:30 开盘。 */
+const OPEN_MIN = 9 * 60 + 30
+/** 11:30 上午收盘。 */
+const MORNING_END_MIN = 11 * 60 + 30
+/** 13:00 下午开盘。 */
+const AFTERNOON_START_MIN = 13 * 60
+/** 15:00 收盘。 */
+const CLOSE_MIN = 15 * 60
+
+/**
+ * 调度边界（北京时间，必须按时间升序）：定时器与客户端都只在这些时刻醒来。
+ *
+ * **13:00 必须在这里** —— 它不算"每天必须拉一次"的硬边界，但它是午休的出口：
+ * 11:31 起客户端会睡到"下一个边界"，若边界表里没有 13:00，这一觉直接睡到 15:00，
+ * 整个下午盘不会发出任何请求，角标就一路冻结在「午间」。
+ */
+const BOUNDARIES = [
+  [9, 30],
+  [13, 0],
+  [15, 0],
+]
+
+function pad(n) {
+  return n < 10 ? `0${n}` : String(n)
+}
+
+/** 把瞬时时间平移到"北京墙上时间"，随后用 getUTC* 读取即可。 */
+function beijing(now = new Date()) {
+  return new Date(now.getTime() + CS_OFFSET_MS)
+}
+
+/** 由北京墙上时间的年月日构造真实瞬时（UTC Date）。 */
+function beijingInstant(year, month /* 1-12 */, day, hour, minute) {
+  return new Date(Date.UTC(year, month - 1, day, hour, minute, 0) - CS_OFFSET_MS)
+}
+
+/**
+ * 当前所处时段。
+ * @returns {{date:string, minutes:number, weekday:number, weekend:boolean,
+ *            state:'pre'|'morning'|'lunch'|'afternoon'|'after'|'weekend',
+ *            inSession:boolean, isTradingDay:boolean}}
+ */
+function sessionInfo(now = new Date()) {
+  const b = beijing(now)
+  const year = b.getUTCFullYear()
+  const month = b.getUTCMonth() + 1
+  const day = b.getUTCDate()
+  const weekday = b.getUTCDay() // 0=周日
+  const minutes = b.getUTCHours() * 60 + b.getUTCMinutes()
+  const weekend = weekday === 0 || weekday === 6
+
+  let state
+  if (weekend) state = 'weekend'
+  else if (minutes < OPEN_MIN) state = 'pre'
+  else if (minutes <= MORNING_END_MIN) state = 'morning'
+  else if (minutes < AFTERNOON_START_MIN) state = 'lunch'
+  else if (minutes <= CLOSE_MIN) state = 'afternoon'
+  else state = 'after'
+
+  return {
+    date: `${year}-${pad(month)}-${pad(day)}`,
+    minutes,
+    weekday,
+    weekend,
+    state,
+    inSession: state === 'morning' || state === 'afternoon',
+    isTradingDay: !weekend,
+  }
+}
+
+/**
+ * 边界容差：**刚过去不到这么久的边界仍算作"下一个"**。
+ *
+ * 为什么需要：宿主定时器若比边界早 1 毫秒触发，严格"只取未来"的实现会把这次
+ * 边界整个跳过、直接排到下一个（明天 09:30），于是 15:00 的收盘拉取就丢了 ——
+ * 而"每天 09:30 / 15:00 必须各拉一次"是硬需求。给一点回看窗口即可消除这个竞态。
+ */
+const BOUNDARY_TOLERANCE_MS = 1500
+
+/**
+ * 下一个边界时刻（09:30 / 13:00 / 15:00，跳过周末）。
+ * @returns {Date|null} 真实瞬时；找不到（异常）时返回 null。
+ */
+function nextBoundary(now = new Date()) {
+  const b = beijing(now)
+  const base = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate())
+  for (let i = 0; i < 10; i++) {
+    const d = new Date(base + i * 24 * 60 * 60 * 1000)
+    const dow = d.getUTCDay()
+    if (dow === 0 || dow === 6) continue
+    for (const [hour, minute] of BOUNDARIES) {
+      const instant = beijingInstant(d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate(), hour, minute)
+      if (instant.getTime() > now.getTime() - BOUNDARY_TOLERANCE_MS) return instant
+    }
+  }
+  return null
+}
+
+/** 距下一个边界的毫秒数（找不到时给一个保守的 1 小时）。 */
+function msUntilNextBoundary(now = new Date()) {
+  const next = nextBoundary(now)
+  if (next === null) return 60 * 60 * 1000
+  return Math.max(1000, next.getTime() - now.getTime())
+}
+
+/**
+ * 该不该去账本拉一次？
+ *
+ * 规则（按优先级）：
+ *   1. 从未有过快照 → 拉一次（否则非交易时段首次安装会一直空白）；
+ *   2. 盘中（含 09:30 与 15:00 两个边界）→ 拉；
+ *   3. 收盘后且**今天还没拉过收盘值** → 拉一次（保证 15:00 那次落到收盘价）；
+ *   4. 开盘后且**今天还没拉过** → 拉一次（保证 09:30 那次，比如服务刚启动）；
+ *   5. 其余（盘前 / 午间 / 收盘后已拉过 / 周末已有快照）→ 不拉，用缓存值。
+ *
+ * @param {object} info - sessionInfo(now)
+ * @param {object|null} snap - 已缓存的快照（含 sessionDate / closeDate）
+ * @returns {boolean}
+ */
+function shouldFetch(info, snap) {
+  if (snap === null || snap === undefined) return true
+  if (info.inSession) return true
+  if (!info.isTradingDay) return false
+  if (info.minutes >= CLOSE_MIN && snap.closeDate !== info.date) return true
+  if (info.minutes >= OPEN_MIN && snap.sessionDate !== info.date) return true
+  return false
+}
+
+/** 客户端下次轮询间隔：盘中按心跳；盘外直接睡到下一个边界。 */
+function nextPollMs(info, now = new Date(), heartbeatMs = 60_000) {
+  if (info.inSession) return heartbeatMs
+  return Math.max(30_000, msUntilNextBoundary(now) + 1500)
+}
+
+// 今日盈亏：Cookie 规整 / 字段锚定解析 + **能拿到 HTTP 状态码**的 curl 请求。
+//
+// 为什么另起一套 curl 而不复用宿主 lib/http.js：那边的 curl() 是雪球专用（Referer /
+// Accept / 重试链 / 并发闸门全是写死的），而且**不输出状态码** —— 账本恰恰要靠状态码
+// 区分「Cookie 过期（401/403）」「接口报错（200 + error_code）」和「网关重定向」。
+// 所以这里自拼命令，用 `-w '\n__HTTP__%{http_code}'` 探针把状态码一次取回。
+//
+// 动态形态可用性：import 只走相对路径的宿主模块，shell 走 ctx.get('shell')，无裸 fetch。
+
+
+/**
+ * 凭据存储里可能被 YAML 折行而插入空格，破坏 base64/JWT；
+ * 按 ';' 切开、逐段去掉所有空白、再用标准 '; ' 拼回。
+ */
+function normalizeCookie(cookie) {
+  return String(cookie ?? '')
+    .split(/;\s*/)
+    .map(part => part.replace(/\s+/g, ''))
+    .filter(part => part.length > 0)
+    .join('; ')
+}
+
+/**
+ * 取 Cookie 里的一个字段。**必须锚定**：裸 /userid=/ 会匹配到
+ * pex_userid 之类的其它 cookie，账本会因此返回 403（上游真实事故）。
+ */
+function cookieField(cookie, field) {
+  const m = String(cookie ?? '').match(new RegExp(`(?:^|;\\s*)${field}=([^;]*)`))
+  return m?.[1]
+}
+
+/**
+ * 从 curl stdout 里切出 body 与 HTTP 状态码。
+ * 用 lastIndexOf：接口响应体自身若含 '__HTTP__' 字样也不会被误切。
+ * @returns {{status:number, text:string}} status=0 表示没拿到探针（异常输出）
+ */
+function splitStatus(stdout) {
+  const idx = stdout.lastIndexOf('\n' + HTTP_MARK)
+  if (idx < 0) return { status: 0, text: stdout }
+  const raw = stdout.slice(idx + HTTP_MARK.length + 1)
+  return { status: Number(raw.trim()) || 0, text: stdout.slice(0, idx) }
+}
+
+/**
+ * POST 一个表单（不带 -L：凭据类请求绝不跟随重定向，Cookie 不能外泄到别的 origin）。
+ * @param {object} core - 宿主 core（用它的 ctx 取 shell）
+ * @param {string} url
+ * @param {string} body - x-www-form-urlencoded 请求体
+ * @param {string} cookie
+ * @param {{minimal?:boolean}} [opts] - minimal=true 时**只带 User-Agent**（account_list 网关要求）
+ * @returns {Promise<{status:number, text:string}>}
+ */
+const pnlRequest = async function (core, url, body, cookie, opts) {
+  const o = opts || {}
+  const shell = core.ctx.get('shell')
+  if (!shell) throw new Error('shell 服务不可用，无法访问投资账本')
+  let cmd = CURL + " -s --max-time 15 -X POST '" + url + "'"
+  cmd += " -H 'User-Agent: " + PNL_UA + "'"
+  if (o.minimal !== true) {
+    // account_list 网关只认最小请求头：多带 Accept/Referer 会被拒（上游踩过的坑）
+    cmd += " -H 'Accept: application/json, text/plain, */*'"
+    cmd += " -H 'Accept-Language: zh-CN,zh;q=0.9'"
+    cmd += " -H 'Referer: https://tzzb.10jqka.com.cn/pc/index.html'"
+  }
+  const ck = normalizeCookie(cookie)
+  if (ck) cmd += " -H 'Cookie: " + ck.replace(/['"]/g, '') + "'"
+  cmd += " --data '" + String(body).replace(/'/g, '%27') + "'"
+  cmd += " -w '\\n" + HTTP_MARK + "%{http_code}'"
+  const spec = shell.resolve({ command: cmd, timeoutMs: 20000, stdoutMaxBytes: 1048576 })
+  const result = await shell.run(spec)
+  if (!result || result.exitCode !== 0) {
+    // 不回显 stderr：shell 语法错误会把完整命令行（含内部拼接细节）透给调用方
+    throw new Error('curl 失败 (' + ((result && result.exitCode) ?? '?') + ')')
+  }
+  return splitStatus(String((result.stdout && result.stdout.text) || ''))
+}
+
+// 今日盈亏：与 dsh-ths-pnl **共用**同一份状态文件（$DSH_HOME/dsh-ths-pnl/）。
+//
+// 为什么要共用：旧插件（dsh-ths-pnl）与新版面板可能同时在跑，用户不应该重新粘一次
+// Cookie；快照分文件存放也是有意的 —— 清 Cookie（config.json）不该顺手抹掉
+// 「最后已知盈亏」（snapshot.json），反之亦然。
+//
+// 落点解析与宿主 state.js 同套路（稳定目录优先 + 沙箱可写性探测 + 工作区回退），
+// 但**独立 memo** core.pnlBasePromise：两套东西的默认目录不同、探测失败时机也不同。
+
+
+/** 目标目录（$DSH_HOME/<pnlStateDir>）；拿不到基址返回 ''（调用方走工作区回退）。 */
+function pnlStateDirOf(core) {
+  try {
+    const base = dshHomeBase()
+    const name = (core.config && core.config.pnlStateDir) ? core.config.pnlStateDir : PNL_STATE_DIR
+    return base ? base + '/' + name : ''
+  } catch (e) { return '' }
+}
+
+/** 稳定目录是否可写（写一个 .write-probe 探针），结果 memo 在 core.pnlBasePromise。 */
+function pnlStateBase(core) {
+  if (!core.pnlBasePromise) {
+    core.pnlBasePromise = (async function () {
+      const fs = core.ctx.get('fs')
+      const sp = core.ctx.get('sandboxPolicy')
+      const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
+      const dir = pnlStateDirOf(core)
+      if (!fs || !dir) return ''
+      try {
+        const probe = await fs.resolve(dir + '/.write-probe', { cwd: root })
+        await fs.writeText(probe, String(Date.now()))
+        return dir
+      } catch (e) { return '' }
+    })()
+  }
+  return core.pnlBasePromise
+}
+
+/** 读：稳定文件优先；稳定模式且稳定文件缺失时回读旧工作区路径（迁移源）。 */
+const pnlStateRead = async function (core, name) {
+  const fs = core.ctx.get('fs')
+  const sp = core.ctx.get('sandboxPolicy')
+  const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
+  if (!fs) return null
+  const dir = await pnlStateBase(core)
+  if (dir) {
+    try { return await fs.readText(await fs.resolve(dir + '/' + name, { cwd: root })) } catch (e) { /* 试旧工作区 */ }
+  }
+  if (!root) return null
+  try { return await fs.readText(await fs.resolve(name, { cwd: root })) } catch (e) { return null }
+}
+
+/** 写：稳定模式写稳定目录，否则旧工作区。返回真实落点。 */
+const pnlStateWrite = async function (core, name, text) {
+  const fs = core.ctx.get('fs')
+  const sp = core.ctx.get('sandboxPolicy')
+  const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
+  if (!fs) throw new Error('fs 服务不可用，无法保存今日盈亏配置')
+  const dir = await pnlStateBase(core)
+  const target = await fs.resolve(dir ? dir + '/' + name : name, { cwd: root })
+  await fs.writeText(target, String(text))
+  return target
+}
+
+/** 读凭据（config.json）。任何异常都退化成 {}：没配置 ≠ 报错。 */
+const loadPnlConfig = async function (core) {
+  try {
+    const text = await pnlStateRead(core, CONFIG_FILE)
+    const parsed = text == null ? null : JSON.parse(text)
+    return (parsed && typeof parsed === 'object') ? parsed : {}
+  } catch (e) { return {} }
+}
+
+/**
+ * 写凭据：**读-改-写合并**（与旧插件 saveState 同语义），pretty JSON。
+ * 写失败会抛错 —— 用户必须知道「Cookie 没存上」，不能静默成功。
+ */
+const savePnlConfig = async function (core, patch) {
+  const cur = await loadPnlConfig(core)
+  const next = Object.assign({}, cur, patch || {})
+  await pnlStateWrite(core, CONFIG_FILE, JSON.stringify(next, null, 2))
+  return next
+}
+
+/** 读快照（snapshot.json）。缺失 / 损坏都返回 null。 */
+const loadPnlSnapshot = async function (core) {
+  try {
+    const text = await pnlStateRead(core, SNAPSHOT_FILE)
+    const parsed = text == null ? null : JSON.parse(text)
+    return (parsed && typeof parsed === 'object') ? parsed : null
+  } catch (e) { return null }
+}
+
+/** 写快照：**写不了不该让请求失败**，所以这里静默（与旧插件 saveSnapshot 一致）。 */
+const savePnlSnapshot = async function (core, snapshot) {
+  try {
+    await pnlStateWrite(core, SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2))
+    return true
+  } catch (e) { return false }
+}
+
+// 今日盈亏：组合列表 / 盈亏采集 / Cookie 校验（同花顺投资账本）。
+//
+// 三个坑逐字继承自旧插件（都是真实事故）：
+//   1. account_list 网关**只认最小请求头**（UA，多带 Accept/Referer 会被拒）；
+//   2. Cookie 里的 userid 必须**锚定**解析，否则会读到 pex_userid（→ 403）；
+//   3. 凭据类请求**绝不跟随重定向**（Cookie 不能外泄到别的 origin）。
+
+
+/** 3xx：网关重定向（旧实现 redirect:'manual' 拒绝跟随，这里同样按异常报出来）。 */
+const PNL_REDIRECT_STATUS = new Set([301, 302, 303, 307, 308])
+
+/**
+ * POST 表单并解析 JSON（错误语义与旧插件的 postForm 一一对应）。
+ * @returns {{ok:true, body:object}|{ok:false, tokenExpired:boolean, error:string}}
+ */
+async function postPnlForm(core, url, payload, cookie, opts) {
+  let res
+  try {
+    res = await pnlRequest(core, url, payload, cookie, opts)
+  } catch (error) {
+    return { ok: false, tokenExpired: false, error: '网络错误: ' + String((error && error.message) || error) }
+  }
+  const status = Number(res.status) || 0
+  if (PNL_REDIRECT_STATUS.has(status)) {
+    return { ok: false, tokenExpired: false, error: '接口重定向未跟随 (HTTP ' + status + ')' }
+  }
+  if (status === 401 || status === 403) {
+    return { ok: false, tokenExpired: true, error: 'TOKEN_EXPIRED (HTTP ' + status + ')' }
+  }
+  if (status < 200 || status >= 300) {
+    return { ok: false, tokenExpired: false, error: 'HTTP ' + status }
+  }
+  try {
+    return { ok: true, body: JSON.parse(res.text) }
+  } catch (e) {
+    return { ok: false, tokenExpired: false, error: '响应解析失败' }
+  }
+}
+
+/** 取 Cookie 里的 userid（锚定解析，见文件头第 2 条）。 */
+function pnlUserId(cookie) {
+  return cookieField(normalizeCookie(cookie), 'userid') || ''
+}
+
+/** account_list 的请求体（旧插件逐字）。 */
+function accountPayload(userId) {
+  return 'terminal=1&version=0.0.0&userid=' + userId + '&user_id=' + userId
+}
+
+/** 从最后一个采样点里探出金额字段。 */
+function pickYk(point) {
+  for (const key of YK_KEYS) {
+    if (point?.[key] !== undefined && point?.[key] !== null) {
+      return { value: Number(point[key]) || 0, field: key }
+    }
+  }
+  return { value: 0, field: '' }
+}
+
+/** 组合账户列表（fund_key / manualname / brokername）。失败返回空数组（调用方决定文案）。 */
+const listPortfolios = async function (core, cookie) {
+  const userId = pnlUserId(cookie)
+  const r = await postPnlForm(core, ACCOUNT_LIST_URL, accountPayload(userId), cookie, { minimal: true })
+  if (!r.ok) return []
+  const common = r.body?.ex_data?.common ?? []
+  return common
+    .map(item => ({
+      fund_key: String(item?.fund_key ?? ''),
+      manualname: String(item?.manualname ?? ''),
+      brokername: String(item?.brokername ?? ''),
+    }))
+    .filter(p => p.fund_key.length > 0)
+}
+
+/**
+ * 取一次快照：今日盈亏金额 + 百分比（金额字段名动态探测）。
+ * @returns {{pnl_yk:number, pnl_pct:number, error:string, token_expired:boolean, yk_field:string}}
+ */
+const collectPnl = async function (core, cookie, fundKey) {
+  const userId = pnlUserId(cookie)
+  const payload = accountPayload(userId)
+    + '&manual_id=&fundid=&fund_key=' + String(fundKey ?? '') + '&rzrq_fund_key=&custid='
+  const r = await postPnlForm(core, PNL_URL, payload, cookie)
+  if (!r.ok) {
+    return { pnl_yk: 0, pnl_pct: 0, error: r.error, token_expired: r.tokenExpired, yk_field: '' }
+  }
+  if (r.body?.error_code !== undefined && String(r.body.error_code) !== '0') {
+    return { pnl_yk: 0, pnl_pct: 0, error: String(r.body?.error_msg ?? 'API 错误'), token_expired: false, yk_field: '' }
+  }
+  const points = r.body?.ex_data?.data ?? []
+  if (points.length === 0) {
+    return { pnl_yk: 0, pnl_pct: 0, error: '接口返回空数据（可能今日无成交/未上传数据）', token_expired: false, yk_field: '' }
+  }
+  const last = points[points.length - 1]
+  const yk = pickYk(last)
+  return {
+    pnl_yk: yk.value,
+    pnl_pct: Number(last?.zf) || 0,
+    error: '',
+    token_expired: false,
+    yk_field: yk.field,
+  }
+}
+
+/** 校验 Cookie 是否被账本接受，并顺带回传组合列表。 */
+const verifyCookie = async function (core, cookie) {
+  const ck = normalizeCookie(cookie)
+  if (!ck) return { valid: false, error: '未配置 Cookie', portfolios: [] }
+  const userId = pnlUserId(ck)
+  if (!userId) return { valid: false, error: 'Cookie 缺少 userid 字段，可能已失效', portfolios: [] }
+  const r = await postPnlForm(core, ACCOUNT_LIST_URL, accountPayload(userId), ck, { minimal: true })
+  if (!r.ok) {
+    return {
+      valid: false,
+      error: r.tokenExpired ? 'Cookie 已过期，请重新登录投资账本后重新粘贴' : r.error,
+      portfolios: [],
+    }
+  }
+  const code = r.body?.error_code
+  if (code !== undefined && String(code) !== '0') {
+    return { valid: false, error: '账本拒绝请求: ' + String(r.body?.error_msg ?? '未知错误'), portfolios: [] }
+  }
+  const portfolios = await listPortfolios(core, ck)
+  return { valid: true, error: '', portfolios: portfolios, user_id: userId }
+}
+
+// 今日盈亏：installPnl(core) —— 三个 RPC 动作（pnl.get / pnl.verify / pnl.config）
+// 与「交易时段边界 + 盘中心跳」调度器。
+//
+// 宿主定节奏：客户端只按 next_poll_ms 打 pnl.get，拉不拉上游由宿主判定
+// （非交易时段直接回快照，不浪费请求、也不会被账本风控盯上）。
+//
+// 调度器是本文件唯一持有定时器的地方：一律走 ctx.timeout（动态形态里没有全局
+// setTimeout），并且**归一化返回值**——它可能是函数，也可能是带 .dispose() 的对象。
+
+
+// 说明：clampPollMs 在上游 dsh-ths-pnl 里定义于入口模块（不在 session.js），
+// 这里保持同样的归属，避免把「逐字搬 session.js」搅浑。
+/**
+ * 把用户填的秒数规整成合法的毫秒间隔。
+ * 非数字 / NaN / 非正数返回 null（调用方回退默认值）；越界夹到 [MIN, MAX]。
+ */
+function clampPollMs(value) {
+  const sec = typeof value === 'string' ? Number(value.trim()) : Number(value)
+  if (!Number.isFinite(sec) || sec <= 0) return null
+  return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, Math.round(sec * 1000)))
+}
+
+/** 生效的盘中心跳：存盘秒数（钳制过）> 默认 60 秒。 */
+function pnlPollMs(state) {
+  const ms = clampPollMs(state && state.pollSec)
+  return ms === null ? DEFAULT_POLL_MS : ms
+}
+
+/** ctx.timeout 的返回值可能是函数，也可能是带 .dispose() 的对象 —— 统一成「停止函数」。 */
+function stopOf(disposable) {
+  if (typeof disposable === 'function') return disposable
+  if (disposable && typeof disposable.dispose === 'function') return function () { disposable.dispose() }
+  return function () {}
+}
+
+/** 定时器回调里的异常只记日志：调度链不能因为一次网络失败断掉。 */
+function pnlWarn(ctx, error) {
+  try {
+    if (ctx.logger && typeof ctx.logger.warn === 'function') {
+      ctx.logger.warn(error instanceof Error ? error : new Error(String(error)))
+    }
+  } catch (e) { /* 日志失败不影响调度 */ }
+}
+
+function installPnl(core) {
+  const ctx = core.ctx
+  // 内存快照缓存（调度器判定用）+ 最近一次生效的心跳
+  core.pnl = { snapshot: null, pollMs: DEFAULT_POLL_MS }
+  let boundaryStop = null
+  let settleStop = null
+  // 收盘补拉**每天只做一次**：15:00 之后盘中心跳还会唤醒好几次，
+  // 若不记住「本交易日已补过」，5 分钟窗口内会重复打 5~6 次上游。
+  let settleDate = null
+
+  function stopTimer(stop) {
+    if (!stop) return
+    try { stop() } catch (e) { /* 已停止 */ }
+  }
+
+  /**
+   * 拉一次账本并写入快照。动作与边界定时器共用。
+   * @param {string} reason - 诊断用：route / force / boundary / startup / close-settle
+   */
+  async function refresh(reason) {
+    const state = await loadPnlConfig(core)
+    const cookie = typeof state.cookie === 'string' ? state.cookie : ''
+    if (!cookie) return null
+    core.pnl.pollMs = pnlPollMs(state)
+    // fundKey：存盘的 → 现探第一个组合（旧插件同语义，探到就落盘）
+    let fundKey = typeof state.fundKey === 'string' ? state.fundKey : ''
+    if (!fundKey) {
+      const list = await listPortfolios(core, cookie)
+      const first = list.length > 0 ? list[0].fund_key : ''
+      if (first) {
+        fundKey = first
+        try { await savePnlConfig(core, { fundKey: first }) } catch (e) { /* 存不下不影响本次取值 */ }
+      }
+    }
+    const pnl = await collectPnl(core, cookie, fundKey)
+    const now = new Date()
+    const info = sessionInfo(now)
+    const prev = (await loadPnlSnapshot(core)) || {}
+    // 标记位：今天是否已拉过「开盘后的值」/「收盘后的值」。
+    // 盘前那次拉到的其实是昨天收盘，所以不能打今天的标。
+    const snapshot = {
+      pnl_yk: pnl.pnl_yk,
+      pnl_pct: pnl.pnl_pct,
+      error: pnl.error,
+      token_expired: pnl.token_expired,
+      yk_field: pnl.yk_field,
+      fetched_at: now.toISOString(),
+      fetched_reason: reason,
+      sessionDate: info.minutes >= OPEN_MIN ? info.date : (prev.sessionDate ?? null),
+      closeDate: info.minutes >= CLOSE_MIN ? info.date : (prev.closeDate ?? null),
+    }
+    await savePnlSnapshot(core, snapshot)
+    core.pnl.snapshot = snapshot
+    return snapshot
+  }
+
+  /** 现在该不该打上游（无快照 → 该；盘中 → 该；否则看今天的标记位）。 */
+  async function shouldFetchNow() {
+    const info = sessionInfo(new Date())
+    const snap = await loadPnlSnapshot(core)
+    return shouldFetch(info, snap)
+  }
+
+  /**
+   * 排一次唤醒（先收掉上一个定时器，保证同一时刻只有一个）。
+   * @param {number} ms - 毫秒
+   * @param {string} reason - 唤醒后 refresh 用的诊断原因
+   */
+  function arm(ms, reason) {
+    stopTimer(boundaryStop)
+    boundaryStop = stopOf(ctx.timeout(function () {
+      wake(reason).catch(function () {})
+    }, ms))
+  }
+
+  /** 按既定节奏排下一次唤醒：盘中按心跳、盘外睡到下一个边界。 */
+  function schedule() {
+    const now = new Date()
+    const info = sessionInfo(now)
+    arm(nextPollMs(info, now, core.pnl.pollMs), 'boundary')
+  }
+
+  async function wake(reason) {
+    boundaryStop = null
+    try {
+      // 不该拉就什么都不做（例如节假日/午间的边界），避免无谓请求
+      if (await shouldFetchNow()) await refresh(reason)
+    } catch (e) { pnlWarn(ctx, e) }
+    // 15:00 那次拉到的收盘价可能还没落定：45 秒后再补一次，**每个交易日只补一次**。
+    // **绕过 shouldFetch**：15:00 那次已经打过 closeDate 标记，按规则就再也不会拉了。
+    const after = sessionInfo(new Date())
+    if (after.minutes >= CLOSE_MIN && after.minutes <= CLOSE_MIN + 5 && settleDate !== after.date) {
+      settleDate = after.date
+      stopTimer(settleStop)
+      settleStop = stopOf(ctx.timeout(function () {
+        settleStop = null
+        refresh('close-settle').catch(function () {})
+      }, CLOSE_SETTLE_MS))
+    }
+    schedule()
+  }
+
+  ctx.effect(function () {
+    // 启动补拉：进程刚起若"该有值"（盘中 / 今天还没拉过 / 从未拉过）就立刻补一次，
+    // 覆盖"09:30 时进程还没在跑"这种情况；错开插件加载高峰，3 秒后再打。
+    arm(STARTUP_DELAY_MS, 'startup')
+    return function () {
+      stopTimer(boundaryStop)
+      boundaryStop = null
+      stopTimer(settleStop)
+      settleStop = null
+    }
+  }, 'xueqiu-debug: 今日盈亏边界定时器')
+
+  /**
+   * pnl.get（args 可选 `{ force?: boolean }`）
+   * force=true 跳过 shouldFetch 判定强制打一次上游；未知字段一律忽略。
+   */
+  async function actPnlGet(args) {
+    const a = (args && typeof args === 'object') ? args : {}
+    const force = a.force === true
+    const now = new Date()
+    const info = sessionInfo(now)
+    const state = await loadPnlConfig(core)
+    const effective = pnlPollMs(state)
+    const pollMs = nextPollMs(info, now, effective)
+    const cookie = typeof state.cookie === 'string' ? state.cookie : ''
+    // 未配置：不请求上游，字段齐全（金额/时间给 null，error 空串）
+    if (!cookie) {
+      return {
+        configured: false, pnl_yk: null, pnl_pct: null, error: '', token_expired: false,
+        yk_field: '', updated_at: null, session: info.state, frozen: true,
+        poll_ms: effective, next_poll_ms: pollMs,
+      }
+    }
+
+    let snap = await loadPnlSnapshot(core)
+    let frozen = true
+    // 注意：**没有快照时 shouldFetch 必为 true** —— 这是「首次配置后立刻出数」的关键路径，
+    // 不能被会话判定提前挡掉（非交易时段也要真的拉一次）。
+    if (force || shouldFetch(info, snap)) {
+      const fresh = await refresh(force ? 'force' : 'route')
+      if (fresh) { snap = fresh; frozen = false }
+    }
+    if (!snap) {
+      return {
+        configured: true, pnl_yk: null, pnl_pct: null, error: '暂无数据', token_expired: false,
+        yk_field: '', updated_at: null, session: info.state, frozen: true,
+        poll_ms: effective, next_poll_ms: pollMs,
+      }
+    }
+    return {
+      configured: true,
+      pnl_yk: snap.pnl_yk,
+      pnl_pct: snap.pnl_pct,
+      error: snap.error ?? '',
+      token_expired: Boolean(snap.token_expired),
+      yk_field: snap.yk_field ?? '',
+      updated_at: snap.fetched_at ?? null,
+      session: info.state,
+      // 盘外时 frozen=true：界面显示的就是收盘/上一次的值，不会再变
+      frozen: frozen,
+      poll_ms: effective,
+      next_poll_ms: pollMs,
+    }
+  }
+
+  /** pnl.verify：用当前存的 Cookie 打一次 account_list（args 忽略）。 */
+  async function actPnlVerify() {
+    const state = await loadPnlConfig(core)
+    const cookie = typeof state.cookie === 'string' ? state.cookie : ''
+    const result = await verifyCookie(core, cookie)
+    const effective = pnlPollMs(state)
+    return {
+      configured: Boolean(cookie),
+      valid: result.valid,
+      error: result.error,
+      // name 回退链：manualname → brokername → fund_key（客户端直接显示）
+      portfolios: (result.portfolios ?? []).map(function (p) {
+        return { fund_key: p.fund_key, name: p.manualname || p.brokername || p.fund_key }
+      }),
+      fundKey: typeof state.fundKey === 'string' ? state.fundKey : '',
+      poll_ms: effective,
+      min_sec: MIN_POLL_MS / 1000,
+      max_sec: MAX_POLL_MS / 1000,
+    }
+  }
+
+  /** pnl.config：存 Cookie / fundKey / 刷新间隔，或 clear 清凭据（保留快照）。 */
+  async function actPnlSave(args) {
+    const a = (args && typeof args === 'object') ? args : {}
+
+    // clear：清 Cookie（**保留 snapshot**，最后已知盈亏不该被抹掉），不请求上游
+    if (a.clear === true) {
+      await savePnlConfig(core, { cookie: '', fundKey: '' })
+      const cleared = await loadPnlConfig(core)
+      const clearedMs = pnlPollMs(cleared)
+      return {
+        ok: true, configured: false, valid: false, error: '', portfolios: [],
+        fundKey: '', poll_ms: clearedMs, poll_sec: clearedMs / 1000,
+        min_sec: MIN_POLL_MS / 1000, max_sec: MAX_POLL_MS / 1000,
+      }
+    }
+
+    const patch = {}
+    if (typeof a.cookie === 'string' && a.cookie.trim().length > 0) {
+      const cookie = normalizeCookie(a.cookie.trim())
+      if (cookie.length > MAX_COOKIE_LEN) {
+        throw new Error('Cookie 过长（超过 ' + MAX_COOKIE_LEN + ' 字符），请只粘贴投资账本需要的字段')
+      }
+      patch.cookie = cookie
+    }
+    if (typeof a.fundKey === 'string') patch.fundKey = a.fundKey.trim()
+
+    // 刷新间隔：入参是**秒**，越界夹到边界值（省得用户猜范围），非数字才报错
+    if (a.pollSec !== undefined && a.pollSec !== null && a.pollSec !== '') {
+      const ms = clampPollMs(a.pollSec)
+      if (ms === null) throw new Error('刷新间隔请填 5–3600 之间的秒数')
+      patch.pollSec = ms / 1000
+    }
+
+    if (Object.keys(patch).length === 0) throw new Error('没有可保存的字段')
+    await savePnlConfig(core, patch)
+
+    // 存了 Cookie 就当场校验：客户端一次调用即可显示「已保存 / Cookie 无效」
+    const verify = patch.cookie ? await verifyCookie(core, patch.cookie) : null
+    const saved = await loadPnlConfig(core)
+    const effective = pnlPollMs(saved)
+    core.pnl.pollMs = effective
+    return {
+      ok: true,
+      configured: typeof saved.cookie === 'string' && saved.cookie.length > 0,
+      valid: verify ? verify.valid : false,
+      error: verify ? verify.error : '',
+      portfolios: verify ? (verify.portfolios ?? []).map(function (p) {
+        return { fund_key: p.fund_key, name: p.manualname || p.brokername || p.fund_key }
+      }) : [],
+      fundKey: typeof saved.fundKey === 'string' ? saved.fundKey : '',
+      // 回传生效值（可能被夹过），界面据此回填，避免「填了 1 秒却还是 5 秒」的困惑
+      poll_ms: effective,
+      poll_sec: effective / 1000,
+      min_sec: MIN_POLL_MS / 1000,
+      max_sec: MAX_POLL_MS / 1000,
+    }
+  }
+
+  core.actPnlGet = actPnlGet
+  core.actPnlVerify = actPnlVerify
+  core.actPnlSave = actPnlSave
 }
 
 // 16 个 endpoint 对应的业务动作（act*）。只做参数整形 + 调 getJSON + 走 normalizer。
@@ -1050,6 +1866,8 @@ function installActions(core) {
     'watchlist.pull': core.actWatchlistPull,
     'login.status': core.actLoginStatus, 'login.save': core.actLoginSave, 'login.logout': core.actLoginLogout,
     'ui.get': core.actUiGet, 'ui.set': core.actUiSet,
+    // 今日盈亏（同花顺投资账本）：宿主侧实现在 lib/pnl/，与旧插件 dsh-ths-pnl 共用状态文件
+    'pnl.get': core.actPnlGet, 'pnl.verify': core.actPnlVerify, 'pnl.config': core.actPnlSave,
     debug: async function () {
       return { running: core.running, waiters: core.waiters.length, inflight: Array.from(core.inflight.keys()), cacheKeys: core.cache.size, cookie: core.state.cookie ? 'set' : 'none', login: core.login ? ('uid=' + (core.login.uid || '?')) : 'anonymous' }
     }
@@ -1384,6 +2202,10 @@ function createXqCore(ctx, config) {
     cloudPid: null,   // 默认自选组合 pid（首次云端操作时探测并缓存）
     cookieSeeding: null,
     stateBasePromise: null,
+    // 今日盈亏状态目录的沙箱可写性探测（与 stateBasePromise 独立：目录不同、时机不同）
+    pnlBasePromise: null,
+    // 今日盈亏：installPnl 挂的 { snapshot, pollMs }；null = 尚未安装
+    pnl: null,
     syncInflight: false,
     // 请求调度槽位（gate.js 维护，debug RPC 会读）
     running: 0,
@@ -1402,6 +2224,8 @@ function createXqCore(ctx, config) {
   installLogin(core)
   installWatchlist(core)
   installUiState(core)
+  // 今日盈亏：必须在 installActions 之前（dispatch 表构造时按值捕获 core.actPnlGet 等）
+  installPnl(core)
   installApi(core)
   installActions(core)
   return core

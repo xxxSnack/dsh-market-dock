@@ -20,7 +20,10 @@
  *   3) 6 个 Agent 工具的注册名 / JSON Schema 根 / output / execute(null) 兜底
  *   4) RPC 契约：通道名 xq.call；/xq-rpc 的回环 Host 栅栏、Origin 同源栅栏、
  *      未知 action、ui.get / ui.set / debug / watchlist.get 的响应包络
- *   5) 状态文件隔离：全程只写临时目录，不碰真实 $DSH_HOME，也不往仓库里掉 .xueqiu-*.json
+ *   5) 今日盈亏 RPC（pnl.get / pnl.verify / pnl.config）：未配置不发请求、
+ *      **磁盘无快照时必拉一次**、force 跳过 shouldFetch、pollSec 越界钳制、
+ *      与旧插件 dsh-ths-pnl 共用状态文件（config.json / snapshot.json 分离）
+ *   6) 状态文件隔离：全程只写临时目录，不碰真实 $DSH_HOME，也不往仓库里掉 .xueqiu-*.json
  *
  * 安全：ctx.get('shell') 是**只会抛错**的假对象 —— 任何真实 shell / 网络都不会发生；
  *       ctx.get('fs') 是带监牢检查的真 fs 外壳 —— 越界路径一律抛错。
@@ -98,7 +101,8 @@ function makeFsStub() {
   }
 }
 
-function makeCtx() {
+function makeCtx(opts) {
+  const o = opts || {}
   const rec = {
     injectNames: [],
     effectCalls: 0,
@@ -107,14 +111,31 @@ function makeCtx() {
     routes: [],
     shellResolve: [],
     shellRun: [],
+    shellRunSpecs: [],   // 脚本化回放时真正"发出去"的 shell spec
+    disposers: [],       // ctx.effect 返回的回收函数（pnl 定时器清理用）
+    timers: [],          // manualTimers 模式下排过的定时器（永不自动触发）
+    timerStops: [],      // manualTimers 模式下被停止函数清掉的定时器间隔
   }
+  // 默认假 shell 只会抛错（零网络保证）；显式传 opts.shellResponses 时改成"脚本回放"。
+  const responses = Array.isArray(o.shellResponses) ? o.shellResponses.slice() : null
   const shell = {
     resolve(spec) {
       rec.shellResolve.push(String((spec && spec.command) || ''))
       return { __smokeStub: true, command: String((spec && spec.command) || '') }
     },
     run(spec) {
-      rec.shellRun.push(String((spec && spec.command) || ''))
+      const command = String((spec && spec.command) || '')
+      rec.shellRun.push(command)
+      if (responses) {
+        // 回放预置 stdout：形如 `body\n__HTTP__200`，与真实 curl -w 输出同形
+        if (responses.length === 0) throw new Error('[smoke] shell 脚本用尽：出现了预期外的请求')
+        const next = responses.shift() || {}
+        rec.shellRunSpecs.push(spec)
+        return {
+          exitCode: next.exitCode === undefined ? 0 : next.exitCode,
+          stdout: { text: String(next.text === undefined ? '' : next.text) },
+        }
+      }
       throw new Error('[smoke] shell.run 被拦截：测试内禁止真实 shell / 网络')
     },
   }
@@ -127,11 +148,27 @@ function makeCtx() {
   function effect(fn) {
     rec.effectCalls++
     const dispose = fn()
-    return typeof dispose === 'function' ? dispose : () => {}
+    if (typeof dispose === 'function') {
+      rec.disposers.push(dispose) // 记下来：收尾时可显式回收（pnl 的边界定时器）
+      return dispose
+    }
+    return () => {}
   }
 
   const ctx = {
     timeout(cb, ms) {
+      // manualTimers：不排真定时器，只登记 + 返回停止函数 —— 让用例完全确定，
+      // 不会有"启动 3 秒补拉"在断言进行到一半时突然触发。
+      if (o.manualTimers) {
+        const entry = { cb: cb, ms: ms, live: true }
+        rec.timers.push(entry)
+        return () => {
+          if (entry.live) {
+            entry.live = false
+            rec.timerStops.push(ms)
+          }
+        }
+      }
       const t = setTimeout(() => {
         timers.delete(t)
         cb()
@@ -556,6 +593,142 @@ try {
   check('仓库根未新增 .xueqiu-*.json', sameJson(listStateFiles(REPO_ROOT), baseline.repo), JSON.stringify(listStateFiles(REPO_ROOT)))
   check('插件目录未新增 .xueqiu-*.json', sameJson(listStateFiles(PLUGIN_DIR), baseline.plugin), JSON.stringify(listStateFiles(PLUGIN_DIR)))
   check('真实 ~/.dsh/dsh-xueqiu 未被触碰', sameJson(snapshotDir(REAL_XQ_HOME), baseline.realHome), JSON.stringify(snapshotDir(REAL_XQ_HOME)))
+
+  /* ---------------------------------------------------------------- *
+   * 11. 今日盈亏（pnl.*）：无快照必拉 + 未配置语义 + 越界钳制 + 共用状态文件
+   *
+   * 用**带脚本 shell** 的新实例：假 shell 只回放预置 stdout（形如
+   * `body\n__HTTP__200`），于是"到底发了几次上游请求"变成可断言的确定量。
+   * 该实例用 manualTimers（定时器只登记、不自动触发），断言不会被
+   * "启动 3 秒补拉"打断；旧实例 stat 的定时器在这里显式回收。
+   * ---------------------------------------------------------------- */
+  section('[9] 今日盈亏 RPC（pnl.get / pnl.verify / pnl.config）')
+  const PNL_DIR = path.join(SMOKE_HOME, 'dsh-ths-pnl') // 与旧插件 dsh-ths-pnl 同一路径
+  const PNL_CONFIG = path.join(PNL_DIR, 'config.json')
+  const PNL_SNAPSHOT = path.join(PNL_DIR, 'snapshot.json')
+  const readJsonFile = (p) => {
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { return null }
+  }
+  const PNL_SESSIONS = ['pre', 'morning', 'lunch', 'afternoon', 'after', 'weekend']
+
+  // 回收旧实例的 effect：否则 stat 的启动补拉可能在断言中途触发、往 snapshot.json 写脏值
+  for (const d of stat.rec.disposers) {
+    try { d() } catch (e) { /* 回收失败不影响其它断言 */ }
+  }
+  check('前置：旧实例的 effect 可回收（disposer 不抛错）', stat.rec.disposers.length >= 1, 'disposers=' + stat.rec.disposers.length)
+
+  const PNL_ACCT = '{"error_code":"0","ex_data":{"common":[{"fund_key":"FK9","manualname":"组合九","brokername":"券商"}]}}'
+  const PNL_SHARE = '{"error_code":"0","ex_data":{"data":[{"yk":1,"zf":0.1},{"yk":888.88,"zf":0.66}]}}'
+  const p = makeCtx({
+    manualTimers: true,
+    shellResponses: [
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 1 存 Cookie 后当场校验 → account_list
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 2 校验顺带取组合列表 → account_list
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 3 pnl.get：无快照 → 探 fund_key
+      { text: PNL_SHARE + '\n__HTTP__200' },  // 4 pnl.get：取今日盈亏
+      { text: PNL_SHARE + '\n__HTTP__200' },  // 5 pnl.get(force)
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 6 pnl.verify
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 7 pnl.verify → 组合列表
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 8 clear 后再存 Cookie → 校验
+      { text: PNL_ACCT + '\n__HTTP__200' },   // 9 校验顺带取组合列表
+    ],
+  })
+  plugin.apply(p.ctx)
+  const rpcP = (payload) => callRoute(p.rec.routes[0].handler, makeReq({ headers: SAME_ORIGIN, body: JSON.stringify(payload) }))
+  // 越界时返回空串：断言照样失败，但不会把后面所有断言一起崩掉（smoke 里更好定位）
+  const cmdAt = (i) => String(p.rec.shellRun[i] || '')
+
+  check('pnl 边界定时器挂在 ctx.effect 内，首次只排一个启动补拉（3000ms）', p.rec.timers.length === 1 && p.rec.timers[0].ms === 3000 && p.rec.disposers.length >= 1, 'timers=' + JSON.stringify(p.rec.timers.map((t) => t.ms)) + ' disposers=' + p.rec.disposers.length)
+
+  // ---- 未配置：不请求上游、字段齐全 ----
+  const pnlIdle = jsonOf(await rpcP({ action: 'pnl.get' }))
+  check('未配置：pnl.get → 200 + ok:true + configured:false', pnlIdle && pnlIdle.ok === true && pnlIdle.data && pnlIdle.data.configured === false, JSON.stringify(pnlIdle))
+  check('未配置：pnl_yk / pnl_pct / updated_at 为 null、error 为空串', Boolean(pnlIdle && pnlIdle.data) && pnlIdle.data.pnl_yk === null && pnlIdle.data.pnl_pct === null && pnlIdle.data.updated_at === null && pnlIdle.data.error === '', JSON.stringify(pnlIdle && pnlIdle.data))
+  check('未配置：poll_ms 回退默认 60 秒、next_poll_ms 正数', Boolean(pnlIdle && pnlIdle.data) && pnlIdle.data.poll_ms === 60000 && pnlIdle.data.next_poll_ms > 0, JSON.stringify(pnlIdle && pnlIdle.data))
+
+  const pnlIdleForce = jsonOf(await rpcP({ action: 'pnl.get', args: { force: true } }))
+  check('未配置：force 也拉不动（没有 Cookie 可用），仍 configured:false', Boolean(pnlIdleForce && pnlIdleForce.data) && pnlIdleForce.data.configured === false, JSON.stringify(pnlIdleForce))
+
+  const pnlVerifyIdle = jsonOf(await rpcP({ action: 'pnl.verify' }))
+  check('未配置：pnl.verify → configured:false / valid:false / portfolios:[]', Boolean(pnlVerifyIdle && pnlVerifyIdle.data) && pnlVerifyIdle.data.configured === false && pnlVerifyIdle.data.valid === false && sameJson(pnlVerifyIdle.data.portfolios, []), JSON.stringify(pnlVerifyIdle && pnlVerifyIdle.data))
+  check('未配置：pnl.verify 给可读中文原因', Boolean(pnlVerifyIdle && pnlVerifyIdle.data) && pnlVerifyIdle.data.error === '未配置 Cookie', String(pnlVerifyIdle && pnlVerifyIdle.data && pnlVerifyIdle.data.error))
+  check('未配置：pnl.verify 回传 5/3600 秒边界', Boolean(pnlVerifyIdle && pnlVerifyIdle.data) && pnlVerifyIdle.data.min_sec === 5 && pnlVerifyIdle.data.max_sec === 3600, JSON.stringify(pnlVerifyIdle && pnlVerifyIdle.data))
+  check('未配置：三个动作累计零上游请求（不白打账本）', p.rec.shellRun.length === 0, JSON.stringify(p.rec.shellRun))
+
+  // ---- pollSec 钳制 ----
+  const cfgBig = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 99999 } }))
+  check('pnl.config：pollSec 超上限 → 夹到 3600 秒（不报错）', Boolean(cfgBig && cfgBig.data) && cfgBig.ok === true && cfgBig.data.poll_ms === 3600000 && cfgBig.data.poll_sec === 3600, JSON.stringify(cfgBig))
+  const cfgSmall = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 1 } }))
+  check('pnl.config：pollSec 低于下限 → 夹到 5 秒', Boolean(cfgSmall && cfgSmall.data) && cfgSmall.data.poll_ms === 5000 && cfgSmall.data.poll_sec === 5, JSON.stringify(cfgSmall))
+  check('pnl.config：回传 min_sec / max_sec = 5 / 3600', Boolean(cfgSmall && cfgSmall.data) && cfgSmall.data.min_sec === 5 && cfgSmall.data.max_sec === 3600, JSON.stringify(cfgSmall && cfgSmall.data))
+  const cfgBad = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 'abc' } }))
+  check('pnl.config：pollSec 非数字 → ok:false + 精确中文提示', Boolean(cfgBad) && cfgBad.ok === false && cfgBad.error === '刷新间隔请填 5–3600 之间的秒数', JSON.stringify(cfgBad))
+  const cfgEmpty = jsonOf(await rpcP({ action: 'pnl.config', args: {} }))
+  check('pnl.config：空 patch → ok:false（没有可保存的字段）', Boolean(cfgEmpty) && cfgEmpty.ok === false && cfgEmpty.error === '没有可保存的字段', JSON.stringify(cfgEmpty))
+  const cfgJunk = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 60, 无关字段: { x: 1 } } }))
+  check('pnl.config：多余字段被忽略（不因未知字段抛错）', Boolean(cfgJunk) && cfgJunk.ok === true && cfgJunk.data.poll_ms === 60000, JSON.stringify(cfgJunk))
+  check('pollSec 落盘为 config.json 的秒数（与旧插件字段名一致）', (readJsonFile(PNL_CONFIG) || {}).pollSec === 60, JSON.stringify(readJsonFile(PNL_CONFIG)))
+  check('pollSec 的写入同样走 $DSH_HOME/dsh-ths-pnl（共用状态文件）', fs.existsSync(PNL_CONFIG) && fs.realpathSync(PNL_DIR) === fs.realpathSync(path.join(SMOKE_HOME, 'dsh-ths-pnl')))
+
+  // ---- 存 Cookie（先写一个"脏"Cookie，验证规整 + 当场校验）----
+  const cfgSave = jsonOf(await rpcP({ action: 'pnl.config', args: { cookie: '  userid=abc ;\n  token=T1  ' } }))
+  check('pnl.config：存 Cookie → ok:true + configured:true', Boolean(cfgSave && cfgSave.data) && cfgSave.ok === true && cfgSave.data.configured === true, JSON.stringify(cfgSave))
+  check('pnl.config：当场校验 → valid:true + 组合下拉（name 用 manualname）', Boolean(cfgSave && cfgSave.data) && cfgSave.data.valid === true && sameJson(cfgSave.data.portfolios, [{ fund_key: 'FK9', name: '组合九' }]), JSON.stringify(cfgSave && cfgSave.data))
+  check('pnl.config：Cookie 被 normalizeCookie 规整后落盘', (readJsonFile(PNL_CONFIG) || {}).cookie === 'userid=abc; token=T1', JSON.stringify((readJsonFile(PNL_CONFIG) || {}).cookie))
+  check('pnl.config：校验用最小请求头打 account_list /2 次', p.rec.shellRun.length === 2 && cmdAt(0).indexOf('account/v1/account_list') >= 0 && cmdAt(0).indexOf('Referer') < 0, '实际 ' + p.rec.shellRun.length)
+  check('pnl.config：Cookie 头里是规整后的 userid（不是 pex_userid）', cmdAt(0).indexOf('userid=abc') >= 0 && cmdAt(0).indexOf('pex_userid') < 0, cmdAt(0))
+
+  // ---- 核心路径：磁盘上没有快照 → 必须真的拉一次（否则首屏永远空白）----
+  check('前置：磁盘上还没有 snapshot.json（"无快照必拉"才测得到）', !fs.existsSync(PNL_SNAPSHOT))
+  const pnlFirst = jsonOf(await rpcP({ action: 'pnl.get' }))
+  check('无快照：pnl.get 真的打了上游（探 fund_key + 取数，共 2 次）', p.rec.shellRun.length === 4, '实际 ' + p.rec.shellRun.length)
+  check('无快照：第 1 次是 account_list（最小头）', cmdAt(2).indexOf('account/v1/account_list') >= 0 && cmdAt(2).indexOf('Referer') < 0, cmdAt(2))
+  check('无快照：第 2 次是 time_share 且带探到的 fund_key', cmdAt(3).indexOf('asset/v1/time_share') >= 0 && cmdAt(3).indexOf('fund_key=FK9') >= 0, cmdAt(3))
+  check('pnl.get：取最后一个采样点的金额与百分比', Boolean(pnlFirst && pnlFirst.data) && pnlFirst.data.pnl_yk === 888.88 && pnlFirst.data.pnl_pct === 0.66, JSON.stringify(pnlFirst && pnlFirst.data))
+  check('pnl.get：yk_field / configured / error / token_expired', Boolean(pnlFirst && pnlFirst.data) && pnlFirst.data.yk_field === 'yk' && pnlFirst.data.configured === true && pnlFirst.data.error === '' && pnlFirst.data.token_expired === false, JSON.stringify(pnlFirst && pnlFirst.data))
+  check('pnl.get：session ∈ 六态、frozen:false（刚拉完）、updated_at 是 ISO', Boolean(pnlFirst && pnlFirst.data) && PNL_SESSIONS.indexOf(pnlFirst.data.session) >= 0 && pnlFirst.data.frozen === false && /^\d{4}-\d{2}-\d{2}T/.test(String(pnlFirst.data.updated_at)), JSON.stringify(pnlFirst && pnlFirst.data))
+  check('sanitize 原样过 pnl_yk（number）/ next_poll_ms（number）', Boolean(pnlFirst && pnlFirst.data) && typeof pnlFirst.data.pnl_yk === 'number' && pnlFirst.data.pnl_yk === 888.88 && typeof pnlFirst.data.next_poll_ms === 'number', JSON.stringify(pnlFirst && pnlFirst.data))
+  check('pnl.get 字段名与契约完全一致（不多不少）', Boolean(pnlFirst && pnlFirst.data) && sameJson(Object.keys(pnlFirst.data).sort(), ['configured', 'error', 'frozen', 'next_poll_ms', 'pnl_pct', 'pnl_yk', 'poll_ms', 'session', 'token_expired', 'updated_at', 'yk_field']), JSON.stringify(Object.keys((pnlFirst && pnlFirst.data) || {})))
+  check('探测到的 fund_key 回写 config.json（下次不用再探）', (readJsonFile(PNL_CONFIG) || {}).fundKey === 'FK9', JSON.stringify(readJsonFile(PNL_CONFIG)))
+  check('快照落盘 snapshot.json，fetched_reason=route', (readJsonFile(PNL_SNAPSHOT) || {}).pnl_yk === 888.88 && (readJsonFile(PNL_SNAPSHOT) || {}).fetched_reason === 'route', JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
+  check('快照带 sessionDate / closeDate 标记位（判定"今天是否拉过"）', typeof (readJsonFile(PNL_SNAPSHOT) || {}).sessionDate === 'string', JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
+
+  // ---- force：跳过 shouldFetch，强制再拉一次 ----
+  const pnlForce = jsonOf(await rpcP({ action: 'pnl.get', args: { force: true } }))
+  check('force:true 跳过 shouldFetch 判定：又打了一次上游', p.rec.shellRun.length === 5, '实际 ' + p.rec.shellRun.length)
+  check('force 那次已知道 fund_key，只打 time_share（不再探组合）', cmdAt(4).indexOf('asset/v1/time_share') >= 0, cmdAt(4))
+  check('force 那次 fetched_reason=force 落盘', (readJsonFile(PNL_SNAPSHOT) || {}).fetched_reason === 'force', JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
+  check('force 回包仍是契约字段齐全的成功响应', Boolean(pnlForce && pnlForce.data) && pnlForce.data.pnl_yk === 888.88 && pnlForce.data.frozen === false, JSON.stringify(pnlForce && pnlForce.data))
+
+  // ---- verify：用存好的 Cookie 打一次 account_list ----
+  const pnlVerify = jsonOf(await rpcP({ action: 'pnl.verify' }))
+  check('pnl.verify：valid:true + 组合列表（name 回退链）', Boolean(pnlVerify && pnlVerify.data) && pnlVerify.data.valid === true && sameJson(pnlVerify.data.portfolios, [{ fund_key: 'FK9', name: '组合九' }]), JSON.stringify(pnlVerify && pnlVerify.data))
+  check('pnl.verify：fundKey 回传存盘值 / poll_ms 回传 60000', Boolean(pnlVerify && pnlVerify.data) && pnlVerify.data.fundKey === 'FK9' && pnlVerify.data.poll_ms === 60000, JSON.stringify(pnlVerify && pnlVerify.data))
+  check('pnl.verify：又发了 2 次 account_list（校验 + 取组合）', p.rec.shellRun.length === 7, '实际 ' + p.rec.shellRun.length)
+
+  // ---- clear：清 Cookie 但**保留 snapshot**（最后已知盈亏不该被抹掉）----
+  const cfgClear = jsonOf(await rpcP({ action: 'pnl.config', args: { clear: true } }))
+  check('pnl.config clear：configured:false / valid:false / portfolios:[]', Boolean(cfgClear && cfgClear.data) && cfgClear.ok === true && cfgClear.data.configured === false && cfgClear.data.valid === false && sameJson(cfgClear.data.portfolios, []), JSON.stringify(cfgClear && cfgClear.data))
+  check('pnl.config clear：不请求上游', p.rec.shellRun.length === 7, '实际 ' + p.rec.shellRun.length)
+  check('pnl.config clear：Cookie 已清空', (readJsonFile(PNL_CONFIG) || {}).cookie === '', JSON.stringify((readJsonFile(PNL_CONFIG) || {}).cookie))
+  check('pnl.config clear：snapshot.json 被保留（最后已知盈亏仍在）', (readJsonFile(PNL_SNAPSHOT) || {}).pnl_yk === 888.88, JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
+
+  // ---- 再存一次：确认 clear 之后能重新配置 ----
+  const cfgSave2 = jsonOf(await rpcP({ action: 'pnl.config', args: { cookie: 'userid=abc;  token=T2\n', pollSec: 30 } }))
+  check('pnl.config：clear 后可重新存 Cookie（valid:true）', Boolean(cfgSave2 && cfgSave2.data) && cfgSave2.data.valid === true && cfgSave2.data.configured === true, JSON.stringify(cfgSave2 && cfgSave2.data))
+  check('pnl.config：Cookie + pollSec 一次写入都生效', (readJsonFile(PNL_CONFIG) || {}).cookie === 'userid=abc; token=T2' && (readJsonFile(PNL_CONFIG) || {}).pollSec === 30, JSON.stringify(readJsonFile(PNL_CONFIG)))
+  check('pnl.config：回传生效的 poll_sec（30）', Boolean(cfgSave2 && cfgSave2.data) && cfgSave2.data.poll_sec === 30 && cfgSave2.data.poll_ms === 30000, JSON.stringify(cfgSave2 && cfgSave2.data))
+
+  // ---- 收尾：依赖面 + 定时器可回收 ----
+  const pnlGot = []
+  for (const n of p.rec.getNames) if (pnlGot.indexOf(n) < 0) pnlGot.push(n)
+  check('pnl 侧 ctx.get 依赖面 ⊆ {shell, fs, sandboxPolicy}', pnlGot.length > 0 && pnlGot.every((n) => ['shell', 'fs', 'sandboxPolicy'].indexOf(n) >= 0), JSON.stringify(pnlGot))
+  for (const d of p.rec.disposers) {
+    try { d() } catch (e) { /* 已回收 */ }
+  }
+  check('pnl 边界定时器可回收（disposer 停掉启动补拉 3000ms）', p.rec.timerStops.indexOf(3000) >= 0, JSON.stringify(p.rec.timerStops))
+  check('无真实定时器泄漏（manualTimers 下 pnl 只用登记式定时器）', p.rec.timers.every((t) => t.live === false), JSON.stringify(p.rec.timers))
+  check('全程没有真实 shell / 网络：所有命令都是 curl 命令行', p.rec.shellRun.length > 0 && p.rec.shellRun.every((c) => /^curl(\.exe)?\s/.test(c)), '共 ' + p.rec.shellRun.length + ' 条')
 } catch (e) {
   failures.push('未捕获异常: ' + String((e && e.stack) || e))
   console.log('\n  ✗ 未捕获异常 :: ' + String((e && e.stack) || e))

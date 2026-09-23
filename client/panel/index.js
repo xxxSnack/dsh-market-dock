@@ -1,14 +1,15 @@
 // XueqiuPanel：面板内容容器（数据 + tab 条 + 查表分发）。
 //
-// 内层视图（LoginBox / MarketTab / DetailView / HotTab / SearchTab / NewsTab）已提到模块作用域，
+// 内层视图（LoginBox / MarketTab / DetailView / HotTab / SearchTab / NewsTab / PnlTab）已提到模块作用域，
 // 原来靠父级闭包读的 state/句柄改为「调用点组装显式上下文 p」传入；本文件只保留数据逻辑。
 //
 // tab 分发表：ui.tab → 组件。注意 DetailView 不在此表 —— 详情由 view 真值门控（旧 if/else 链
-// 也是先判 view），且宿主 ui.get 会把 tab 白名单化成 market/hot/search/news。把 detail 塞进
+// 也是先判 view），且宿主 ui.get 会把 tab 白名单化成 market/hot/search/news/pnl。把 detail 塞进
 // 查表会让理论上不可达的 tab='detail' 渲染详情骨架（旧行为是落到快讯页），属于行为变化。
 import { el, pageHidden } from '../dom.js'
 import { call, A_HOT, A_NEWS, A_KLINE, A_QUOTE_DETAIL, A_MINUTE, A_FINANCE, A_KOL, A_SEARCH, A_SEARCH_POSTS, A_LOGIN_STATUS, A_LOGIN_SAVE, A_LOGIN_LOGOUT, A_WATCHLIST_ADD, A_WATCHLIST_REMOVE, A_WATCHLIST_PULL } from '../platform.js'
 import { getUiRuntime } from '../store/ui.js'
+import { getPnlRuntime } from '../store/pnl.js'
 import { fetchQuote, fetchIndices, fetchWatchlist } from '../store/market.js'
 import { LoginBox } from './login.js'
 import { MarketTab } from './market.js'
@@ -16,9 +17,10 @@ import { DetailView } from './detail.js'
 import { HotTab } from './hot.js'
 import { SearchTab } from './search.js'
 import { NewsTab } from './news.js'
+import { PnlTab } from './pnl.js'
 import { PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, SEARCH_STOCK_SIZE, SEARCH_POST_SIZE, POLL_MARKET_OPEN_MS, POLL_MARKET_CLOSED_MS, POLL_CONTENT_OPEN_MS, POLL_CONTENT_CLOSED_MS } from '../constants.js'
 
-const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab }
+const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab, pnl: PnlTab }
 
 // ---------- 面板内容（数据 + tabs + 详情） ----------
 export function XueqiuPanel() {
@@ -335,7 +337,10 @@ export function XueqiuPanel() {
       key: 'btn', className: 'xq-btn', disabled: loading, title: '刷新全部数据',
       onClick: function () {
         setLoading(true)
-        Promise.all([refreshMarket(), refreshContent()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
+        // 盈亏一并刷新：refresh() 内部已做并发去重，与后台轮询不会重复请求；
+        // 它自己吞掉失败（返回 null 而非拒绝），所以这里的 loading 语义与原来完全一致。
+        const pnlRt = getPnlRuntime()
+        Promise.all([refreshMarket(), refreshContent(), pnlRt ? pnlRt.refresh() : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
       }
     }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
   ]))
@@ -343,7 +348,7 @@ export function XueqiuPanel() {
   const errBox = err ? el('div', { className: 'xq-err' }, err) : null
 
   // 每个 tab 的显式上下文工厂：字段 = 该 tab 函数体里用到的父级 state/句柄
-  // （MarketTab/HotTab/SearchTab/NewsTab 的字段清单见各自文件头部注释）
+  // （MarketTab/HotTab/SearchTab/NewsTab 的字段清单见各自文件头部注释；PnlTab 自取运行时，故返回空对象）
   const TAB_CTX = {
     market: function () {
       return {
@@ -370,6 +375,9 @@ export function XueqiuPanel() {
       return {
         news: news, newsMore: newsMore, newsNoMore: newsNoMore, loadMoreNews: loadMoreNews
       }
+    },
+    pnl: function () {
+      return {}   // PnlTab 自身订阅盈亏运行时，不需要父级任何字段
     }
   }
 

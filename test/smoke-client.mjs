@@ -896,11 +896,11 @@ check('flush 后 (ui.get) 水合生效，面板渲染出 .xq-dock', () => {
   ok(hasClass(tree, 'xq-dock-body'), '缺 .xq-dock-body')
   ok(hasClass(tree, 'xq-dock-resize'), '缺 .xq-dock-resize（高度拖拽条）')
 })
-check('面板渲染出 4 个 tab 与搜索行', () => {
+check('面板渲染出 5 个 tab 与搜索行', () => {
   const tree = panelTree('second')
-  for (const needle of ['行情', '热榜', '搜索', '快讯']) ok(textHas(tree, needle), '缺 tab 文案 ' + needle)
+  for (const needle of ['行情', '热榜', '搜索', '快讯', '盈亏']) ok(textHas(tree, needle), '缺 tab 文案 ' + needle)
   ok(hasClass(tree, 'xq-search-row'), '缺 .xq-search-row')
-  eq(classCount(tree, 'xq-tab'), 4, 'tab 数量')
+  eq(classCount(tree, 'xq-tab'), 5, 'tab 数量')
   return treeHosts(tree).length + ' 个宿主节点'
 })
 check('flush 期间请求全部指向 /xq-rpc（未出网）', () => {
@@ -923,8 +923,71 @@ check('flush 后 effect 里登记了轮询（ctx.interval）', () => {
 check('数据加载完成后复渲染仍稳定（不抛错、面板结构不变）', () => {
   const tree = panelTree('third')
   ok(hasClass(tree, 'xq-dock'), '第三次渲染丢了 .xq-dock')
-  eq(classCount(tree, 'xq-tab'), 4, 'tab 数量')
+  eq(classCount(tree, 'xq-tab'), 5, 'tab 数量')
   return treeHosts(tree).length + ' 个宿主节点'
+})
+
+// ---------------------------------------------------------------- 5b. 今日盈亏（pnl）接线契约
+// 客户端新增的第 5 个 tab（同花顺投资账本「今日总盈亏」）。这里只断言对外可观察的契约：
+// 常量字面量、tab 表顺序、头部 chip 与 tab 文案，以及 CSS 里确实落了 .xq-pnl-* 规则。
+section('[5b] 今日盈亏接线契约（常量 / tab 顺序 / 头部 chip / 样式）')
+const clientSource = (() => {
+  try {
+    return readFileSync(BUNDLE_PATH, 'utf8')
+  } catch (err) {
+    return ''
+  }
+})()
+
+check("A_PNL_* 三个 action 常量值正确（'pnl.get'/'pnl.verify'/'pnl.config'）", () => {
+  const want = ["A_PNL_GET = 'pnl.get'", "A_PNL_VERIFY = 'pnl.verify'", "A_PNL_CONFIG = 'pnl.config'"]
+  const miss = want.filter((s) => !clientSource.includes(s))
+  ok(miss.length === 0, '产物里找不到：' + miss.join(' | '))
+  return want.length + ' 个常量'
+})
+check('PNL_POLL_FALLBACK_MS = 60000（轮询兜底退避）', () => {
+  ok(clientSource.includes('PNL_POLL_FALLBACK_MS = 60000'), '产物里找不到 PNL_POLL_FALLBACK_MS = 60000')
+  return '60000'
+})
+check("PANEL_TABS 含 ['pnl','盈亏']，且前 4 项顺序与字面量未变", () => {
+  const line = clientSource.split('\n').find((l) => l.includes('const PANEL_TABS ='))
+  ok(line, '产物里找不到 PANEL_TABS 定义行')
+  const ordered = ["['market', '行情']", "['hot', '热榜']", "['search', '搜索']", "['news', '快讯']", "['pnl', '盈亏']"]
+  let at = -1
+  for (const token of ordered) {
+    const i = line.indexOf(token, at + 1)
+    ok(i > at, 'PANEL_TABS 缺少或顺序不符：' + token + '（实际行：' + line.trim() + '）')
+    at = i
+  }
+  return '5 项，顺序正确'
+})
+check('pnl 已接进 XQ_TABS / TAB_CTX（渲染分发不落回默认 tab）', () => {
+  ok(/const XQ_TABS = \{[^}]*pnl: PnlTab[^}]*\}/.test(clientSource), 'XQ_TABS 未接 pnl: PnlTab')
+  ok(/pnl: function \(\) \{\s*return \{\}/.test(clientSource), 'TAB_CTX 未提供 pnl（应为空上下文）')
+  return 'XQ_TABS.pnl + TAB_CTX.pnl'
+})
+check('面板 tab 条文案顺序 = 行情/热榜/搜索/快讯/盈亏', () => {
+  const tree = panelTree('second')
+  const labels = treeHosts(tree)
+    .filter((h) => classOf(h).split(/\s+/).includes('xq-tab'))
+    .map((h) => treeText(h))
+  eqJson(labels, ['行情', '热榜', '搜索', '快讯', '盈亏'], 'tab 文案顺序')
+})
+check('头部 xq-dock-head 里渲染出常驻盈亏 chip', () => {
+  const tree = panelTree('second')
+  ok(hasClass(tree, 'xq-pnl-chip'), '缺 .xq-pnl-chip')
+  const head = treeHosts(tree).find((h) => classOf(h).split(/\s+/).includes('xq-dock-head'))
+  ok(head, '缺 .xq-dock-head')
+  ok(textHas(head, '今日盈亏'), '头部 chip 文案缺「今日盈亏」：' + treeText(head))
+  return treeText(head).slice(0, 80)
+})
+check('样式契约：CSS 里有 .xq-pnl-* 规则且不含模板字面量标记', () => {
+  const tag = styleTags(main.dom)[main.styleAfter - 1]
+  const css = String(tag.textContent || '')
+  ok(css.includes('.xq-pnl-chip'), 'CSS 里没有 .xq-pnl-chip')
+  ok(css.includes('.xq-pnl-amt'), 'CSS 里没有 .xq-pnl-amt')
+  ok(!css.includes('`') && !css.includes('${'), 'CSS 里出现反引号或 ${（#include-styles 内联会炸）')
+  return 'chip + amt + ' + css.length + ' 字符'
 })
 
 // ---------------------------------------------------------------- 6. slots 缺失时的降级

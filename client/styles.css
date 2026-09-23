@@ -180,3 +180,36 @@
 .xq-login-ok{color:var(--dsw-alias-state-success-primary);}
 .xq-login-bad{color:var(--dsw-alias-state-warn-primary);}
 .xq-acc-mark{font-size:10px;color:var(--dsw-alias-label-secondary);}
+/* 今日盈亏（同花顺投资账本）：头部常驻 chip + 「盈亏」tab。
+   配色沿用既有变量，A 股习惯「涨红跌绿」：up 用 state-error-primary、down 用 state-success-primary。 */
+.xq-pnl-chip{display:inline-flex;align-items:baseline;gap:4px;font-size:11px;padding:1px 8px;border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);white-space:nowrap;cursor:pointer;font-variant-numeric:tabular-nums;transition:color .15s;max-width:300px;overflow:hidden;text-overflow:ellipsis;}
+.xq-pnl-chip:hover{color:var(--dsw-alias-label-primary);}
+.xq-pnl-chip.xq-pnl-up{color:var(--dsw-alias-state-error-primary);font-weight:600;}
+.xq-pnl-chip.xq-pnl-down{color:var(--dsw-alias-state-success-primary);font-weight:600;}
+.xq-pnl-chip.xq-pnl-bad{color:var(--dsw-alias-state-warn-primary);}
+.xq-pnl-tag{font-size:10px;color:var(--dsw-alias-label-tertiary);font-weight:400;}
+.xq-pnl{display:flex;flex-direction:column;gap:9px;max-width:560px;}
+.xq-pnl-hero{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+.xq-pnl-amt{font-size:26px;font-weight:800;line-height:1.1;font-variant-numeric:tabular-nums;}
+.xq-pnl-pct{font-size:14px;font-weight:700;font-variant-numeric:tabular-nums;}
+.xq-pnl-up{color:var(--dsw-alias-state-error-primary);}
+.xq-pnl-down{color:var(--dsw-alias-state-success-primary);}
+.xq-pnl-dim{color:var(--dsw-alias-label-secondary);}
+.xq-pnl-ok{color:var(--dsw-alias-state-success-primary);}
+.xq-pnl-bad{color:var(--dsw-alias-state-warn-primary);}
+.xq-pnl-meta{font-size:11px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;}
+.xq-pnl-block{display:flex;flex-direction:column;gap:6px;}
+.xq-pnl-sec{font-size:12.5px;font-weight:700;display:flex;align-items:center;gap:8px;}
+.xq-pnl-sec::before{content:"";width:3px;height:12px;border-radius:2px;background:var(--dsw-alias-brand-primary);flex:none;}
+.xq-pnl-field{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.xq-pnl-field label{font-size:12px;color:var(--dsw-alias-label-secondary);flex:none;}
+.xq-pnl-sel{font-size:12.5px;padding:3px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);max-width:100%;}
+.xq-pnl-num{font-size:12.5px;width:88px;padding:3px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;}
+.xq-pnl-num:focus,.xq-pnl-sel:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}
+.xq-pnl-ta{font-size:11.5px;font-family:ui-monospace,Menlo,monospace;width:100%;min-height:64px;resize:vertical;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.xq-pnl-ta:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}
+.xq-pnl-note{font-size:11px;color:var(--dsw-alias-label-tertiary);line-height:1.6;}
+.xq-pnl-sub{font-size:11px;line-height:1.6;color:var(--dsw-alias-label-secondary);}
+.xq-pnl-sub.xq-pnl-bad{color:var(--dsw-alias-state-warn-primary);}
+.xq-pnl-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.xq-pnl-msg{font-size:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;}

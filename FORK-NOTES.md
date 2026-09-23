@@ -13,6 +13,8 @@
   代价：不能与上游 `dsh-xueqiu` 同时启用（会重复注册同名工具），本 fork 是**替代**上游。
 - 状态目录默认仍是 `$DSH_HOME/dsh-xueqiu/`（存量自选/Cookie/界面位置无缝继承；
   可用插件配置 `stateDir` 改成别的目录与上游彻底隔离，见 §4）。
+- 已并入 `dsh-ths-pnl` 的「今日盈亏」：面板头部常驻 chip + 第 5 个「盈亏」tab，
+  **与 `dsh-ths-pnl` 共用同一份凭据与快照**（`$DSH_HOME/dsh-ths-pnl/`），见 §8。
 
 ---
 
@@ -51,34 +53,36 @@
 
 ### 1.3 目录地图
 
-**host（`lib/`，23 个模块，顺序见 `lib/manifest.txt`）**
+**host（`lib/`，29 个模块，顺序见 `lib/manifest.txt`）**
 
 | 模块 | 职责 |
 |---|---|
 | `constants.js` | UA/BASE/SITE/curl 名/默认自选表/调度与钳制常量 |
-| `config.js` | 插件配置解析（`stateDir` / `watchlist`），未配置时全部走默认值 |
+| `config.js` | 插件配置解析（`stateDir` / `watchlist` / `pnlStateDir`），未配置时全部走默认值 |
 | `cache.js` `gate.js` `http.js` | 请求管道：TTL 缓存+去重 → 并发/限速/看门狗 → curl/ensureCookie/getJSON（含重试链） |
 | `normalize.js` | 纯函数：nz/sanitize/pickQuote/mapKline/mapPosts/mapKOL/mapFinance |
 | `state.js` `watchlist.js` `login.js` `ui-state.js` | 状态落点、自选（含云端镜像）、可选登录、UI 状态持久化 |
+| `pnl/*.js` | 今日盈亏：`constants`/`session`（交易时段纯函数）/`http`（Cookie+带状态码 curl）/`store`（**共用** `dsh-ths-pnl` 的 config.json+snapshot.json）/`collect`（组合·采集·校验）/`index`（3 个 act* + 边界调度） |
 | `api.js` | 16 个雪球 endpoint 对应的 `act*` 业务动作 |
-| `actions.js` | RPC `dispatch` 表（21 个 action）+ `handleCall` 包络 |
+| `actions.js` | RPC `dispatch` 表（24 个 action）+ `handleCall` 包络 |
 | `tools/*.js` | 每个 Agent 工具一个 spec 工厂 + `makeAgentTools(core)` 汇总 |
 | `register.js` | 双路径注册（RPC 暴露 + 工具注册） |
 | `core.js` | `createXqCore(ctx, config)`：共享状态 + 按序安装各模块 |
 | `index.js` | 入口：`apply(ctx, config)` 薄壳 + `export default` |
 
-**client（`client/`，23 个模块 + `styles.css`，顺序见 `client/manifest.txt`）**
+**client（`client/`，25 个模块 + `styles.css`，顺序见 `client/manifest.txt`）**
 
 | 模块 | 职责 |
 |---|---|
 | `constants.js` | 指数代码/周期表/钳制/轮询间隔/请求规模/槽位 id 与 order（**全插件唯一一份**） |
 | `format.js` `dom.js` | 纯格式化、`el()`/视口/会话文案等渲染工具 |
-| `platform.js` | `call()` 封装 + 19 个 action 名常量 |
+| `platform.js` | `call()` 封装 + 22 个 action 名常量 |
 | `store/ui.js` | UI 共享状态 + touched 守卫 + 幂等水合（**[fork-fix] 语义集中地**）+ 运行时持有者 |
 | `store/market.js` | 共用取数薄封装（`fetchQuote`/`fetchIndices`/`fetchWatchlist`） |
+| `store/pnl.js` | 今日盈亏共享状态 + **单一轮询器**（节奏由宿主 `next_poll_ms` 决定，chip 与 tab 共用一份数据） |
 | `charts/{setup,kline,minute}.js` | KLineChart 初始化/主题/销毁 + K 线 + 分时 |
 | `tools/{parse,cards}.js` | 工具结果解析 + 4 个 toolview 卡片 |
-| `panel/*.js` | 面板外壳（tab 查表分发）+ 6 个内层视图（登录/行情/详情/热榜/搜索/快讯） |
+| `panel/*.js` | 面板外壳（tab 查表分发）+ 6 个内层视图（登录/行情/详情/热榜/搜索/快讯）+ `pnl.js`（头部 chip 与「盈亏」tab） |
 | `badge.js` `dock.js` `ticker.js` | 悬浮徽标、停靠面板门控、底部指数条 |
 | `slots.js` | 7 个槽位注册（集中一处） |
 | `index.js` | 入口：`apply` 薄壳（插样式 → 建运行时 → 装槽位）+ `export default` |
@@ -110,16 +114,19 @@ node tools/build.mjs --extract-asset  # 一次性：从历史 bundle 反提 asse
 
 ```bash
 npm run check        # 产物最新 + 四条语法/eval/JSON 检查
-npm test             # 三套冒烟：宿主契约 77 项 + 客户端契约 46 项 + 配置 11 项
+npm test             # 六套测试共 363 项断言：72 + 50 + 130 + 47 + 53 + 11
 npm run verify       # verify-bundle（bundle 契约）+ verify-install（安装接管状态）
 ```
 
-三套冒烟的定位：
+六套测试的定位：
 
 | 脚本 | 锁住什么 |
 |---|---|
-| `test/smoke-host.mjs` | 插件形状、双路径注册、`/xq-rpc` 栅栏、RPC 动作、ui 往返、状态落点隔离、空参兜底 |
-| `test/smoke-client.mjs` | bundle 注册 id、require 纯度、样式 `data-plugin`、7 个槽位 exact、渲染冒烟、水合后面板、降级路径 |
+| `test/smoke-host.mjs` | 插件形状、双路径注册、`/xq-rpc` 栅栏、RPC 动作、ui 往返、状态落点隔离、空参兜底、今日盈亏 RPC（§9） |
+| `test/pnl-session.mjs` | 交易时段纯函数：边界划分、下一个边界、该不该拉、下次间隔、刷新间隔钳制 |
+| `test/pnl-cookie.mjs` | Cookie 规整与**字段锚定**（`pex_userid` 回归）、带状态码的 curl、上游错误语义 |
+| `test/pnl-rpc.mjs` | **端到端**：真 `/xq-rpc` → dispatch → 假 curl → **与旧插件共用的状态文件** → 响应 JSON |
+| `test/smoke-client.mjs` | bundle 注册 id、require 纯度、样式 `data-plugin`、7 个槽位 exact、渲染冒烟、水合后面板、盈亏接线、降级路径 |
 | `test/config.mjs` | 配置默认值向后兼容、配置生效、非法值（含路径穿越）安全回退 |
 
 改产物前请**只改 `lib/`、`client/`、`assets/`**，然后重新构建；`src/`、`dynamic/` 一律不要手改。
@@ -177,11 +184,16 @@ npm run verify       # verify-bundle（bundle 契约）+ verify-install（安装
 |---|---|---|
 | `stateDir` | `dsh-xueqiu` | `$DSH_HOME/<stateDir>/`。只接受 `[A-Za-z0-9._-]+`，非法值（含 `../`、含分隔符、非字符串）一律退回默认 |
 | `watchlist` | 6 只内置票 | 首个自选表；自动去空白、上限 200；空数组退回默认 |
+| `pnlStateDir` | `dsh-ths-pnl` | 今日盈亏的凭据/快照目录 `$DSH_HOME/<pnlStateDir>/`。**默认与 `dsh-ths-pnl` 插件共用**，所以两边数值一致、Cookie 只需粘一次；校验规则同 `stateDir`。想彻底隔离就改这里 |
 
 **未配置时行为与重构前逐字一致**（`test/config.mjs` 锁住这条）。
-轮询间隔（面板 20s/60s、休市 60s/180s、徽标 30s、指数条 30s）**暂不可配**：定时器在组件
+雪球自己的轮询间隔（面板 20s/60s、休市 60s/180s、徽标 30s、指数条 30s）**暂不可配**：定时器在组件
 effect 挂载时就注册了，而配置是异步到达的，要正确支持需给 4 个 effect 加「配置就绪」门控；
 目前这些值集中在 `client/constants.js` 一处，需要调整改这一个文件即可。
+
+> 今日盈亏的刷新间隔**是可配的**（界面上改，5–3600 秒），因为它走的是另一条路子：
+> 节奏由**宿主**决定（`pnl.get` 回传 `next_poll_ms`），客户端只照着排下一次，不存在
+> 「配置异步到达时定时器已经注册好」的问题。要加可配的轮询，照这条范式做。
 
 ---
 
@@ -247,3 +259,78 @@ effect 挂载时就注册了，而配置是异步到达的，要正确支持需�
 并把 `node_modules/dsh-xueqiu-debug` 指到本目录（与 `dsh-ths-pnl` 同款 symlink）。
 **改了宿主侧（`lib/`）要重启 `dsh web`；只改客户端（`client/`）刷新页面即可**
 （未跑 `pnpm run dev:web` 时客户端 bundle 不会自动热更）。
+
+---
+
+## 8. 今日盈亏（并入原 `dsh-ths-pnl`）
+
+数据源是**同花顺投资账本**（`tzzb.10jqka.com.cn`，与雪球毫无关系），原先由独立插件
+`plugins/dsh-ths-pnl` 以右下角角标展示；现已并入本插件，**旧的 `dsh-ths-pnl` 可以并存、也可以摘掉**。
+
+### 8.1 为什么是「搬进来重写」而不是「直接复用旧代码」
+
+`dsh-ths-pnl` 的宿主代码在 DSH 的**动态插件沙箱**里会直接抛错：
+`dsh-cordis-host-runner` 的 `NODE_API_REDIRECTS` 会把 `fetch` / `setTimeout` / `require` 一律替换成
+`xxx is not available in the dynamic package sandbox`，沙箱里也没有 `process`。
+旧插件用了裸 `await fetch(...)`、裸 `setTimeout(...)`、`import ... from 'node:fs/promises'`，
+所以它只能静态安装（这也是它没有 `dynamic/` 半区的原因）。
+搬进来时全部改成本插件既有的服务范式：
+
+| 能力 | 旧插件 | 现在 |
+|---|---|---|
+| HTTP | 全局 `fetch` | `ctx.get('shell')` 跑 `curl`（`CURL`/`NULL_DEV` 由 `lib/constants.js` 提供平台分支）+ `-w '\n__HTTP__%{http_code}'` 取状态码，**不跟随重定向** |
+| 定时 | 全局 `setTimeout` | `ctx.effect` + `ctx.timeout`（返回值归一化成 stop 函数） |
+| 落盘 | `node:fs/promises` | `ctx.get('fs')` + `ctx.get('sandboxPolicy')`，经 `lib/pnl/store.js` 定位 |
+
+### 8.2 与旧插件共用状态文件（迁移期的关键设计）
+
+`pnlStateDir` 默认 `dsh-ths-pnl`，即读写 `$DSH_HOME/dsh-ths-pnl/`：
+
+- `config.json` → `{ cookie, fundKey, pollSec }`（字段名与旧插件逐字一致）
+- `snapshot.json` → `{ pnl_yk, pnl_pct, error, token_expired, yk_field, fetched_at, fetched_reason, sessionDate, closeDate }`
+
+于是**两个插件并存时数值必然一致**，Cookie 只需粘一次；摘掉旧插件后状态文件继续有效（无需迁移）。
+`test/pnl-rpc.mjs` 端到端锁住这条契约（含 `clear` 只清 Cookie、**保留** `snapshot.json`）。
+想彻底隔离就把 `pnlStateDir` 改成别的目录（代价：要重新粘一次 Cookie）。
+
+### 8.3 宿主侧：3 个 action（`lib/pnl/`）
+
+| action | 入参 | 出参要点 |
+|---|---|---|
+| `pnl.get` | `{ force?: boolean }` | `configured / pnl_yk / pnl_pct / error / token_expired / yk_field / updated_at / session / frozen / poll_ms / next_poll_ms`。宿主判定「该不该打上游」：**无快照必拉**、盘中心跳、盘外睡到下一个 09:30/13:00/15:00 边界；`force` 跳过判定强拉一次 |
+| `pnl.verify` | — | 用存盘 Cookie 打一次 `account_list`：`{ configured, valid, error, portfolios, fundKey, poll_ms, min_sec, max_sec }` |
+| `pnl.config` | `{ cookie?, fundKey?, pollSec?, clear? }` | 保存并**当场校验**；`pollSec` 越界夹到 5–3600、非数字报错；`clear:true` 只清 Cookie 保留快照 |
+
+调度细节：`installPnl(core)` 在 `info.minutes >= 900`（15:00）后 45 秒补拉一次收盘终值
+（**每个交易日只补一次**，且绕过 `shouldFetch`，否则 `closeDate` 已写就再也拉不到终值）。
+节假日无法离线判断，按交易日处理（与旧插件一致的已知限制）。
+
+> 注意：盈亏请求**不走** `core.getJSON`——那条管道认的是雪球错误码（400016/400017），
+> 并发 2 / 最小间隔 100ms 也是雪球的风控预算，账本的 Cookie 与错误语义完全不同。
+
+### 8.4 客户端侧
+
+- 头部常驻 chip（`panel/pnl.js` 的 `PnlChip`，插在 `dock.js` 的 `xq-status` 之后）：切任何 tab 都可见，
+  点击跳到「盈亏」tab；A 股习惯**涨红跌绿**，盘外显示 `盘前/午间/收盘/休市` 小标签。
+- 第 5 个 tab「盈亏」（`PnlTab`）：大字金额+百分比、数据时间、组合账户下拉、Cookie 粘贴框、
+  刷新间隔（5–3600 秒）、`立即刷新`（`force:true`）、`清除 Cookie`。
+- 取数只有一处：`store/pnl.js` 的**单一轮询器**（chip 与 tab 共享；引用计数启停；
+  `force` 透传；并发去重；页面隐藏时跳过请求但照旧等这么久；出错退避 60 秒）。
+- tab 追加在 `PANEL_TABS` **末尾**，前 4 个 tab 的字面量与顺序未动。
+- 宿主 `ui.get` 的 `validTabs` 已加 `'pnl'`（否则水合会把 `tab:'pnl'` 打回 `'market'`，chip 点击会失效）。
+
+**已知取舍**：chip 在面板头部，所以**面板收起时看不到盈亏**（旧插件的右下角角标是常驻的）。
+并存期两者互补；若摘掉旧插件后仍想常驻，可把 `PnlChip` 也挂到 `shell.overlay`（那个槽位已由徽标占用）。
+
+### 8.5 摘掉旧的 `dsh-ths-pnl`
+
+`dsh-ths-pnl` 是**普通本地目录，不是 submodule**，摘除完全可逆：
+
+1. 编辑 `C:\Users\海尔\.dsh\profiles\web\package.json`，从 `dsh.profile.bundles` 里删掉 `"dsh-ths-pnl"` 一行
+   （可选：同时删掉 `dependencies` 里的 `"dsh-ths-pnl": "link:..."`）。
+2. 重启 `dsh web`、刷新页面。新的「盈亏」tab 应显示与旧角标相同的数值。
+3. 回滚就是把这行加回去（`$DSH_HOME/dsh-ths-pnl/` 里的 Cookie 与快照全程未被改动）。
+
+并存期两处会**各自**轮询（旧插件按自己的定时器、本插件按 `next_poll_ms`），大约每 60 秒各一次；
+账本接口能承受，但确认无误后建议摘掉旧的，只留一份轮询。
+

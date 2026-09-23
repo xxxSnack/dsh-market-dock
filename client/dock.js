@@ -5,6 +5,7 @@
 import { el, viewport, sessionsText } from './dom.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
 import { XueqiuPanel } from './panel/index.js'
+import { PnlChip } from './panel/pnl.js'
 import { DOCK_H_MIN, DOCK_H_MAX, DOCK_H_VP_RATIO, DOCK_H_DEFAULT_RATIO, DOCK_H_FALLBACK, VIEWPORT_FALLBACK_H, POLL_DOCK_SESSION_MS } from './constants.js'
 
 export function DockGate() {
@@ -80,6 +81,7 @@ export function DockPanel() {
     el('div', { key: 'head', className: 'xq-dock-head' }, [
       el('span', { key: 'logo', className: 'xq-logo' }, [el('b', { key: 'b' }, '雪球'), ' mini']),
       el('span', { key: 'st', className: 'xq-status', title: 'A股/港股/美股交易时段（本地时区推算，不含节假日）' }, sessionsText() || '行情面板'),
+      el(PnlChip, { key: 'pnl' }),
       el('span', { key: 'hint', className: 'xq-update' }, '已嵌入输入框上方 · Esc 收起'),
       el('span', { key: 'sp', className: 'xq-spacer' }),
       el('button', { key: 'min', className: 'xq-btn-mini', title: '收起（点右下角徽章重新打开）', onClick: function () { ui.set({ open: false }) } }, '收起 —')

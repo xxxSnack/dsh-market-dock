@@ -1,7 +1,7 @@
 {
   "name": "dsh-xueqiu-debug",
   "version": "1.22.15-fork.1",
-  "description": "dsh-xueqiu 的本地 fork（dsh-xueqiu-debug）— 雪球 mini 行情面板：免登录 A股/港美股实时行情、K线、分时图、热榜、搜索、7x24 快讯。嵌入式面板 + 可拖拽行情徽标。相对上游 1.22.15 的改动：修复徽章位置在切换会话后被旧持久化值覆盖回右下角（即拖拽位置看似「丢失」）；拖拽即时落盘；水合改为应用级一次性执行。详见 FORK-NOTES.md。",
+  "description": "dsh-xueqiu 的本地 fork（dsh-xueqiu-debug）— 雪球 mini 行情面板：免登录 A股/港美股实时行情、K线、分时图、热榜、搜索、7x24 快讯。嵌入式面板 + 可拖拽行情徽标。另并入原 dsh-ths-pnl 的同花顺投资账本「今日盈亏」（面板头部常驻 chip + 盈亏 tab，与旧插件共用同一份凭据与快照）。相对上游 1.22.15 的改动：修复徽章位置在切换会话后被旧持久化值覆盖回右下角（即拖拽位置看似「丢失」）；拖拽即时落盘；水合改为应用级一次性执行。详见 FORK-NOTES.md。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -56,8 +56,8 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "build:check": "node tools/build.mjs --check",
-    "test": "node test/smoke-host.mjs && node test/smoke-client.mjs && node test/config.mjs",
-    "verify": "node tools/verify-bundle.mjs && node tools/verify-install.mjs",
+    "test": "node test/pnl-session.mjs && node test/pnl-cookie.mjs && node test/smoke-host.mjs && node test/pnl-rpc.mjs && node test/smoke-client.mjs && node test/config.mjs",
+    "verify": "node tools/verify-bundle.mjs && node tools/verify-wiring.mjs && node tools/verify-install.mjs",
     "check": "node tools/build.mjs --check && node --check src/index.js && node --check src/client/index.js && node -e \"new Function(require('fs').readFileSync('dynamic/host.js','utf8'))\" && node -e \"new Function(require('fs').readFileSync('dynamic/client.js','utf8'))\" && node -e \"JSON.parse(require('fs').readFileSync('package.json','utf8'))\""
   }
 }

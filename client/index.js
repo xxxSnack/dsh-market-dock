@@ -2,6 +2,7 @@
 // 样式在 apply 开头只插一次；ui store / saveUi / hydratePromise / 拖拽引用等「每次 apply 一份」
 // 的状态由 createUiRuntime 重建（见 store/ui.js 的运行时持有者说明）。
 import { createUiRuntime } from './store/ui.js'
+import { createPnlRuntime } from './store/pnl.js'
 import { installSlots } from './slots.js'
 
 const xqClientPlugin = {
@@ -9,6 +10,7 @@ const xqClientPlugin = {
   apply(ctx) {
     // #include-styles ./styles.css
     createUiRuntime(ctx)
+    createPnlRuntime(ctx)   // 只建运行时、不取数：首个订阅者（chip）挂载时才启动轮询
     installSlots(ctx)
   }
 }

@@ -1,0 +1,26 @@
+# client/ 源码模块清单：一行一个模块（相对 client/），顺序 = 拼接顺序，最后一行是入口。
+# 约定：被 import 的模块必须排在前面（构建期校验）；同组导出名不得重复。
+# 分组顺序：常量/工具 → 宿主调用 → 状态 → 图表 → 工具卡片 → 面板 → 徽章/停靠/指数条 → 槽位 → 入口
+constants.js
+format.js
+dom.js
+platform.js
+store/ui.js
+store/market.js
+charts/setup.js
+charts/kline.js
+charts/minute.js
+tools/parse.js
+tools/cards.js
+panel/login.js
+panel/market.js
+panel/detail.js
+panel/hot.js
+panel/search.js
+panel/news.js
+panel/index.js
+badge.js
+dock.js
+ticker.js
+slots.js
+index.js

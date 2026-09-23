@@ -1,0 +1,25 @@
+# lib/ 的拼接顺序（= 依赖顺序）：被 import 的模块必须排在前面，最后一行是入口模块。
+# 顺序本身不承载语义（跨模块调用都走 core），但保持「底层 → 上层」便于阅读。
+constants.js      # 常量：UA/BASE/SITE/curl 名/默认自选表/调度与容量钳制值
+config.js         # 插件配置解析（stateDir / watchlist；未配置时全部走默认值）
+normalize.js      # 纯函数：nz/sanitize/pickQuote/mapKline/mapPosts/mapKOL/mapFinance
+cache.js          # URL 工具 enc/toQuery + TTL 缓存 + in-flight 去重（装到 core）
+gate.js           # 请求调度闸门：并发 2 / 最小间隔 / 30s 看门狗（装到 core）
+http.js           # classifyError + curl / ensureCookie / getJSON（含重试链，装到 core）
+state.js          # 状态文件落点：稳定目录优先、工作区回退、旧路径回读（装到 core）
+login.js          # 可选登录：Cookie 解析/落盘/云端自选读写与迁移（装到 core）
+watchlist.js      # 本地自选表 + 云端为准的后台自动同步（装到 core）
+ui-state.js       # UI 状态（tab/open/dockH/badgeW/badgePos）持久化（装到 core）
+api.js            # 16 个 endpoint 对应的 act* 业务动作（装到 core）
+actions.js        # RPC dispatch 表 + handleCall 包络（装到 core）
+tools/common.js   # 工具共用：xqToolOutput / xqIso
+tools/quote.js    # xueqiu_quote spec 工厂
+tools/kline.js    # xueqiu_kline spec 工厂
+tools/search.js   # xueqiu_search spec 工厂
+tools/hot.js      # xueqiu_hot spec 工厂
+tools/news.js     # xueqiu_news spec 工厂
+tools/kol.js      # xueqiu_kol spec 工厂
+tools/index.js    # 6 个 spec 的汇总（顺序即注册顺序）
+register.js       # 双路径注册：harness RPC/工具 与 webServer 路由/tools 服务
+core.js           # createXqCore(ctx)：共享状态 + 按序调用各 install*
+index.js          # 入口：apply 薄壳 + export default（构建器的入口模块）

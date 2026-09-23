@@ -1,4 +1,5 @@
 // 嵌入式主面板（conversation.input.dock）：输入框上方一整行。
+// ---------- 嵌入式主面板（conversation.input.dock）：输入框上方一整行 ----------
 // DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 时渲染 null。
 // 不能把开关写在槽位 render 闭包里——槽位函数不会因 ui 变化而重新执行。
 import { el, viewport, sessionsText } from './dom.js'

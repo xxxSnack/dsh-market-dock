@@ -87,7 +87,8 @@ export function createUiRuntime(ctx) {
 }
 
 // [fork-fix] 水合改为应用级、幂等、只跑一次。
-// ui 是全局状态（不属于任何会话），但原来 ui.get 挂在 DockGate 里，而
+// 下面四行是重构前的原文（"本组件"= 当时承载这段代码的 DockGate；本函数现已随代码搬到 store/ui.js）：
+// ui 是全局状态（不属于任何会话），但原来 ui.get 挂在本组件里，而
 // conversation.input.dock 的 scope 是 "session" → 每次切会话重挂都会重放一次水合，
 // 把内存里刚拖到的新位置覆盖成旧持久化值。移到 shell.overlay 的 MiniBadge（全局只挂一次）触发。
 export function hydrateUi() {

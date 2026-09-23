@@ -340,7 +340,8 @@ function createUiRuntime(ctx) {
 }
 
 // [fork-fix] 水合改为应用级、幂等、只跑一次。
-// ui 是全局状态（不属于任何会话），但原来 ui.get 挂在 DockGate 里，而
+// 下面四行是重构前的原文（"本组件"= 当时承载这段代码的 DockGate；本函数现已随代码搬到 store/ui.js）：
+// ui 是全局状态（不属于任何会话），但原来 ui.get 挂在本组件里，而
 // conversation.input.dock 的 scope 是 "session" → 每次切会话重挂都会重放一次水合，
 // 把内存里刚拖到的新位置覆盖成旧持久化值。移到 shell.overlay 的 MiniBadge（全局只挂一次）触发。
 function hydrateUi() {
@@ -551,6 +552,7 @@ function klcPrecision(rows, hint) {
 
 // K线蜡烛图（KLineChart：内置 MA/VOL、滚轮缩放、拖拽平移、右拖自动加载更早历史）。
 
+// ---------- K线蜡烛图（KLineChart：内置 MA/VOL、滚轮缩放、拖拽平移、右拖自动加载更早历史） ----------
 function KlineChart(props) {
   const rows = props.rows || []
   const onNeedEarlier = props.onNeedEarlier || null
@@ -624,6 +626,7 @@ function KlineChart(props) {
 
 // 分时图（面积价线 + 昨收虚线 + 均价线 + 十字光标 tooltip）。
 
+// ---------- 分时图（面积价线 + 昨收虚线 + 均价线 + 十字光标 tooltip） ----------
 function MinuteChart(props) {
   const items = props.items || []
   const lastClose = Number(props.lastClose) || 0
@@ -780,6 +783,7 @@ function xqParseResult(block) {
 
 // Agent 工具调用卡片（tool.call.toolview）：xueqiu_quote / xueqiu_kline / xueqiu_hot / xueqiu_news。
 
+// ---------- Agent 工具调用卡片（tool.call.toolview）：xueqiu_quote / xueqiu_kline ----------
 function QuoteCard(props) {
   const block = props.block
   const r = xqParseResult(block)
@@ -1252,6 +1256,7 @@ function NewsTab(p) {
 
 const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab }
 
+// ---------- 面板内容（数据 + tabs + 详情） ----------
 function XueqiuPanel() {
   const rt = getUiRuntime()
   const ui = rt.ui
@@ -1636,6 +1641,7 @@ function XueqiuPanel() {
 // 形态 C：默认区域模式（320px 宽，前 12 只自选静态平铺换行）；⤡ 手柄可调宽 120–480px，双击复位 320。
 // 悬停弹层已砍掉：速览靠拉宽徽章，完整功能点徽章开面板。
 
+// ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
 function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui
@@ -1833,6 +1839,7 @@ function MiniBadge() {
 }
 
 // 嵌入式主面板（conversation.input.dock）：输入框上方一整行。
+// ---------- 嵌入式主面板（conversation.input.dock）：输入框上方一整行 ----------
 // DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 时渲染 null。
 // 不能把开关写在槽位 render 闭包里——槽位函数不会因 ui 变化而重新执行。
 
@@ -1926,6 +1933,7 @@ function DockPanel() {
 
 // 底部指数条（会话页，输入框下方氛围行）。
 
+// ---------- 底部指数条（会话页，输入框下方氛围行） ----------
 function Ticker() {
   const rt = getUiRuntime()
   const ui = rt.ui
@@ -1960,6 +1968,7 @@ function Ticker() {
 
 // 槽位注册：7 次 slots.inject/register 集中成一张表（顺序即契约，与重构前一一对应）。
 
+// ---------- 注册 ----------
 const XQ_SLOT_REGISTRATIONS = [
   { slot: SLOT_TOOLVIEW, options: { name: SLOT_TOOLVIEW, key: TOOLVIEW_KEYS.quote }, render: function (props) { return el(QuoteCard, props) } },
   { slot: SLOT_TOOLVIEW, options: { name: SLOT_TOOLVIEW, key: TOOLVIEW_KEYS.kline }, render: function (props) { return el(KlineCard, props) } },

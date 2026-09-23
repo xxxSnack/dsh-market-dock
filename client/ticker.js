@@ -5,6 +5,7 @@ import { getUiRuntime } from './store/ui.js'
 import { fetchIndices } from './store/market.js'
 import { POLL_TICKER_MS } from './constants.js'
 
+// ---------- 底部指数条（会话页，输入框下方氛围行） ----------
 export function Ticker() {
   const rt = getUiRuntime()
   const ui = rt.ui

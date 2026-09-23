@@ -4,6 +4,7 @@ import { fmtDay } from '../format.js'
 import { klcLib, klcSetup, klcNoLib, klcNormRows, klcPrecision } from './setup.js'
 import { KLC_PERIOD_MAP } from '../constants.js'
 
+// ---------- K线蜡烛图（KLineChart：内置 MA/VOL、滚轮缩放、拖拽平移、右拖自动加载更早历史） ----------
 export function KlineChart(props) {
   const rows = props.rows || []
   const onNeedEarlier = props.onNeedEarlier || null

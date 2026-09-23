@@ -7,6 +7,7 @@ import { getUiRuntime, hydrateUi } from './store/ui.js'
 import { fetchIndices, fetchQuote, fetchWatchlist } from './store/market.js'
 import { BADGE_WATCH_LIMIT, BADGE_W_MIN, BADGE_W_MAX, BADGE_W_DEFAULT, BADGE_DRAG_THRESHOLD, EDGE_GAP, VIEWPORT_FALLBACK_W, VIEWPORT_FALLBACK_H, POLL_BADGE_MS } from './constants.js'
 
+// ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
 export function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui

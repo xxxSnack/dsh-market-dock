@@ -4,6 +4,7 @@ import { fmt, fmtPct, fmtTime, fmtDay, colorOf } from '../format.js'
 import { klcLib, klcSetup, klcNoLib, klcPrecision, cssVarColor, klcPalette } from './setup.js'
 import { MINUTE_TIP_WRAP_FALLBACK } from '../constants.js'
 
+// ---------- 分时图（面积价线 + 昨收虚线 + 均价线 + 十字光标 tooltip） ----------
 export function MinuteChart(props) {
   const items = props.items || []
   const lastClose = Number(props.lastClose) || 0

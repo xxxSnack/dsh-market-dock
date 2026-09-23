@@ -5,6 +5,7 @@ import { xqParseResult } from './parse.js'
 import { KlineChart } from '../charts/kline.js'
 import { PERIOD_LABELS, HOT_MARKET_LABELS } from '../constants.js'
 
+// ---------- Agent 工具调用卡片（tool.call.toolview）：xueqiu_quote / xueqiu_kline ----------
 export function QuoteCard(props) {
   const block = props.block
   const r = xqParseResult(block)

@@ -6,6 +6,7 @@ import { MiniBadge } from './badge.js'
 import { Ticker } from './ticker.js'
 import { SLOT_TOOLVIEW, SLOT_INPUT_DOCK, SLOT_OVERLAY, SLOT_COMPOSER_DOCK, TOOLVIEW_KEYS, PANEL_ID, PANEL_ORDER, BADGE_ID, TICKER_ID, TICKER_ORDER } from './constants.js'
 
+// ---------- 注册 ----------
 const XQ_SLOT_REGISTRATIONS = [
   { slot: SLOT_TOOLVIEW, options: { name: SLOT_TOOLVIEW, key: TOOLVIEW_KEYS.quote }, render: function (props) { return el(QuoteCard, props) } },
   { slot: SLOT_TOOLVIEW, options: { name: SLOT_TOOLVIEW, key: TOOLVIEW_KEYS.kline }, render: function (props) { return el(KlineCard, props) } },

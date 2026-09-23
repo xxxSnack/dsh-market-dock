@@ -20,6 +20,7 @@ import { PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, S
 
 const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab }
 
+// ---------- 面板内容（数据 + tabs + 详情） ----------
 export function XueqiuPanel() {
   const rt = getUiRuntime()
   const ui = rt.ui

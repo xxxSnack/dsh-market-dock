@@ -294,6 +294,8 @@ return {
     // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
     const ui = {
       open: false, tab: 'market', badgePos: null, badgeW: null, dockH: null, hydrated: false,
+      // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这两个标志，位置/尺寸缺失。
+      openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, dockHTouched: false,
       _fns: [],
       subscribe: function (fn) {
         this._fns.push(fn)
@@ -314,12 +316,22 @@ return {
           // 水合前用户已交互过的字段不做回滚（页面刚加载就点开面板/切标签，不被迟到的旧持久化打回）
           if (k === 'open') this.openTouched = true
           if (k === 'tab') this.tabTouched = true
+          // [fork-fix] 位置/尺寸同样要守卫：原来只有 open/tab 有，导致切会话时重放的水合
+          // 把刚拖到的徽章位置打回旧持久化值（表现为"切会话后弹回右下角"）。
+          if (k === 'badgePos') this.badgePosTouched = true
+          if (k === 'badgeW') this.badgeWTouched = true
+          if (k === 'dockH') this.dockHTouched = true
         }
         if (ch) {
           this.notify()
           // 打开面板的 set 发生在面板组件订阅建立之前（订阅在挂载后才生效）——
           // 若无人续触发 ui.set，open=true 永远不落盘，刷新后面板关着。open 翻转直接触发落盘。
-          if ('open' in patch) { try { saveUi() } catch (e) { /* 初始化前忽略 */ } }
+          // [fork-fix] 原来只有 open 直接落盘：位置/尺寸靠 DockPanel 的订阅间接落盘，
+          // 而面板收起时 DockPanel 根本不挂载（DockGate 返回 null）→ 拖徽章永不写入。
+          // 改为所有被持久化的键都直接排一次落盘，不再依赖某个组件恰好挂着。
+          if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'dockH' in patch) {
+            try { saveUi() } catch (e) { /* 初始化前忽略 */ }
+          }
         }
       }
     }
@@ -1364,37 +1376,47 @@ return {
     // ---------- 嵌入式主面板（conversation.input.dock）：输入框上方一整行 ----------
     // DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 时渲染 null。
     // 不能把开关写在槽位 render 闭包里——槽位函数不会因 ui 变化而重新执行。
+
+    // [fork-fix] 水合改为应用级、幂等、只跑一次。
+    // ui 是全局状态（不属于任何会话），但原来 ui.get 挂在本组件里，而
+    // conversation.input.dock 的 scope 是 "session" → 每次切会话重挂都会重放一次水合，
+    // 把内存里刚拖到的新位置覆盖成旧持久化值。移到 shell.overlay 的 MiniBadge（全局只挂一次）触发。
+    let hydratePromise = null
+    function hydrateUi() {
+      if (hydratePromise) return hydratePromise
+      hydratePromise = call('ui.get', {}).then(function (d) {
+        if (d && d.tab && !ui.tabTouched) ui.set({ tab: d.tab })
+        if (d && typeof d.open === 'boolean' && !ui.openTouched) ui.set({ open: d.open })
+        if (d && d.badgePos && isFinite(Number(d.badgePos.x)) && isFinite(Number(d.badgePos.y)) && !ui.badgePosTouched) {
+          // 恢复位置时钳制到当前视口内（视口缩小/分辨率变化后防止徽章落到屏幕外）
+          // maxX 必须按徽章实际宽度算：区域模式宽达 480px，固定 -140 会让宽徽章右缘出屏
+          const vp = viewport()
+          const effW = (typeof d.badgeW === 'number' && isFinite(d.badgeW) && d.badgeW >= 120)
+            ? Math.min(d.badgeW, 480) : 320
+          const maxX = (vp ? vp.w : 1200) - effW - 4
+          const maxY = (vp ? vp.h : 800) - 60
+          ui.set({ badgePos: {
+            x: Math.min(Math.max(4, Number(d.badgePos.x)), Math.max(4, maxX)),
+            y: Math.min(Math.max(4, Number(d.badgePos.y)), Math.max(4, maxY))
+          } })
+        }
+        if (d && typeof d.dockH === 'number' && isFinite(d.dockH) && !ui.dockHTouched) {
+          ui.set({ dockH: d.dockH })
+        }
+        if (d && typeof d.badgeW === 'number' && isFinite(d.badgeW) && !ui.badgeWTouched) {
+          ui.set({ badgeW: d.badgeW })
+        }
+        ui.set({ hydrated: true })
+      }).catch(function () { ui.set({ hydrated: true }) })
+      return hydratePromise
+    }
+
     function DockGate() {
       const [, force] = React.useState(0)
       React.useEffect(function () {
-        let alive = true
-        call('ui.get', {}).then(function (d) {
-          if (!alive) return
-          if (d && d.tab && !ui.tabTouched) ui.set({ tab: d.tab })
-          if (d && typeof d.open === 'boolean' && !ui.openTouched) ui.set({ open: d.open })
-          if (d && d.badgePos && isFinite(Number(d.badgePos.x)) && isFinite(Number(d.badgePos.y))) {
-            // 恢复位置时钳制到当前视口内（视口缩小/分辨率变化后防止徽章落到屏幕外）
-            // maxX 必须按徽章实际宽度算：区域模式宽达 480px，固定 -140 会让宽徽章右缘出屏
-            const vp = viewport()
-            const effW = (typeof d.badgeW === 'number' && isFinite(d.badgeW) && d.badgeW >= 120)
-              ? Math.min(d.badgeW, 480) : 320
-            const maxX = (vp ? vp.w : 1200) - effW - 4
-            const maxY = (vp ? vp.h : 800) - 60
-            ui.set({ badgePos: {
-              x: Math.min(Math.max(4, Number(d.badgePos.x)), Math.max(4, maxX)),
-              y: Math.min(Math.max(4, Number(d.badgePos.y)), Math.max(4, maxY))
-            } })
-          }
-          if (d && typeof d.dockH === 'number' && isFinite(d.dockH)) {
-            ui.set({ dockH: d.dockH })
-          }
-          if (d && typeof d.badgeW === 'number' && isFinite(d.badgeW)) {
-            ui.set({ badgeW: d.badgeW })
-          }
-          ui.set({ hydrated: true })
-        }).catch(function () { ui.set({ hydrated: true }) })
+        hydrateUi()   // 幂等：MiniBadge 已经触发过就是空操作
         const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
-        return function () { alive = false; off() }
+        return off
       }, [])
       if (!ui.hydrated || !ui.open) return null
       return el(DockPanel, null)
@@ -1503,6 +1525,8 @@ return {
         }
         function onVis() { if (!pageHidden()) refresh() }
         refresh()
+        // [fork-fix] 应用级水合入口：shell.overlay 全局只挂一次，不随会话切换重放旧持久化值
+        hydrateUi()
         const stop = ctx.interval(refresh, 30000)
         const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
         try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
@@ -1860,19 +1884,19 @@ return {
     })
     slots.inject('conversation.input.dock', function () {
       return slots.register(
-        { name: 'conversation.input.dock', id: 'xueqiu-panel', order: 30 },
+        { name: 'conversation.input.dock', id: 'xueqiu-debug-panel', order: 30 },
         function () { return el(DockGate, null) }
       )
     })
     slots.inject('shell.overlay', function () {
       return slots.register(
-        { name: 'shell.overlay', id: 'xueqiu-badge' },
+        { name: 'shell.overlay', id: 'xueqiu-debug-badge' },
         function () { return el(MiniBadge, null) }
       )
     })
     slots.inject('conversation.composer.dock', function () {
       return slots.register(
-        { name: 'conversation.composer.dock', id: 'xueqiu-ticker', order: 1 },
+        { name: 'conversation.composer.dock', id: 'xueqiu-debug-ticker', order: 1 },
         function () { return el(Ticker, null) }
       )
     })

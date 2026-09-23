@@ -125,7 +125,7 @@ node -e "new Function(require('fs').readFileSync('dynamic/client.js','utf8'))"
 
 ## 安装
 `C:\Users\海尔\.dsh\profiles\web\package.json`：
-- `dependencies`：`"dsh-xueqiu": "^1.22.15"` → `"dsh-xueqiu-debug": "link:D:/project/financial_analysis/dsh-xueqiu-debug"`
+- `dependencies`：`"dsh-xueqiu": "^1.22.15"` → `"dsh-xueqiu-debug": "link:D:/project/financial_analysis/plugins/dsh-xueqiu-debug"`
 - `dsh.profile.bundles`：`"dsh-xueqiu"` → `"dsh-xueqiu-debug"`
 
 并把 `node_modules/dsh-xueqiu-debug` 指到本目录（与 `dsh-ths-pnl` 同款 symlink）。

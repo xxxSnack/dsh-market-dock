@@ -13,6 +13,9 @@
  *      且每条的 name / id / order / key 精确匹配；
  *   5. 样式契约：apply 插入的 <style> 的 data-plugin 精确等于包名；
  *   6. 渲染冒烟：用最小 React 替身真实调用已注册组件，断言渲染不抛异常且产出关键结构。
+ *   7. 运行时 hook 契约（[5c]）：替身给**每次组件调用**记一本 hook 账本，断言切 tab 时「每个组件自身的
+ *      hook 数」恒定 —— 内联（裸函数调用）的子组件会把 hook 记到父组件头上，于是父组件 hook 数随 tab
+ *      变化，正是 React 抛 "Rendered fewer hooks than expected" 的根因。
  *
  * 运行：node test/smoke-client.mjs      （退出码 0=通过，非 0=失败）
  *
@@ -223,16 +226,38 @@ function createReactStub() {
     setStateCalls: [],       // 只记录，不触发重渲染
     renders: 0,              // 被真实调用的函数组件次数
     componentNames: [],
+    // [5c] hook 账本：每次「函数组件被真实调用」追加一条 { fn, name, hooks, count }。
+    // 归属规则与真实 React 一致 —— hook 记在**当前正在执行 body 的那个组件**头上，
+    // 因此被内联（裸函数调用）的子组件不会开新作用域，它的 hook 会算到父组件头上，
+    // 表现为父组件的 hook 数随渲染变化（React 会抛 "Rendered fewer hooks than expected"）。
+    hookLog: [],
+    // [5c] stateful：默认 false = 旧行为（每次渲染都返回初始值、setter 为 noop）。
+    // 打开后 useState/useReducer 按「组件函数 + hook 序号」跨渲染记忆值、setter 真正生效；
+    // 只有这样才能验证「effect 取到数据 → 复渲染真的把数据渲染出来」这条链路（指数条那段用）。
+    stateful: false,
+    _slots: new Map(),       // fn → Map(hook 序号 → 值)，仅 stateful 模式使用
   }
 
   function needScope(hook) {
     const s = reactor.current
     if (!s) throw new Error('React 替身：' + hook + ' 在组件函数之外被调用')
     s.i++
+    s.hooks.push(hook)
     return s
   }
   function noopSetter(value) {
     reactor.setStateCalls.push(typeof value === 'function' ? '[fn updater]' : value)
+  }
+  /** [5c] stateful 模式的 state 槽：按「组件函数 + hook 序号」对位，与 React 的按调用顺序对位同构。 */
+  function stateSlot(scope, init) {
+    let slots = reactor._slots.get(scope.fn)
+    if (!slots) { slots = new Map(); reactor._slots.set(scope.fn, slots) }
+    const idx = scope.i - 1   // 本次调用里的 hook 序号（useEffect 也占位，与 React 一致）
+    if (!slots.has(idx)) slots.set(idx, typeof init === 'function' ? init() : init)
+    return {
+      get: () => slots.get(idx),
+      set: (v) => { noopSetter(v); slots.set(idx, typeof v === 'function' ? v(slots.get(idx)) : v) },
+    }
   }
 
   function createElement(type, props, ...children) {
@@ -262,13 +287,17 @@ function createReactStub() {
     lazy: (fn) => fn,
     createContext: (defaultValue) => ({ $$xqContext: true, defaultValue, Provider: Fragment, Consumer: Fragment }),
     useState(init) {
-      needScope('useState')
-      return [typeof init === 'function' ? init() : init, noopSetter]
+      const s = needScope('useState')
+      if (!reactor.stateful) return [typeof init === 'function' ? init() : init, noopSetter]
+      const slot = stateSlot(s, init)
+      return [slot.get(), slot.set]
     },
     useReducer(reducer, init, initFn) {
-      needScope('useReducer')
-      const v = typeof initFn === 'function' ? initFn(init) : (typeof init === 'function' ? init() : init)
-      return [v, noopSetter]
+      const s = needScope('useReducer')
+      const initial = () => (typeof initFn === 'function' ? initFn(init) : (typeof init === 'function' ? init() : init))
+      if (!reactor.stateful) return [initial(), noopSetter]
+      const slot = stateSlot(s, initial)
+      return [slot.get(), slot.set]
     },
     useRef(init) {
       needScope('useRef')
@@ -318,7 +347,7 @@ function createReactStub() {
 
   function invokeComponent(type, props) {
     const prev = reactor.current
-    const scope = { name: type.name || 'anonymous', i: 0 }
+    const scope = { fn: type, name: type.name || 'anonymous', i: 0, hooks: [] }
     reactor.current = scope
     reactor.renders++
     reactor.componentNames.push(scope.name)
@@ -328,6 +357,8 @@ function createReactStub() {
       throw new Error('组件 ' + scope.name + ' 渲染抛错：' + ((err && err.message) || String(err)))
     } finally {
       reactor.current = prev
+      // [5c] 成功/抛错都记账：本次调用依次调了哪些 hook（内联子组件不会开新作用域，会记到父组件上）
+      reactor.hookLog.push({ fn: type, name: scope.name, hooks: scope.hooks.slice(), count: scope.hooks.length })
     }
   }
 
@@ -536,6 +567,9 @@ function safeResponder(url, body) {
   if (action === 'hot') return { ok: true, data: { market: 'cn', list: [] } }
   if (action === 'news') return { ok: true, data: { items: [] } }
   if (action === 'login.status') return { ok: true, data: { loggedIn: false } }
+  // [5c] 盈亏未配置：指数条行末的今日盈亏 chip 文案因此是确定的「今日盈亏 未配置」。
+  // 此前这条 action 落到默认分支（data={}），chip 会渲染成「今日 +0.00 (+0.00%)」——文案随实现漂移，不好断言。
+  if (action === 'pnl.get') return { ok: true, data: { configured: false } }
   return { ok: true, data: {} }
 }
 
@@ -990,6 +1024,255 @@ check('样式契约：CSS 里有 .xq-pnl-* 规则且不含模板字面量标记'
   return 'chip + amt + ' + css.length + ' 字符'
 })
 
+// ---------------------------------------------------------------- 5c. 运行时 hook 契约
+// [5b] 是**静态**契约（在产物文本里找字面量），只能证明「源码里写的是 el(组件, ...)」。
+// 本节从**运行时**独立证明根因：hook 必须归属到「正在执行 body 的那个组件」。
+// 做法是给 React 替身加一本 hook 账本（reactor.hookLog）：每次函数组件被真实调用就记一条
+// { 组件函数, 本次调用里依次调用的 hook }。账本记的是 reactor.current —— 当前正在执行 body 的
+// 组件，所以**被内联（裸函数调用）的子组件不会开新作用域，它的 hook 会算到父组件头上**。
+// 于是「切到盈亏时 PnlTab 被内联进 XueqiuPanel」必然表现为 XueqiuPanel 的 hook 数随 tab 变化，
+// 这正是 React 抛 "Rendered fewer hooks than expected"（整棵面板被卸载、切回也打不开）的根因。
+section('[5c] 运行时 hook 契约（切 tab 不改 hook 链表 / 指数条盈亏 chip）')
+
+/** 组件名 → 源文件：失败信息直接指出该改哪个文件（替身只能给出函数引用与函数名）。 */
+const COMPONENT_FILE = {
+  XueqiuPanel: 'client/panel/index.js',
+  MarketTab: 'client/panel/market.js',
+  HotTab: 'client/panel/hot.js',
+  SearchTab: 'client/panel/search.js',
+  NewsTab: 'client/panel/news.js',
+  PnlTab: 'client/panel/pnl.js',
+  PnlChip: 'client/panel/pnl.js',
+  DockGate: 'client/dock.js',
+  DockPanel: 'client/dock.js',
+  Ticker: 'client/ticker.js',
+}
+const where = (name) => (COMPONENT_FILE[name] ? name + '（' + COMPONENT_FILE[name] + '）' : name)
+
+/** 当前高亮的 tab 文案（没有 xq-tab-active 时返回 null）。 */
+function activeTabLabel(tree) {
+  const h = treeHosts(tree).find((x) => classOf(x).split(/\s+/).includes('xq-tab-active'))
+  return h ? treeText(h) : null
+}
+/** 按文案取 tab 按钮宿主节点：props.onClick 就是组件里那个真实点击处理器。 */
+function tabButton(tree, label) {
+  const btn = treeHosts(tree).find((h) => classOf(h).split(/\s+/).includes('xq-tab') && treeText(h) === label)
+  ok(btn, '找不到 tab 按钮「' + label + '」，实际 tab 文案 [' +
+    treeHosts(tree).filter((h) => classOf(h).split(/\s+/).includes('xq-tab')).map(treeText).join(', ') + ']')
+  ok(typeof btn.props.onClick === 'function', 'tab 按钮「' + label + '」没有 onClick')
+  return btn
+}
+/** 把多次渲染的 hook 账本按**组件函数引用**归组（同名不同函数用 #2 区分，保证失败信息可定位）。 */
+function groupHooks(passes) {
+  const byFn = new Map()
+  for (const p of passes) {
+    for (const r of p.recs) {
+      let e = byFn.get(r.fn)
+      if (!e) { e = { name: r.name, seen: [] }; byFn.set(r.fn, e) }
+      e.seen.push({ label: p.label, count: r.count, hooks: r.hooks })
+    }
+  }
+  const dup = new Map()
+  for (const e of byFn.values()) dup.set(e.name, (dup.get(e.name) || 0) + 1)
+  const nth = new Map()
+  for (const e of byFn.values()) {
+    if (dup.get(e.name) > 1) { const n = (nth.get(e.name) || 0) + 1; nth.set(e.name, n); e.id = e.name + '#' + n }
+    else e.id = e.name
+  }
+  return byFn
+}
+
+// 驱动序列：market → pnl → market → hot → search → news → pnl → news（第 1 步不点击，直接沿用 [5]
+// 第三次渲染的 tab）。覆盖全部 5 个 tab 组件，保证「每个 tab 都是独立组件实例」这件事对 5 个都成立。
+// 每次都用**真实点击处理器**切 tab（走组件的 onClick → ui.set({tab})），再像 [5] 那样重跑槽位 render
+// 重走整棵 dock 树 —— 与 React 里 setState 触发的那次重渲染在「组件 body 会被重新执行」这点上等价。
+const TAB_STEPS = [
+  { label: '行情', tab: 'market', click: false, comp: 'MarketTab' },
+  { label: '盈亏', tab: 'pnl', click: true, comp: 'PnlTab' },
+  { label: '行情', tab: 'market', click: true, comp: 'MarketTab' },
+  { label: '热榜', tab: 'hot', click: true, comp: 'HotTab' },
+  { label: '搜索', tab: 'search', click: true, comp: 'SearchTab' },
+  { label: '快讯', tab: 'news', click: true, comp: 'NewsTab' },
+  { label: '盈亏', tab: 'pnl', click: true, comp: 'PnlTab' },
+  { label: '快讯', tab: 'news', click: true, comp: 'NewsTab' },
+]
+const tabPasses = []
+let tabSeqError = null
+await (async () => {
+  try {
+    let tree = panelTree('third')
+    for (let i = 0; i < TAB_STEPS.length; i++) {
+      const step = TAB_STEPS[i]
+      if (step.click) tabButton(tree, step.label).props.onClick()
+      const mark = main.react.reactor.hookLog.length
+      const r = render(main, SLOT_PANEL, undefined)
+      const flush = flushEffects(main, r.effects)
+      await settle(6)
+      tree = r.tree
+      tabPasses.push({
+        label: '第' + (i + 1) + '次(' + step.label + ')',
+        tab: step.tab, want: step.label, comp: step.comp,
+        active: activeTabLabel(tree),
+        recs: main.react.reactor.hookLog.slice(mark),
+        flushErrors: flush.errors,
+      })
+    }
+  } catch (err) { tabSeqError = err }
+})()
+function tabPassesReady() {
+  if (tabSeqError) throw new Error('前置失败：切 tab 序列执行出错（' + ((tabSeqError && tabSeqError.message) || tabSeqError) + '）')
+  if (tabPasses.length !== TAB_STEPS.length) throw new Error('前置失败：只采集到 ' + tabPasses.length + '/' + TAB_STEPS.length + ' 次渲染')
+}
+
+check('切 tab 序列真的切换了面板 tab（每次渲染的高亮 tab 正确）', () => {
+  tabPassesReady()
+  for (const p of tabPasses) eq(p.active, p.want, p.label + ' 的高亮 tab')
+  return tabPasses.map((p) => p.active).join(' → ')
+})
+check('每次切 tab 后渲染的确实是目标 tab 组件（否则下面的 hook 断言会空转）', () => {
+  tabPassesReady()
+  for (const p of tabPasses) {
+    const names = p.recs.map((r) => r.name)
+    ok(names.includes(p.comp), p.label + ' 里没有以 ' + where(p.comp) + ' 身份执行的组件调用；' +
+      '本次出现的组件是 [' + [...new Set(names)].join(', ') + ']')
+  }
+  return tabPasses.map((p) => p.comp).join(' → ')
+})
+check('每个组件自身的 hook 数在全部 ' + TAB_STEPS.length + ' 次渲染间完全一致', () => {
+  tabPassesReady()
+  const byFn = groupHooks(tabPasses)
+  const bad = []
+  for (const e of byFn.values()) {
+    const first = e.seen[0]
+    const diff = e.seen.find((s) => s.count !== first.count)
+    if (!diff) continue
+    bad.push(where(e.id) + '：' + first.label + ' 调用 ' + first.count + ' 个 hook [' + first.hooks.join(' ') + ']，' +
+      diff.label + ' 调用 ' + diff.count + ' 个 [' + diff.hooks.join(' ') + ']')
+  }
+  ok(bad.length === 0, '有组件自身的 hook 数随渲染变化 —— 同一组件的 hook 链表变长/变短，React 会抛 ' +
+    '"Rendered fewer hooks than expected" 并卸载整棵面板（切回也打不开）：' + bad.join(' | '))
+  return byFn.size + ' 个组件 × ' + TAB_STEPS.length + ' 次渲染，每个组件自身的 hook 数全部恒定'
+})
+// 比「数量相等」更强：hook 的**顺序**也必须一致。React 对「顺序变了但个数没变」（例如把 useState 挪到
+// useEffect 后面、或两个 useState 互换）同样报错 —— 只比数量会漏掉这一类。
+check('每个组件自身的 hook 序列（种类与顺序）在全部 ' + TAB_STEPS.length + ' 次渲染间完全一致', () => {
+  tabPassesReady()
+  const byFn = groupHooks(tabPasses)
+  const bad = []
+  for (const e of byFn.values()) {
+    const first = e.seen[0]
+    const key = first.hooks.join(' ')
+    const diff = e.seen.find((s) => s.hooks.join(' ') !== key)
+    if (!diff) continue
+    bad.push(where(e.id) + '：' + first.label + ' = [' + first.hooks.join(' ') + ']，' +
+      diff.label + ' = [' + diff.hooks.join(' ') + ']')
+  }
+  ok(bad.length === 0, '有组件的 hook 顺序随渲染变化 —— React 对 hook 顺序变化同样会报错并卸载面板：' + bad.join(' | '))
+  const groups = [...byFn.values()]
+  const multi = groups.filter((e) => e.seen.length > 1)
+  return multi.length + '/' + groups.length + ' 个组件各被渲染多次，每次的 hook 序列逐项相同（' +
+    groups.map((e) => e.id + ':' + e.seen[0].hooks.length).join(', ') + '）'
+})
+check('「盈亏」tab 由独立组件 ' + where('PnlTab') + ' 挂载（hooks 不落在 XueqiuPanel 头上）', () => {
+  tabPassesReady()
+  const pnlPasses = tabPasses.filter((p) => p.tab === 'pnl')
+  const recs = pnlPasses.flatMap((p) => p.recs.filter((r) => r.name === 'PnlTab'))
+  ok(recs.length > 0, '切到「盈亏」的 ' + pnlPasses.length + ' 次渲染里，没有任何一次是以 PnlTab 身份执行的组件调用 —— ' +
+    'PnlTab 的 hook 被记到了父组件头上（dispatch 用了裸函数调用）；这 ' + pnlPasses.length + ' 次渲染出现的组件是 [' +
+    [...new Set(pnlPasses.flatMap((p) => p.recs.map((r) => r.name)))].join(', ') + ']')
+  ok(recs[0].count >= 7, 'PnlTab 名下只记到 ' + recs[0].count + ' 个 hook（usePnlState 2 个 + 自己的 5 个，应 ≥ 7）')
+  return 'PnlTab 独立挂载，hook 序列 [' + recs[0].hooks.join(' ') + ']'
+})
+check('XueqiuPanel 自身的 hook 数不随 tab 变化', () => {
+  tabPassesReady()
+  const seen = []
+  for (const p of tabPasses) for (const r of p.recs) if (r.name === 'XueqiuPanel') seen.push({ label: p.label, count: r.count })
+  ok(seen.length >= TAB_STEPS.length, 'XueqiuPanel 只被记录了 ' + seen.length + ' 次（应每次渲染一次）')
+  const uniq = [...new Set(seen.map((s) => s.count))]
+  eq(uniq.length, 1, where('XueqiuPanel') + ' 的 hook 数在不同 tab 下变化：' + seen.map((s) => s.label + '=' + s.count).join(', '))
+  return '恒定 ' + uniq[0] + ' 个 hook（' + seen.length + ' 次渲染）'
+})
+check('切 tab 期间面板内组件 effect flush 无抛错', () => {
+  tabPassesReady()
+  const errs = tabPasses.flatMap((p) => p.flushErrors)
+  ok(errs.length === 0, 'flush 抛错：' + errs.join(' | '))
+  return TAB_STEPS.length + ' 次渲染的 effect 全部 flush 完成'
+})
+
+// ---- 指数条（client/ticker.js）：非空指数 + 行末今日盈亏 chip ----
+// [4] 只覆盖了「既无指数又无盈亏可说 → Ticker 返回 null」那条分支。这里补另一条：假指数响应有数据时，
+// 底部指数条要渲染出 .xq-ticker 行，且行末挂的是**独立组件** PnlChip（而不是内联进 Ticker）。
+// 注意：替身的 useState 默认每次渲染都返回初始值（setter 为 noop），indices 永远进不到复渲染里，
+// 所以这里临时打开 reactor.stateful（见 createReactStub 的注释）——这是替身能力的扩展，不是放宽断言。
+const tickerProbe = await (async () => {
+  try {
+    // 1) 先让共享盈亏运行时「活」起来：跑一次面板里 PnlChip 的 effect（subscribe → 首次 pnl.get）。
+    //    Ticker 的 showPnl 依赖它（pnl.data !== null || status 非 idle），否则行末不会有 chip。
+    const primer = render(main, SLOT_PANEL, undefined)
+    const chipFx = primer.effects.filter((e) => e.name === 'PnlChip')
+    if (!chipFx.length) return { error: new Error('面板渲染里没有登记 PnlChip 的 effect（头部 chip 未挂载？）') }
+    for (const e of chipFx) e.fn()
+    await settle(6)
+    // 2) 打开跨渲染记忆 state：Ticker 的 effect 里 setIndices 才会在复渲染时生效
+    main.react.reactor.stateful = true
+    const fetchBefore = main.record.fetchCalls.length
+    const mark = main.react.reactor.hookLog.length
+    const first = render(main, SLOT_TICKER, undefined)
+    const flush = flushEffects(main, first.effects)
+    await settle(6)
+    const second = render(main, SLOT_TICKER, undefined)
+    return { first, second, flush, recs: main.react.reactor.hookLog.slice(mark), calls: main.record.fetchCalls.slice(fetchBefore) }
+  } catch (err) { return { error: err } }
+})()
+
+function tickerReady(round) {
+  if (!tickerProbe || tickerProbe.error) {
+    throw new Error('前置失败：指数条渲染阶段出错（' + ((tickerProbe && tickerProbe.error && tickerProbe.error.message) || '未产出结果') + '）')
+  }
+  const r = tickerProbe[round]
+  if (!r) throw new Error('前置失败：缺少指数条 ' + round + ' 渲染结果')
+  return r
+}
+const tickerRow = (tree) => treeHosts(tree).find((h) => classOf(h).split(/\s+/).includes('xq-ticker'))
+
+check('指数条在假指数有数据时渲染出 .xq-ticker 行与指数项', () => {
+  const r = tickerReady('second')
+  ok(r.tree, '复渲染仍返回 null（指数数据没进到复渲染里）')
+  ok(tickerRow(r.tree), '缺 .xq-ticker 行，实际文本：' + treeText(r.tree))
+  ok(classCount(r.tree, 'xq-tick') >= 1, '行内没有指数项（.xq-tick），实际文本：' + treeText(r.tree))
+  return classCount(r.tree, 'xq-tick') + ' 个指数项：' + treeText(r.tree).slice(0, 60)
+})
+check('指数条行末是今日盈亏 chip（.xq-pnl-chip 作为最后一个子节点）', () => {
+  const r = tickerReady('second')
+  const row = tickerRow(r.tree)
+  ok(row, '缺 .xq-ticker 行')
+  ok(row.children.length > 0, '.xq-ticker 行没有任何子节点')
+  const last = row.children[row.children.length - 1]
+  ok(last && last.kind === 'host', '行末子节点不是宿主节点：' + stable(last && last.kind))
+  ok(classOf(last).split(/\s+/).includes('xq-pnl-chip'), '行末子节点不是盈亏 chip（class=' + JSON.stringify(classOf(last)) + '）')
+  ok(textHas(last, '今日盈亏'), '盈亏 chip 文案缺「今日盈亏」：' + treeText(last))
+  return treeText(last)
+})
+check('指数条里的盈亏 chip 由独立组件 PnlChip 挂载（hooks 不落在 Ticker 头上）', () => {
+  tickerReady('first')
+  const recs = tickerProbe.recs
+  const chip = recs.filter((r) => r.name === 'PnlChip')
+  ok(chip.length > 0, '指数条渲染里没有以 PnlChip 身份执行的组件调用（chip 被内联进 Ticker 了？）；' +
+    '本次出现的组件是 [' + [...new Set(recs.map((r) => r.name))].join(', ') + ']')
+  const ticker = recs.filter((r) => r.name === 'Ticker')
+  ok(ticker.length > 0, '指数条渲染里没有 Ticker 的 hook 记录')
+  return 'PnlChip ' + chip[0].count + ' 个 hook（' + where('PnlChip') + '），Ticker ' + ticker[0].count + ' 个（' + where('Ticker') + '）'
+})
+check('指数条只发一次指数请求（action=quote），没有额外网络调用', () => {
+  if (!tickerProbe || tickerProbe.error) throw new Error('前置失败：' + ((tickerProbe && tickerProbe.error && tickerProbe.error.message) || '未产出结果'))
+  ok(tickerProbe.flush.errors.length === 0, '指数条 effect flush 抛错：' + tickerProbe.flush.errors.join(' | '))
+  const calls = tickerProbe.calls
+  eqJson([...new Set(calls.map((c) => c.url))], ['/xq-rpc'], '指数条期间的 fetch URL 集合')
+  eqJson([...new Set(calls.map((c) => c.action))], ['quote'], '指数条期间的 action 集合')
+  eq(calls.length, 1, '指数条期间的 fetch 次数（不应触发 pnl.get / 其它接口）')
+  return '1 次 quote'
+})
+
 // ---------------------------------------------------------------- 6. slots 缺失时的降级
 readyGuard = null
 section('[6] 降级路径：ctx.get(\'slots\') === undefined')
@@ -1014,6 +1297,12 @@ section('[7] 沙箱替身与妥协（信息）')
 note('React 替身：createElement 真造树 + 真调函数组件（本次共调用 ' + main.react.reactor.renders + ' 次）；' +
   'useState/useReducer 返回初始值（setter 为 noop，记录了 ' + main.react.reactor.setStateCalls.length + ' 次 setState）；' +
   'useRef 每次渲染给新对象；useMemo 真跑；useCallback 原样返回；useEffect/useLayoutEffect 只登记不执行')
+note('hook 账本（[5c]）：按「组件函数 + 本次调用」记 hook 序列，内联子组件的 hook 归到父组件 —— 与真实 React 的归属规则一致；' +
+  '本次共记账 ' + main.react.reactor.hookLog.length + ' 条组件调用')
+note('替身能力边界（[5c] 依赖的部分）：没有 fiber/协调，每次渲染都从头重跑组件 body；effect 不做 deps 比对；' +
+  'setState 默认不触发重渲染（只有 [5c] 指数条那段临时打开 stateful，setter 才真正生效，共 ' +
+  (main.react.reactor.stateful ? '已打开' : '未打开') + '）。' +
+  '所以 hook 账本能证明的是「hook 归属 + 每次调用各自的 hook 数」，而不是 React 真正的 hook 链表实现。')
 note('effect 仅对白名单组件 flush：' + [...FLUSHABLE].join(', ') + '；图表组件（KlineChart 等）的 canvas effect 跳过')
 note('fetch 被替换为进程内假响应（共 ' + main.record.fetchCalls.length + ' 次，URL 集合 [' +
   [...new Set(main.record.fetchCalls.map((f) => f.url))].join(', ') + ']），绝不出网')

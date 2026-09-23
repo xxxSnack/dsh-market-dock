@@ -164,6 +164,11 @@ npm run verify       # verify-bundle（bundle 契约）+ verify-install（安装
 4. 需要新数据源时按 3.2 加 action；样式加到 `client/styles.css`（用 `xq-` 前缀）。
 5. 跑 `node tools/build.mjs && npm test`。
 
+> ⚠️ **tab 组件里一旦用了 hook**（`React.useState` / `React.useEffect` …），它就会作为独立 fiber
+> 被 `el(renderTab, tabProps)` 挂载 —— 这是 `panel/index.js` 已经做好的，**你不需要改分发逻辑**，
+> 但也**绝不能**在自己代码里把别的组件写成裸调用 `SomeComp(props)`。见 §5.3。
+> 新增/改完 tab 后 `npm run verify` 的第 4 节会核对这条。
+
 ---
 
 ## 4. 插件配置（可选）
@@ -239,6 +244,53 @@ effect 挂载时就注册了，而配置是异步到达的，要正确支持需�
 （`emitStaticClient` 模板里取 `PKG`），**不可能再漏改**；`tools/verify-install.mjs` 与
 `verify-bundle.mjs` 都盯着这条契约。
 
+### 5.3 切 tab 让整个面板消失，且再也点不开（hook 链表错位）
+
+**症状**：在「盈亏」tab 与其它 tab（行情/热榜/搜索/快讯）之间切换，面板**整块消失**，
+之后点徽标也再打不开；不切 tab 则一切正常。
+
+**根因**：`client/panel/index.js` 用**裸函数调用**分发 tab：
+
+```js
+content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabKey]
+```
+
+`XQ_TABS` 里 `market/hot/search/news` 四个 tab **一个 hook 都不用**，而第 5 个 `pnl`
+（`panel/pnl.js`）用了 **7 个**（`usePnlState()` 贡献 1 `useState` + 1 `useEffect`，
+`PnlTab` 自己再有 4 `useState` + 1 `useEffect`）。裸调用等于把子组件的 hook 记进了
+**调用者 `XueqiuPanel` 自己的 hook 链表**：切到盈亏时链表 +7，切走时 -7，React 立刻抛
+`Rendered fewer hooks than expected. This may be caused by an accidental early return statement.`
+→ 正在渲染的那棵子树被卸载，用户看到的就是「面板整块消失」。之后点徽标重开仍失败，是因为
+点开＝在同一个已损坏的渲染位置重试（tab 状态还停在盈亏上，重新挂载后一旦再切走就再次抛错）。
+> 诚实标注：抛错信息与「切到盈亏才炸、不切就正常」的现象完全吻合，这一点是确证的；
+> 「重开后仍打不开」的确切链路（DSH 的槽位是否有错误边界、是否记住失败状态）我无法在本地复现验证，
+> 因此上文只描述到「子树被卸载 + 同一位置重试」为止。**修复点本身（hooks 挂载方式）是独立成立的硬约束**。
+
+这是 React 的经典坑，但**在本次整合里是新引入的**：加 `pnl` tab 之前，五个 tab 全是无 hook
+的纯展示组件，裸调用一直"碰巧"成立。教训是「无 hook 组件」这个前提没有被任何校验盯着。
+
+**改动**（`client/panel/index.js`）
+| 位置 | 改动 |
+|---|---|
+| `LoginBox` / `DetailView` | `LoginBox({...})` → `el(LoginBox, {...})` |
+| tab 分发 | `renderTab(TAB_CTX[t]())` → `tabProps.key = t; el(renderTab, tabProps)`，`key` 让每个 tab 是一棵**独立 fiber**（切换即卸载重挂，hook 链表天然隔离） |
+
+**防回归**（两层，都做完才算完）
+1. **静态闸门** `tools/verify-wiring.mjs` 第 4 节「hooks 组件挂载方式」：递归扫 `client/**/*.js`，
+   找出所有 hooks 组件 —— 判据是「导出函数体内含 `React.use*`」**或**「调用了本项目自定义的
+   `export function useXxx`」（后者不可省：`PnlChip` 里一个 `React.use*` 字面量都没有，只用
+   `usePnlState()`，只扫前者会漏掉它）；`useXxx` 开头的真 hook 跳过。
+   再全量扫描这些名字的裸调用（`Name(` 且前面不是 `el(` / `function ` / `.`）即失败；
+   另钉死 `panel/index.js` 里必须存在字面量 `el(renderTab, `。已接入 `npm run verify`。
+   变异验证：① 改回 `renderTab(tabProps)` → `✗ tab 分发表未以 el(renderTab, ...) 挂载 —— 切 tab 会共享 hook 链表`；
+   ② 把 `el(PnlChip, …)` 改成 `PnlChip({…})` → `✗ client/ticker.js 裸调用了 PnlChip()（定义在 client/panel/pnl.js）`。两者 exit 1，恢复后 exit 0。
+   当前输出：`✓ 9 个 hooks 组件均以 el(...) 挂载：MiniBadge, KlineChart, MinuteChart, DockGate, DockPanel, XueqiuPanel, PnlChip, PnlTab, Ticker`。
+2. **运行时闸门** `test/smoke-client.mjs` §5c：React 替身按**组件**归集 hook 数，驱动
+   `market→pnl→market` 与 `news→pnl→news` 复渲染，断言每个组件的 hook 数恒定。
+
+**推广规则**：**任何含 hook 的组件都必须以 `el(Comp, props)` 挂载**，绝不要写成 `Comp(props)`。
+本文件 §3.3 的「新增一个 tab」配方已按此更新。
+
 ## 6. 已知问题（原样保留，未修）
 
 - `uiState.pos` / `uiState.minimized` 是旧「浮动面板」设计的死字段（`ui.get`/`ui.set` 从不读写）；
@@ -312,6 +364,12 @@ effect 挂载时就注册了，而配置是异步到达的，要正确支持需�
 
 - 头部常驻 chip（`panel/pnl.js` 的 `PnlChip`，插在 `dock.js` 的 `xq-status` 之后）：切任何 tab 都可见，
   点击跳到「盈亏」tab；A 股习惯**涨红跌绿**，盘外显示 `盘前/午间/收盘/休市` 小标签。
+- 底部指数条（`client/ticker.js` 的 `Ticker`，`conversation.composer.dock`）**也**渲染同一个 `PnlChip`，
+  作为 `.xq-ticker` 行的最后一个子元素 —— 这是**面板收起时唯一能看到盈亏的落点**（`DockGate` 收起时
+  直接 `return null`，头部 chip 跟着消失）。样式在 `styles.css` 里被 `.xq-ticker .xq-pnl-chip{background:none;padding:0;…}`
+  压平成与指数同一行同一字号。
+  两条注意：① `Ticker` 的 `usePnlState()` 必须写在**任何 early return 之前**（hook 顺序）；② 早退条件已放宽为
+  `if (!indices.length && !showPnl) return null`，指数接口挂掉时不再把整行（含盈亏）一起抹掉。
 - 第 5 个 tab「盈亏」（`PnlTab`）：大字金额+百分比、数据时间、组合账户下拉、Cookie 粘贴框、
   刷新间隔（5–3600 秒）、`立即刷新`（`force:true`）、`清除 Cookie`。
 - 取数只有一处：`store/pnl.js` 的**单一轮询器**（chip 与 tab 共享；引用计数启停；
@@ -319,8 +377,9 @@ effect 挂载时就注册了，而配置是异步到达的，要正确支持需�
 - tab 追加在 `PANEL_TABS` **末尾**，前 4 个 tab 的字面量与顺序未动。
 - 宿主 `ui.get` 的 `validTabs` 已加 `'pnl'`（否则水合会把 `tab:'pnl'` 打回 `'market'`，chip 点击会失效）。
 
-**已知取舍**：chip 在面板头部，所以**面板收起时看不到盈亏**（旧插件的右下角角标是常驻的）。
-并存期两者互补；若摘掉旧插件后仍想常驻，可把 `PnlChip` 也挂到 `shell.overlay`（那个槽位已由徽标占用）。
+**已知取舍**：面板展开时头部 chip 与底部指数条 chip 会**同时**显示同一个数字（冗余但无害，
+两处都点的都是同一份 `store/pnl.js` 状态，不会重复请求）；面板收起时只剩底部那一条。
+两个 chip 都不可拖拽/不可独立隐藏。
 
 ### 8.5 摘掉旧的 `dsh-ths-pnl`
 

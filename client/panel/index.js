@@ -386,23 +386,30 @@ export function XueqiuPanel() {
   const tabKey = Object.prototype.hasOwnProperty.call(XQ_TABS, ui.tab) ? ui.tab : 'news'
   const renderTab = XQ_TABS[tabKey]
 
+  // 必须用 el(组件, 属性) **挂载成真正的组件**，不能写成 LoginBox({...}) / renderTab(...) 这样的
+  // 裸函数调用 —— 裸调用会把子组件的 hooks 记到 XueqiuPanel 自己的 hook 链表上：切到「盈亏」
+  // （PnlTab 有 7 个 hooks）时链表变长、切走时变短，React 直接抛
+  // "Rendered fewer hooks than expected"，整棵面板树被卸载且再也打不开。
+  // 其它 tab 目前恰好一个 hook 都不用，所以这个坑只在盈亏身上炸——但根因是挂载方式，不是 PnlTab。
   let content
   if (loginOpen) {
-    content = LoginBox({
+    content = el(LoginBox, {
       login: login, cookieInput: cookieInput, setCookieInput: setCookieInput,
       loginMsg: loginMsg, loginBusy: loginBusy,
       doLogin: doLogin, doLogout: doLogout, doPull: doPull,
       setLoginOpen: setLoginOpen, setLoginMsg: setLoginMsg
     })
   } else if (view) {
-    content = DetailView({
+    content = el(DetailView, {
       detail: detail, view: view, setView: setView,
       chartMode: chartMode, setChartMode: setChartMode,
       klinePeriod: klinePeriod, setKlinePeriod: setKlinePeriod,
       fetchEarlierKline: fetchEarlierKline
     })
   } else {
-    content = renderTab(TAB_CTX[tabKey]())
+    const tabProps = TAB_CTX[tabKey]()
+    tabProps.key = tabKey   // 每个 tab 一棵独立的 fiber：切换即卸载重挂，不共享 hook 链表
+    content = el(renderTab, tabProps)
   }
 
   // key 变化触发 xq-fade-in 重放：tab/详情切换有轻微淡入

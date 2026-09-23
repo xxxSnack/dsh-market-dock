@@ -32,7 +32,8 @@ const OFF_HOURS = { pre: 1, lunch: 1, after: 1, weekend: 1 }
 
 // 订阅盈亏运行时。返回 state 快照；订阅/退订由 store 的引用计数管轮询器的启停，
 // 所以 chip 与 tab 同时挂着也只有一个轮询器、一份数据。
-function usePnlState() {
+// 导出给底部指数条（client/ticker.js）复用：那里也要判断「有没有东西可显示」。
+export function usePnlState() {
   const [state, setState] = React.useState(function () {
     const rt = getPnlRuntime()
     return rt ? rt.getState() : { data: null, status: 'idle', error: '' }

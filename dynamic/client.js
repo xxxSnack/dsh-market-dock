@@ -1365,6 +1365,7 @@ const OFF_HOURS = { pre: 1, lunch: 1, after: 1, weekend: 1 }
 
 // 订阅盈亏运行时。返回 state 快照；订阅/退订由 store 的引用计数管轮询器的启停，
 // 所以 chip 与 tab 同时挂着也只有一个轮询器、一份数据。
+// 导出给底部指数条（client/ticker.js）复用：那里也要判断「有没有东西可显示」。
 function usePnlState() {
   const [state, setState] = React.useState(function () {
     const rt = getPnlRuntime()
@@ -1994,23 +1995,30 @@ function XueqiuPanel() {
   const tabKey = Object.prototype.hasOwnProperty.call(XQ_TABS, ui.tab) ? ui.tab : 'news'
   const renderTab = XQ_TABS[tabKey]
 
+  // 必须用 el(组件, 属性) **挂载成真正的组件**，不能写成 LoginBox({...}) / renderTab(...) 这样的
+  // 裸函数调用 —— 裸调用会把子组件的 hooks 记到 XueqiuPanel 自己的 hook 链表上：切到「盈亏」
+  // （PnlTab 有 7 个 hooks）时链表变长、切走时变短，React 直接抛
+  // "Rendered fewer hooks than expected"，整棵面板树被卸载且再也打不开。
+  // 其它 tab 目前恰好一个 hook 都不用，所以这个坑只在盈亏身上炸——但根因是挂载方式，不是 PnlTab。
   let content
   if (loginOpen) {
-    content = LoginBox({
+    content = el(LoginBox, {
       login: login, cookieInput: cookieInput, setCookieInput: setCookieInput,
       loginMsg: loginMsg, loginBusy: loginBusy,
       doLogin: doLogin, doLogout: doLogout, doPull: doPull,
       setLoginOpen: setLoginOpen, setLoginMsg: setLoginMsg
     })
   } else if (view) {
-    content = DetailView({
+    content = el(DetailView, {
       detail: detail, view: view, setView: setView,
       chartMode: chartMode, setChartMode: setChartMode,
       klinePeriod: klinePeriod, setKlinePeriod: setKlinePeriod,
       fetchEarlierKline: fetchEarlierKline
     })
   } else {
-    content = renderTab(TAB_CTX[tabKey]())
+    const tabProps = TAB_CTX[tabKey]()
+    tabProps.key = tabKey   // 每个 tab 一棵独立的 fiber：切换即卸载重挂，不共享 hook 链表
+    content = el(renderTab, tabProps)
   }
 
   // key 变化触发 xq-fade-in 重放：tab/详情切换有轻微淡入
@@ -2313,12 +2321,16 @@ function DockPanel() {
 }
 
 // 底部指数条（会话页，输入框下方氛围行）。
+// 除指数外还常驻一条「今日盈亏」：面板收起时（DockGate 直接返回 null）头部 chip 是看不到的，
+// 而这条氛围行始终在，所以它是「收起面板也能看到盈亏」的唯一落点。
+// 与头部 chip 共用同一个 PnlChip（也就共用同一个轮询器，见 store/pnl.js 的引用计数）。
 
 // ---------- 底部指数条（会话页，输入框下方氛围行） ----------
 function Ticker() {
   const rt = getUiRuntime()
   const ui = rt.ui
   const [indices, setIndices] = React.useState([])
+  const pnl = usePnlState()
   React.useEffect(function () {
     let alive = true
     function refresh() {
@@ -2336,7 +2348,9 @@ function Ticker() {
       try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     }
   }, [])
-  if (!indices.length) return null
+  // 指数拉不到时不再整条消失：只要盈亏还有东西可说，这一行就有意义。
+  const showPnl = pnl.data !== null || pnl.status === 'loading' || pnl.status === 'error'
+  if (!indices.length && !showPnl) return null
   const kids = indices.map(function (q) {
     return el('span', { key: q.symbol, className: 'xq-tick' }, [
       el('span', { key: 'n', className: 'xq-tick-name' }, q.name),
@@ -2344,6 +2358,7 @@ function Ticker() {
       el('span', { key: 'p', className: colorOf(q.percent) }, fmtPct(q.percent))
     ])
   })
+  if (showPnl) kids.push(el(PnlChip, { key: 'pnl' }))
   return el('div', { className: 'xq-ticker', onClick: function () { ui.set({ open: true }) } }, kids)
 }
 
@@ -2543,6 +2558,9 @@ const xqClientPlugin = {
 .xq-tick{display:inline-flex;gap:5px;align-items:baseline;}
 .xq-tick-name{color:var(--dsw-alias-label-secondary);}
 .xq-tick-cur{font-weight:600;}
+/* 指数条里复用的盈亏 chip：跟氛围行正文排版走，去掉面板头部那种药丸底色与内边距 */
+.xq-ticker .xq-pnl-chip{background:none;padding:0;max-width:none;font-size:11px;}
+.xq-ticker .xq-pnl-chip.xq-pnl-up,.xq-ticker .xq-pnl-chip.xq-pnl-down{font-weight:600;}
 .xq-caret{font-size:11px;color:var(--dsw-alias-label-secondary);flex-shrink:0;}
 .xq-loading{font-size:12px;color:var(--dsw-alias-label-secondary);padding:12px 0;text-align:center;}
 /* 账号登录（可选）：粘贴浏览器 Cookie 启用云端自选股 */

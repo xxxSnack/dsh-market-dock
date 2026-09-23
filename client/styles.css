@@ -162,6 +162,9 @@
 .xq-tick{display:inline-flex;gap:5px;align-items:baseline;}
 .xq-tick-name{color:var(--dsw-alias-label-secondary);}
 .xq-tick-cur{font-weight:600;}
+/* 指数条里复用的盈亏 chip：跟氛围行正文排版走，去掉面板头部那种药丸底色与内边距 */
+.xq-ticker .xq-pnl-chip{background:none;padding:0;max-width:none;font-size:11px;}
+.xq-ticker .xq-pnl-chip.xq-pnl-up,.xq-ticker .xq-pnl-chip.xq-pnl-down{font-weight:600;}
 .xq-caret{font-size:11px;color:var(--dsw-alias-label-secondary);flex-shrink:0;}
 .xq-loading{font-size:12px;color:var(--dsw-alias-label-secondary);padding:12px 0;text-align:center;}
 /* 账号登录（可选）：粘贴浏览器 Cookie 启用云端自选股 */

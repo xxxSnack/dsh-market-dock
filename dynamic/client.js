@@ -163,7 +163,9 @@ function sessionState(tz, segs, lunch) {
     if (p.weekday === 'Sat' || p.weekday === 'Sun') return '休市'
     var h = parseInt(p.hour, 10) % 24
     var cur = h * 60 + parseInt(p.minute, 10)
-    var inSess = segs.some(function (s) { return cur >= s[0] && cur < s[1] })
+    // 与宿主 P&L 时段口径一致：收盘分钟仍属于盘中（A 股 11:30 / 15:00），
+    // 午休从下一分钟开始，避免界面在边界瞬间先显示“休市/午休”。
+    var inSess = segs.some(function (s) { return cur >= s[0] && cur <= s[1] })
     if (inSess) return '盘中'
     if (lunch && cur >= lunch[0] && cur < lunch[1]) return '午休'
     return cur < segs[0][0] ? '盘前' : '休市'
@@ -215,7 +217,7 @@ const call = async function (action, args) {
   return r.data
 }
 
-// UI 共享状态：面板开合 / 当前标签 / 徽章位置尺寸。同时是**运行时持有者（runtime holder）**。
+// UI 共享状态：面板开合 / 当前标签 / 徽章位置、尺寸与折叠形态。同时是**运行时持有者（runtime holder）**。
 //
 // ── 为什么需要持有者 ─────────────────────────────────────────────────────────
 // 重构前所有东西都在 apply(ctx) 的闭包里，因此 ui store、saveUi（debounce 包装）、hydratePromise、
@@ -238,9 +240,9 @@ function getUiRuntime() { return uiRuntime }
 function createUiRuntime(ctx) {
   // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
   const ui = {
-    open: false, tab: 'market', badgePos: null, badgeW: null, dockH: null, hydrated: false,
-    // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这两个标志，位置/尺寸缺失。
-    openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, dockHTouched: false,
+    open: false, tab: 'market', badgePos: null, badgeW: null, badgeCompact: false, dockH: null, hydrated: false,
+    // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这些标志，位置/尺寸/折叠状态补齐。
+    openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, badgeCompactTouched: false, dockHTouched: false,
     _fns: [],
     subscribe: function (fn) {
       this._fns.push(fn)
@@ -265,6 +267,7 @@ function createUiRuntime(ctx) {
         // 把刚拖到的徽章位置打回旧持久化值（表现为"切会话后弹回右下角"）。
         if (k === 'badgePos') this.badgePosTouched = true
         if (k === 'badgeW') this.badgeWTouched = true
+        if (k === 'badgeCompact') this.badgeCompactTouched = true
         if (k === 'dockH') this.dockHTouched = true
       }
       if (ch) {
@@ -274,7 +277,7 @@ function createUiRuntime(ctx) {
         // [fork-fix] 原来只有 open 直接落盘：位置/尺寸靠 DockPanel 的订阅间接落盘，
         // 而面板收起时 DockPanel 根本不挂载（DockGate 返回 null）→ 拖徽章永不写入。
         // 改为所有被持久化的键都直接排一次落盘，不再依赖某个组件恰好挂着。
-        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'dockH' in patch) {
+        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'badgeCompact' in patch || 'dockH' in patch) {
           try { saveUi() } catch (e) { /* 初始化前忽略 */ }
         }
       }
@@ -282,7 +285,7 @@ function createUiRuntime(ctx) {
   }
 
   const saveUi = ctx.debounce(function () {
-    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
+    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, badgeCompact: ui.badgeCompact, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
   }, SAVE_UI_DEBOUNCE_MS)
 
   uiRuntime = {
@@ -331,6 +334,9 @@ function hydrateUi() {
     if (d && typeof d.badgeW === 'number' && isFinite(d.badgeW) && !ui.badgeWTouched) {
       ui.set({ badgeW: d.badgeW })
     }
+    if (d && typeof d.badgeCompact === 'boolean' && !ui.badgeCompactTouched) {
+      ui.set({ badgeCompact: d.badgeCompact })
+    }
     ui.set({ hydrated: true })
   }).catch(function () { ui.set({ hydrated: true }) })
   return rt.hydratePromise
@@ -340,10 +346,10 @@ function hydrateUi() {
 // 每个函数严格等于重构前散落在各组件里的那一次 call(...) 调用（action 与参数形状不变）。
 
 // 批量行情（面板：指数一组、自选一组；徽标：指数一组、自选前 12 只一组）
-function fetchQuote(symbols) { return call(A_QUOTE, { symbols: symbols }) }
+function fetchQuote(symbols, force) { return call(A_QUOTE, { symbols: symbols, force: force === true }) }
 
 // 四大指数（面板指数卡 / 徽标指数区 / 底部指数条共用同一组代码）
-function fetchIndices() { return call(A_QUOTE, { symbols: XQ_INDEX_SYMBOLS }) }
+function fetchIndices(force) { return call(A_QUOTE, { symbols: XQ_INDEX_SYMBOLS, force: force === true }) }
 
 // 自选列表（面板 refreshMarket、徽标主体）
 function fetchWatchlist() { return call(A_WATCHLIST_GET, {}) }
@@ -394,6 +400,7 @@ function createPnlRuntime(ctx) {
     refs: 0,                       // 订阅者引用计数
     active: false,
     delay: PNL_POLL_FALLBACK_MS,   // 上次排定的间隔（页面隐藏时按它重排，不会排出更密的节奏）
+    visibilityBound: false,
 
     subscribe: function (fn) {
       listeners.push(fn)
@@ -444,6 +451,7 @@ function createPnlRuntime(ctx) {
       rt.refs++
       if (rt.refs !== 1) return   // 已有轮询器在跑，chip 与 tab 共享它
       rt.active = true
+      bindVisibility()
       cycle()
     },
 
@@ -452,6 +460,7 @@ function createPnlRuntime(ctx) {
       if (rt.refs > 0) return
       rt.refs = 0
       rt.active = false
+      unbindVisibility()
       if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
     }
   }
@@ -460,6 +469,29 @@ function createPnlRuntime(ctx) {
     if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
     rt.delay = ms
     rt.timer = disposer(ctx.timeout(cycle, ms))
+  }
+
+  // 页面从后台恢复时不要等完上一次「盘外长睡」：浏览器可能暂停/钳制定时器，
+  // 正好会错过 09:30 开盘或把收盘状态留在屏幕上。可见性恢复立即走一次宿主判定，
+  // 宿主会按北京时间决定是否真的访问上游。
+  function onVisibility() {
+    if (!rt.active || pageHidden()) return
+    if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
+    cycle()
+  }
+  function bindVisibility() {
+    if (rt.visibilityBound) return
+    try {
+      if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('visibilitychange', onVisibility)
+        rt.visibilityBound = true
+      }
+    } catch (e) { /* ignore */ }
+  }
+  function unbindVisibility() {
+    if (!rt.visibilityBound) return
+    try { document.removeEventListener('visibilitychange', onVisibility) } catch (e) { /* ignore */ }
+    rt.visibilityBound = false
   }
 
   // 一次「取数 → 按宿主给的节奏重排」。
@@ -1482,7 +1514,8 @@ function PnlTab(p) {
       if (json && isFinite(Number(json.poll_sec))) setIntervalDraft(String(json.poll_sec))
       if (json && json.valid) setDraft('')
       const rt = getPnlRuntime()
-      if (rt) rt.refresh()
+      // 配置 Cookie/组合后即使处于收盘时段也要立即取一次，避免继续展示旧账户快照。
+      if (rt) rt.refresh(true)
     }).catch(function (e) {
       setStatus(function (prev) {
         return Object.assign({}, prev || {}, { valid: false, error: String((e && e.message) || e) })
@@ -1643,13 +1676,15 @@ function XueqiuPanel() {
   const [indices, setIndices] = React.useState([])
   const [hot, setHot] = React.useState([])
   const [hotMarket, setHotMarket] = React.useState('cn')
-  // 竞态防护：热榜/搜索的响应序号（旧响应到达时序号已过期则丢弃，防慢请求覆盖新结果）
+  // 竞态防护：行情/热榜/搜索的响应序号（旧响应到达时序号已过期则丢弃，防慢请求覆盖新结果）
+  const marketSeq = React.useRef(0)
   const hotSeq = React.useRef(0)
   const searchSeq = React.useRef(0)
   // 轮询闭包读当前市场（interval 闭包不随状态更新，直接捕获 state 会拿到 stale 值）
   const hotMarketRef = React.useRef(hotMarket)
   hotMarketRef.current = hotMarket
   const [news, setNews] = React.useState([])
+  const newsSeq = React.useRef(0)
   const [newsMore, setNewsMore] = React.useState(false)   // 翻页加载中
   const [newsNoMore, setNewsNoMore] = React.useState(false) // 已到最旧
   const [searchQ, setSearchQ] = React.useState('')
@@ -1677,19 +1712,25 @@ function XueqiuPanel() {
   const tab = ui.tab
   function setTab(t) { ui.set({ tab: t }) }
 
-  function refreshMarket() {
+  function refreshMarket(force) {
+    const my = ++marketSeq.current
     return Promise.all([
       fetchWatchlist(),
-      fetchIndices()
+      fetchIndices(force)
     ]).then(function (res) {
+      if (marketSeq.current !== my) return
       const wl = (res[0] && res[0].symbols) || []
       const status = res[1] ? res[1].status : null
-      setMarketOpen(status === 5 || status === 6)
+      // 空响应/临时异常没有足够信息判断盘中，不要把轮询误降到休市节奏；
+      // 下一轮成功拿到状态后再切换。
+      if (status === 5 || status === 6) setMarketOpen(true)
+      else if (status !== null && status !== undefined) setMarketOpen(false)
       setWatchlist(wl)
       setIndices((res[1] && res[1].list) || [])
       setErr('')
       if (!wl.length) return
-      return fetchQuote(wl).then(function (data) {
+      return fetchQuote(wl, force).then(function (data) {
+        if (marketSeq.current !== my) return
         const list = (data && data.list) || []
         // 批量行情会整只丢弃无效/退市代码：补占位行（现价/涨跌全 '--'，仍可删除/查详情），
         // 否则"加进自选却凭空消失"没有任何反馈
@@ -1707,25 +1748,27 @@ function XueqiuPanel() {
         setQuotes(list.concat(missing))
       })
     }).catch(function (e) {
-      setErr(String((e && e.message) || e))
+      if (marketSeq.current === my) setErr(String((e && e.message) || e))
     })
   }
 
   function refreshContent() {
     const my = ++hotSeq.current
+    const newsMy = ++newsSeq.current
     const market = hotMarketRef.current   // 读当前市场（轮询闭包防 stale）
     Promise.all([
       call(A_HOT, { market: market, size: HOT_LIST_SIZE }),
       call(A_NEWS, { count: NEWS_PAGE_SIZE })
     ]).then(function (res) {
       if (hotSeq.current !== my) return   // 期间用户切了市场/触发过手动刷新：丢弃旧响应
+      if (newsSeq.current !== newsMy) return
       setHot((res[0] && res[0].list) || [])
       setNews((res[1] && res[1].items) || [])
       setNewsMore(false)
       setNewsNoMore(false)
       setErr('')
     }).catch(function (e) {
-      setErr(String((e && e.message) || e))
+      if (hotSeq.current === my && newsSeq.current === newsMy) setErr(String((e && e.message) || e))
     })
   }
 
@@ -1733,8 +1776,10 @@ function XueqiuPanel() {
   function loadMoreNews() {
     if (newsMore || newsNoMore || !news.length) return
     const maxId = news[news.length - 1].id
+    const my = ++newsSeq.current
     setNewsMore(true)
     call(A_NEWS, { count: NEWS_PAGE_SIZE, max_id: maxId }).then(function (res) {
+      if (newsSeq.current !== my) return
       const items = (res && res.items) || []
       const seen = {}
       news.forEach(function (it) { seen[it.id] = true })
@@ -1743,7 +1788,7 @@ function XueqiuPanel() {
       else setNews(news.concat(fresh))
       setNewsMore(false)
     }).catch(function () {
-      setNewsMore(false)
+      if (newsSeq.current === my) setNewsMore(false)
     })
   }
 
@@ -1818,6 +1863,38 @@ function XueqiuPanel() {
     })
     return function () { alive = false }
   }, [view])
+
+  // 详情驻留期间也要更新报价/分时；原来只在切换标的时请求一次，打开十几分钟后
+  // 现价会永久停在旧值。回到前台立即补一次，force 跳过短 TTL。
+  React.useEffect(function () {
+    if (!view) return function () {}
+    let alive = true
+    function refreshLive() {
+      if (pageHidden()) return
+      Promise.all([
+        call(A_QUOTE_DETAIL, { symbol: view, force: true }).catch(function () { return null }),
+        call(A_MINUTE, { symbol: view, force: true }).catch(function () { return null })
+      ]).then(function (res) {
+        if (!alive) return
+        const q = res[0] && res[0].quote
+        const m = res[1]
+        if (!q && !m) return
+        setDetail(function (d) {
+          if (!d) return d
+          return Object.assign({}, d, q ? { quote: q } : {}, m ? { minute: m } : {})
+        })
+      })
+    }
+    const liveMs = marketOpen ? POLL_MARKET_OPEN_MS : POLL_MARKET_CLOSED_MS
+    const stop = rt.ctx.interval(refreshLive, liveMs)
+    function onVis() { if (!pageHidden()) refreshLive() }
+    try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+    return function () {
+      alive = false
+      if (stop) stop()
+      try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+    }
+  }, [view, marketOpen])
 
   // K线按周期独立拉取：切周期只清图表数据、只发 1 个请求，报价与周期丸全程保持可点
   React.useEffect(function () {
@@ -1949,7 +2026,7 @@ function XueqiuPanel() {
         // 盈亏一并刷新：refresh() 内部已做并发去重，与后台轮询不会重复请求；
         // 它自己吞掉失败（返回 null 而非拒绝），所以这里的 loading 语义与原来完全一致。
         const pnlRt = getPnlRuntime()
-        Promise.all([refreshMarket(), refreshContent(), pnlRt ? pnlRt.refresh() : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
+        Promise.all([refreshMarket(true), refreshContent(), pnlRt ? pnlRt.refresh(true) : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
       }
     }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
   ]))
@@ -2037,24 +2114,27 @@ function MiniBadge() {
   const [top, setTop] = React.useState([])
   const [mOpen, setMOpen] = React.useState(true)
   const [, force] = React.useState(0)
+  const refreshSeq = React.useRef(0)
 
   React.useEffect(function () {
     let alive = true
     function refresh() {
       if (pageHidden()) return   // 页面隐藏时暂停徽章轮询
+      const my = ++refreshSeq.current
       fetchIndices().then(function (data) {
-        if (!alive) return
+        if (!alive || refreshSeq.current !== my) return
         setIdx((data && data.list) || [])
         const st = data ? data.status : null
-        setMOpen(st === 5 || st === 6)
+        if (st === 5 || st === 6) setMOpen(true)
+        else if (st !== null && st !== undefined) setMOpen(false)
       }).catch(function () { /* 静默失败 */ })
       // 徽章主体：自选前 12 只（轮动素材 / 平铺内容）；自选为空回退指数
       fetchWatchlist().then(function (wl) {
-        if (!alive) return
+        if (!alive || refreshSeq.current !== my) return
         const symbols = ((wl && wl.symbols) || []).slice(0, BADGE_WATCH_LIMIT)
         if (!symbols.length) { setTop([]); return }
         return fetchQuote(symbols).then(function (data) {
-          if (alive) setTop((data && data.list) || [])
+          if (alive && refreshSeq.current === my) setTop((data && data.list) || [])
         })
       }).catch(function () { /* 静默失败：保留指数 */ })
     }
@@ -2105,7 +2185,16 @@ function MiniBadge() {
     }
   }, [])
 
+  function isBadgeControl(e) {
+    const target = e && e.target
+    return !!(target && typeof target.closest === 'function' && target.closest('.xq-badge-control'))
+  }
+  function stopBadgeControl(e) {
+    if (e && typeof e.stopPropagation === 'function') e.stopPropagation()
+  }
   function onDown(e) {
+    // 按钮等子控件不启动徽章拖拽，也不取得 pointer capture。
+    if (isBadgeControl(e)) return
     if (e.pointerType === 'mouse' && e.button !== 0) return
     rt.badgeDrag = { x: e.clientX, y: e.clientY }
     rt.badgeMoved = false
@@ -2131,15 +2220,25 @@ function MiniBadge() {
     e.currentTarget.style.right = 'auto'
     e.currentTarget.style.bottom = 'auto'
   }
-  function onUp(e) {
+  function finishDrag(e, activate) {
+    // 未由徽章背景启动的 pointerup（例如工具按钮）不能误触发开合。
+    if (!rt.badgeDrag) return
     const moved = rt.badgeMoved
-    const pos = rt.badgeDrag ? rt.badgeDrag.pos : null
+    const pos = rt.badgeDrag.pos
     rt.badgeDrag = null
     rt.badgeMoved = false
     try { if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId) } catch (err) { /* ignore */ }
-    if (!moved) { ui.set({ open: !ui.open }); return }
+    if (!moved) {
+      if (!activate) return
+      // 胶囊点击只恢复徽章；完整徽章背景点击才开合大面板。
+      if (ui.badgeCompact) ui.set({ badgeCompact: false })
+      else ui.set({ open: !ui.open })
+      return
+    }
     if (pos) ui.set({ badgePos: pos })   // 松手一次性提交
   }
+  function onUp(e) { finishDrag(e, true) }
+  function onCancel(e) { finishDrag(e, false) }
 
   // ---- 宽度调节手柄：横向拖动改变徽章宽度（120–480px），松手持久化；双击复位为单行条 ----
   const gripDrag = React.useRef(null)
@@ -2174,6 +2273,7 @@ function MiniBadge() {
 
   // 默认区域模式：自选静态平铺（badgeW 未设置时用默认宽 320px；双击手柄回到 320 而非单行）
   const wide = true
+  const compact = ui.badgeCompact === true
   const effW = (ui.badgeW !== null && ui.badgeW !== undefined) ? ui.badgeW : BADGE_W_DEFAULT
   // 区域模式：前 12 只全部平铺（换行）；单行模式：轮动页（页码指示）
   function wItem(q) {
@@ -2196,33 +2296,43 @@ function MiniBadge() {
   let style = ui.badgePos
     ? { left: ui.badgePos.x, top: ui.badgePos.y, right: 'auto', bottom: 'auto' }
     : null
-  if (wide) {
+  if (wide && !compact) {
     if (!style) { style = {} }
     style.maxWidth = effW + 'px'
     style.width = effW + 'px'
   }
-
-  const badgeEl = el('div', {
-    ref: badgeRef,
-    className: 'xq-badge',
-    style: style,
-    title: '点击开合行情面板 · 拖动调整位置 · 右下角 ⤡ 调宽度（双击复位）',
-    onPointerDown: onDown, onPointerMove: onMove, onPointerUp: onUp, onPointerCancel: onUp
-  }, [
+  const compactButton = el('button', {
+    key: 'compact', type: 'button', className: 'xq-badge-control',
+    title: compact ? '展开行情徽章' : '收起为小胶囊',
+    'aria-label': compact ? '展开行情徽章' : '收起为小胶囊',
+    'aria-expanded': !compact,
+    onPointerDown: stopBadgeControl, onPointerMove: stopBadgeControl,
+    onPointerUp: stopBadgeControl, onPointerCancel: stopBadgeControl,
+    onClick: function (e) { stopBadgeControl(e); ui.set({ badgeCompact: !ui.badgeCompact }) }
+  }, compact ? '+' : '−')
+  const badgeKids = [
     el('div', { key: 'hd', className: 'xq-badge-hd' }, [
       el('span', { key: 'logo' }, [el('b', { key: 'b' }, '雪球'), 'mini']),
       el('span', { key: 'st', className: 'xq-status' + (aSession() === '盘中' ? ' xq-live' : ''), title: sessionsText() }, (function () { var s = aSession(); return s === '盘中' ? '● 盘中' : (s || (mOpen ? '● 盘中' : '休市')) })()),
       el('span', { key: 'sp', className: 'xq-spacer' }),
+      compactButton,
       el('span', { key: 'ct', className: 'xq-caret' }, ui.open ? '▾' : '▴')
-    ]),
-    idxEls,
-    bodyEls,
-    el('span', {
+    ])
+  ]
+  if (!compact) {
+    badgeKids.push(idxEls, bodyEls, el('span', {
       key: 'grip', className: 'xq-badge-grip', title: '拖动调宽度 · 双击复位',
       onPointerDown: onGripDown, onPointerMove: onGripMove, onPointerUp: onGripUp, onPointerCancel: onGripUp,
       onDoubleClick: onGripDblClick
-    }, '⤡')
-  ])
+    }, '⤡'))
+  }
+  const badgeEl = el('div', {
+    ref: badgeRef,
+    className: 'xq-badge' + (compact ? ' xq-badge-compact' : ''),
+    style: style,
+    title: compact ? '点击胶囊恢复行情列表 · 拖动调整位置' : '点击开合行情面板 · 拖动调整位置 · 右下角 ⤡ 调宽度（双击复位）',
+    onPointerDown: onDown, onPointerMove: onMove, onPointerUp: onUp, onPointerCancel: onCancel
+  }, badgeKids)
   return el('div', { style: { display: 'contents' } }, [badgeEl])
 }
 
@@ -2331,12 +2441,14 @@ function Ticker() {
   const ui = rt.ui
   const [indices, setIndices] = React.useState([])
   const pnl = usePnlState()
+  const requestSeq = React.useRef(0)
   React.useEffect(function () {
     let alive = true
     function refresh() {
       if (pageHidden()) return   // 页面隐藏时暂停指数条轮询
+      const my = ++requestSeq.current
       fetchIndices().then(function (data) {
-        if (alive) setIndices((data && data.list) || [])
+        if (alive && requestSeq.current === my) setIndices((data && data.list) || [])
       }).catch(function () { /* 静默失败 */ })
     }
     function onVis() { if (!pageHidden()) refresh() }
@@ -2485,6 +2597,11 @@ const xqClientPlugin = {
 .xq-badge-grip{position:absolute;right:2px;bottom:2px;width:16px;height:16px;cursor:ew-resize;display:flex;align-items:flex-end;justify-content:flex-end;color:var(--dsw-alias-label-secondary);font-size:9px;line-height:1;opacity:0;transition:opacity .15s;}
 .xq-badge:hover .xq-badge-grip{opacity:.85;}
 .xq-badge-hd{display:flex;align-items:center;gap:8px;}
+.xq-badge-compact{width:auto;max-width:180px;padding:5px 8px;border-radius:999px;gap:0;}
+.xq-badge-compact .xq-badge-hd{gap:6px;white-space:nowrap;}
+.xq-badge-control{flex:none;width:18px;height:18px;padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:50%;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:16px;text-align:center;cursor:pointer;}
+.xq-badge-control:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary);}
+.xq-badge-control:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}
 .xq-wgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 12px;padding:1px 8px 1px 0;}
 .xq-witem{white-space:nowrap;display:flex;justify-content:space-between;gap:6px;}
 .xq-witem .xq-badge-hint{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;}

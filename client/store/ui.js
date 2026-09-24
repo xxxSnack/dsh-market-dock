@@ -1,4 +1,4 @@
-// UI 共享状态：面板开合 / 当前标签 / 徽章位置尺寸。同时是**运行时持有者（runtime holder）**。
+// UI 共享状态：面板开合 / 当前标签 / 徽章位置、尺寸与折叠形态。同时是**运行时持有者（runtime holder）**。
 //
 // ── 为什么需要持有者 ─────────────────────────────────────────────────────────
 // 重构前所有东西都在 apply(ctx) 的闭包里，因此 ui store、saveUi（debounce 包装）、hydratePromise、
@@ -24,9 +24,9 @@ export function getUiRuntime() { return uiRuntime }
 export function createUiRuntime(ctx) {
   // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
   const ui = {
-    open: false, tab: 'market', badgePos: null, badgeW: null, dockH: null, hydrated: false,
-    // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这两个标志，位置/尺寸缺失。
-    openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, dockHTouched: false,
+    open: false, tab: 'market', badgePos: null, badgeW: null, badgeCompact: false, dockH: null, hydrated: false,
+    // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这些标志，位置/尺寸/折叠状态补齐。
+    openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, badgeCompactTouched: false, dockHTouched: false,
     _fns: [],
     subscribe: function (fn) {
       this._fns.push(fn)
@@ -51,6 +51,7 @@ export function createUiRuntime(ctx) {
         // 把刚拖到的徽章位置打回旧持久化值（表现为"切会话后弹回右下角"）。
         if (k === 'badgePos') this.badgePosTouched = true
         if (k === 'badgeW') this.badgeWTouched = true
+        if (k === 'badgeCompact') this.badgeCompactTouched = true
         if (k === 'dockH') this.dockHTouched = true
       }
       if (ch) {
@@ -60,7 +61,7 @@ export function createUiRuntime(ctx) {
         // [fork-fix] 原来只有 open 直接落盘：位置/尺寸靠 DockPanel 的订阅间接落盘，
         // 而面板收起时 DockPanel 根本不挂载（DockGate 返回 null）→ 拖徽章永不写入。
         // 改为所有被持久化的键都直接排一次落盘，不再依赖某个组件恰好挂着。
-        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'dockH' in patch) {
+        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'badgeCompact' in patch || 'dockH' in patch) {
           try { saveUi() } catch (e) { /* 初始化前忽略 */ }
         }
       }
@@ -68,7 +69,7 @@ export function createUiRuntime(ctx) {
   }
 
   const saveUi = ctx.debounce(function () {
-    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
+    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, badgeCompact: ui.badgeCompact, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
   }, SAVE_UI_DEBOUNCE_MS)
 
   uiRuntime = {
@@ -116,6 +117,9 @@ export function hydrateUi() {
     }
     if (d && typeof d.badgeW === 'number' && isFinite(d.badgeW) && !ui.badgeWTouched) {
       ui.set({ badgeW: d.badgeW })
+    }
+    if (d && typeof d.badgeCompact === 'boolean' && !ui.badgeCompactTouched) {
+      ui.set({ badgeCompact: d.badgeCompact })
     }
     ui.set({ hydrated: true })
   }).catch(function () { ui.set({ hydrated: true }) })

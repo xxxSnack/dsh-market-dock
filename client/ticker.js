@@ -15,12 +15,14 @@ export function Ticker() {
   const ui = rt.ui
   const [indices, setIndices] = React.useState([])
   const pnl = usePnlState()
+  const requestSeq = React.useRef(0)
   React.useEffect(function () {
     let alive = true
     function refresh() {
       if (pageHidden()) return   // 页面隐藏时暂停指数条轮询
+      const my = ++requestSeq.current
       fetchIndices().then(function (data) {
-        if (alive) setIndices((data && data.list) || [])
+        if (alive && requestSeq.current === my) setIndices((data && data.list) || [])
       }).catch(function () { /* 静默失败 */ })
     }
     function onVis() { if (!pageHidden()) refresh() }

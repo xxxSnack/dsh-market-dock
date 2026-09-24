@@ -493,7 +493,8 @@ try {
   check('ui.get 响应 no-store（不被中间层缓存）', Boolean(uiGet.headers) && uiGet.headers['Cache-Control'] === 'no-store', String(uiGet.headers && uiGet.headers['Cache-Control']))
   check('ui.get data 带 tab（合法白名单值）', Boolean(uiJson && uiJson.data) && ['market', 'hot', 'search', 'news'].indexOf(uiJson.data.tab) >= 0, JSON.stringify(uiJson && uiJson.data))
   check('ui.get data 带 open（布尔）', Boolean(uiJson && uiJson.data) && typeof uiJson.data.open === 'boolean', JSON.stringify(uiJson && uiJson.data && uiJson.data.open))
-  check('ui.get data 带 dockH / badgeW / badgePos 键', Boolean(uiJson && uiJson.data) && ['dockH', 'badgeW', 'badgePos'].every((k) => k in uiJson.data), JSON.stringify(Object.keys((uiJson && uiJson.data) || {})))
+  check('ui.get data 带 dockH / badgeW / badgeCompact / badgePos 键', Boolean(uiJson && uiJson.data) && ['dockH', 'badgeW', 'badgeCompact', 'badgePos'].every((k) => k in uiJson.data), JSON.stringify(Object.keys((uiJson && uiJson.data) || {})))
+  check('ui.get badgeCompact 默认 false（兼容旧状态文件）', Boolean(uiJson && uiJson.data) && uiJson.data.badgeCompact === false, JSON.stringify(uiJson && uiJson.data))
 
   const dbg = await rpc(SAME_ORIGIN, { action: 'debug' })
   const dbgJson = jsonOf(dbg)
@@ -520,11 +521,11 @@ try {
    * 8. ui.set 往返 + 状态文件落点
    * ---------------------------------------------------------------- */
   section('[6] ui.set 往返 + 状态落点')
-  const uiSet = await rpc(SAME_ORIGIN, { action: 'ui.set', args: { tab: 'news', dockH: 400 } })
+  const uiSet = await rpc(SAME_ORIGIN, { action: 'ui.set', args: { tab: 'news', dockH: 400, badgeCompact: true } })
   const uiSetJson = jsonOf(uiSet)
   check('ui.set → 200 + ok:true + data.ok:true', uiSet.statusCode === 200 && uiSetJson && uiSetJson.ok === true && uiSetJson.data && uiSetJson.data.ok === true, uiSet.body)
   const uiAfter = jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.get' }))
-  check('ui.set → ui.get 往返（内存态）', Boolean(uiAfter && uiAfter.data) && uiAfter.data.tab === 'news' && uiAfter.data.dockH === 400, JSON.stringify(uiAfter && uiAfter.data))
+  check('ui.set → ui.get 往返（含徽章折叠状态）', Boolean(uiAfter && uiAfter.data) && uiAfter.data.tab === 'news' && uiAfter.data.dockH === 400 && uiAfter.data.badgeCompact === true, JSON.stringify(uiAfter && uiAfter.data))
 
   const uiStatePath = path.join(STATE_DIR, '.xueqiu-ui-state.json')
   check('状态文件写在假 $DSH_HOME/dsh-xueqiu 下', fs.existsSync(uiStatePath), uiStatePath)
@@ -535,7 +536,7 @@ try {
     } catch (e) {
       saved = null
     }
-    check('落盘内容与 ui.set 一致', Boolean(saved) && saved.tab === 'news' && saved.dockH === 400, JSON.stringify(saved))
+    check('落盘内容与 ui.set 一致（含 badgeCompact）', Boolean(saved) && saved.tab === 'news' && saved.dockH === 400 && saved.badgeCompact === true, JSON.stringify(saved))
   }
   check('稳定目录探测文件 .write-probe 存在（未走工作区回退）', fs.existsSync(path.join(STATE_DIR, '.write-probe')))
   check('假工作区目录内没有 .xueqiu-* 文件（回退路径未启用）', listStateFiles(WORK_DIR).length === 0, JSON.stringify(listStateFiles(WORK_DIR)))

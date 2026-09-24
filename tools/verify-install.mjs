@@ -120,8 +120,14 @@ if (pkgJsonPath) {
     const marks = {
       'badgePosTouched 守卫': s.includes('this.badgePosTouched = true'),
       '位置/尺寸直接落盘': s.includes("'badgePos' in patch"),
+      'badgeCompact 水合防回滚': s.includes('!ui.badgeCompactTouched'),
+      'badgeCompact 直接落盘': s.includes("'badgeCompact' in patch") && s.includes('badgeCompact: ui.badgeCompact'),
+      '折叠按钮事件隔离': s.includes("target.closest('.xq-badge-control')") && s.includes('if (!rt.badgeDrag) return'),
       '应用级幂等水合': s.includes('function hydrateUi()'),
       'MiniBadge 触发水合': s.includes('hydrateUi()   //'),
+      'PNL 前台恢复立即轮询': s.includes('function onVisibility()') && s.includes("document.addEventListener('visibilitychange', onVisibility)"),
+      '行情响应序列防护': s.includes('marketSeq.current') && s.includes('refreshSeq.current') && s.includes('requestSeq.current'),
+      '详情驻留刷新': s.includes('详情驻留期间也要更新报价/分时') && s.includes('force: true'),
     }
     for (const [k, v] of Object.entries(marks)) {
       if (v) ok(`${f}: ${k} ✓`)

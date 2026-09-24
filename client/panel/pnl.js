@@ -149,7 +149,8 @@ export function PnlTab(p) {
       if (json && isFinite(Number(json.poll_sec))) setIntervalDraft(String(json.poll_sec))
       if (json && json.valid) setDraft('')
       const rt = getPnlRuntime()
-      if (rt) rt.refresh()
+      // 配置 Cookie/组合后即使处于收盘时段也要立即取一次，避免继续展示旧账户快照。
+      if (rt) rt.refresh(true)
     }).catch(function (e) {
       setStatus(function (prev) {
         return Object.assign({}, prev || {}, { valid: false, error: String((e && e.message) || e) })

@@ -47,6 +47,7 @@ export function createPnlRuntime(ctx) {
     refs: 0,                       // 订阅者引用计数
     active: false,
     delay: PNL_POLL_FALLBACK_MS,   // 上次排定的间隔（页面隐藏时按它重排，不会排出更密的节奏）
+    visibilityBound: false,
 
     subscribe: function (fn) {
       listeners.push(fn)
@@ -97,6 +98,7 @@ export function createPnlRuntime(ctx) {
       rt.refs++
       if (rt.refs !== 1) return   // 已有轮询器在跑，chip 与 tab 共享它
       rt.active = true
+      bindVisibility()
       cycle()
     },
 
@@ -105,6 +107,7 @@ export function createPnlRuntime(ctx) {
       if (rt.refs > 0) return
       rt.refs = 0
       rt.active = false
+      unbindVisibility()
       if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
     }
   }
@@ -113,6 +116,29 @@ export function createPnlRuntime(ctx) {
     if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
     rt.delay = ms
     rt.timer = disposer(ctx.timeout(cycle, ms))
+  }
+
+  // 页面从后台恢复时不要等完上一次「盘外长睡」：浏览器可能暂停/钳制定时器，
+  // 正好会错过 09:30 开盘或把收盘状态留在屏幕上。可见性恢复立即走一次宿主判定，
+  // 宿主会按北京时间决定是否真的访问上游。
+  function onVisibility() {
+    if (!rt.active || pageHidden()) return
+    if (rt.timer) { try { rt.timer() } catch (e) { /* ignore */ } rt.timer = null }
+    cycle()
+  }
+  function bindVisibility() {
+    if (rt.visibilityBound) return
+    try {
+      if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('visibilitychange', onVisibility)
+        rt.visibilityBound = true
+      }
+    } catch (e) { /* ignore */ }
+  }
+  function unbindVisibility() {
+    if (!rt.visibilityBound) return
+    try { document.removeEventListener('visibilitychange', onVisibility) } catch (e) { /* ignore */ }
+    rt.visibilityBound = false
   }
 
   // 一次「取数 → 按宿主给的节奏重排」。

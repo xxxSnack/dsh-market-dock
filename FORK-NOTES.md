@@ -291,6 +291,31 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
 **推广规则**：**任何含 hook 的组件都必须以 `el(Comp, props)` 挂载**，绝不要写成 `Comp(props)`。
 本文件 §3.3 的「新增一个 tab」配方已按此更新。
 
+### 5.4 悬浮徽章折叠按钮不能误开大面板
+
+**症状**：徽章根节点把 `pointerdown/up` 统一当成拖动/开合手势，内部新加按钮会冒泡到根节点；而根节点在 `pointerdown` 时还会取得 pointer capture。单加 `onClick` 的 `stopPropagation()` 不足以阻止 `pointerup` 翻转 `ui.open`。
+
+**改动**（`client/badge.js`）：
+- 标题栏最右侧、小三角左边增加 `−` 按钮，收起指数/自选列表为胶囊；胶囊上的 `+` 或徽章背景点击恢复完整徽章。
+- 控件独立拦截指针事件；根节点另以控件命中检测和「必须先有本徽章 pointerdown」双重防护，不会把控件的 `pointerup` 当成开面板；`pointercancel` 也不再误开合。
+- 新增持久化字段 `badgeCompact`，刷新后保留折叠选择。
+
+**防回归**：`test/smoke-client.mjs` §5d 强制模拟控件事件继续冒泡，断言只切换徽章形态、不改大面板开合；并验证背景区域仍可开合。`test/smoke-host.mjs` 覆盖 `badgeCompact` 的 `ui.get/ui.set` 与落盘往返。
+
+### 5.5 轮询在收盘/开盘边界卡住、慢响应覆盖新数据
+
+**症状**：页面曾经隐藏或浏览器暂停定时器时，收盘后的长睡眠可能跨过次日 09:30；恢复前台后仍沿用旧计时，盈亏状态和行情状态要手动刷新才恢复。另一个独立问题是慢请求晚返回时可能覆盖较新的轮询结果，造成“偶尔更新不及时”。
+
+**根因**：P&L 客户端盘外只重排 timer，没有监听 `visibilitychange`；面板、徽标、底部指数条原先也没有请求序列号。宿主收盘/开盘失败时还会把 attempt 错记成当天已成功，后续 `shouldFetch` 会冻结重试。
+
+**改动**：
+- `client/store/pnl.js`：首个订阅者绑定前台恢复监听；恢复时取消旧 timer，立即调用 `pnl.get`，由宿主按北京时间重新判定；最后一个订阅者退出时解绑。
+- `client/panel/index.js` / `client/badge.js` / `client/ticker.js`：给行情响应加序列守卫；旧响应、旧错误不能覆盖新结果。详情页驻留期间按行情节奏刷新报价/分时，回前台立即补拉。
+- `lib/pnl/index.js`：账本刷新加单飞锁；失败只记录错误并保留上一份有效数值，不推进 `sessionDate/closeDate`，从而允许边界失败后重试；调度器卸载后不再重新 arm。
+- `lib/api.js`：手动刷新/详情补拉传 `force:true` 时绕过雪球短 TTL；11:30、15:00 的客户端时段显示与宿主边界统一。
+
+**防回归**：`test/smoke-client.mjs` 检查前台恢复、序列守卫、详情驻留刷新和手动 force 接线；`test/pnl-session.mjs` 锁住北京时间边界；完整测试套件共 382 项断言通过。
+
 ## 6. 已知问题（原样保留，未修）
 
 - `uiState.pos` / `uiState.minimized` 是旧「浮动面板」设计的死字段（`ui.get`/`ui.set` 从不读写）；
@@ -373,7 +398,7 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
 - 第 5 个 tab「盈亏」（`PnlTab`）：大字金额+百分比、数据时间、组合账户下拉、Cookie 粘贴框、
   刷新间隔（5–3600 秒）、`立即刷新`（`force:true`）、`清除 Cookie`。
 - 取数只有一处：`store/pnl.js` 的**单一轮询器**（chip 与 tab 共享；引用计数启停；
-  `force` 透传；并发去重；页面隐藏时跳过请求但照旧等这么久；出错退避 60 秒）。
+  `force` 透传；并发去重；页面隐藏时跳过请求，恢复前台立即补拉；出错退避 60 秒）。
 - tab 追加在 `PANEL_TABS` **末尾**，前 4 个 tab 的字面量与顺序未动。
 - 宿主 `ui.get` 的 `validTabs` 已加 `'pnl'`（否则水合会把 `tab:'pnl'` 打回 `'market'`，chip 点击会失效）。
 

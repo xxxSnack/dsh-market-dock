@@ -24,7 +24,9 @@ export function sessionState(tz, segs, lunch) {
     if (p.weekday === 'Sat' || p.weekday === 'Sun') return '休市'
     var h = parseInt(p.hour, 10) % 24
     var cur = h * 60 + parseInt(p.minute, 10)
-    var inSess = segs.some(function (s) { return cur >= s[0] && cur < s[1] })
+    // 与宿主 P&L 时段口径一致：收盘分钟仍属于盘中（A 股 11:30 / 15:00），
+    // 午休从下一分钟开始，避免界面在边界瞬间先显示“休市/午休”。
+    var inSess = segs.some(function (s) { return cur >= s[0] && cur <= s[1] })
     if (inSess) return '盘中'
     if (lunch && cur >= lunch[0] && cur < lunch[1]) return '午休'
     return cur < segs[0][0] ? '盘前' : '休市'

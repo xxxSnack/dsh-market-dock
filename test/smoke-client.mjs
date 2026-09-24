@@ -561,7 +561,7 @@ function makeFetch(responder) {
 
 function safeResponder(url, body) {
   const action = body && body.action
-  if (action === 'ui.get') return { ok: true, data: { tab: 'market', open: true, badgePos: null, badgeW: null, dockH: null } }
+  if (action === 'ui.get') return { ok: true, data: { tab: 'market', open: true, badgePos: null, badgeW: null, badgeCompact: false, dockH: null } }
   if (action === 'watchlist.get') return { ok: true, data: { symbols: ['SH600519', 'SZ300750'] } }
   if (action === 'quote') return { ok: true, data: { status: 5, list: [{ symbol: 'SH000001', name: '上证指数', current: 3210.55, percent: 0.42 }] } }
   if (action === 'hot') return { ok: true, data: { market: 'cn', list: [] } }
@@ -874,6 +874,7 @@ check('shell.overlay 徽标渲染出 .xq-badge 结构', () => {
   ok(tree, 'MiniBadge 返回了 null')
   ok(hasClass(tree, 'xq-badge'), '缺 .xq-badge')
   ok(hasClass(tree, 'xq-badge-grip'), '缺 .xq-badge-grip（调宽手柄）')
+  ok(hasClass(tree, 'xq-badge-control'), '缺 .xq-badge-control（独立折叠按钮）')
   ok(hasClass(tree, 'xq-idxgrid'), '缺 .xq-idxgrid')
   ok(textHas(tree, '雪球'), '徽标缺「雪球」字样')
   ok(textHas(tree, '⤡'), '徽标缺手柄字符')
@@ -982,6 +983,29 @@ check("A_PNL_* 三个 action 常量值正确（'pnl.get'/'pnl.verify'/'pnl.confi
 check('PNL_POLL_FALLBACK_MS = 60000（轮询兜底退避）', () => {
   ok(clientSource.includes('PNL_POLL_FALLBACK_MS = 60000'), '产物里找不到 PNL_POLL_FALLBACK_MS = 60000')
   return '60000'
+})
+check('盈亏轮询在页面恢复前台时立即重取', () => {
+  ok(clientSource.includes('function onVisibility()'), '缺 PNL onVisibility')
+  ok(clientSource.includes("document.addEventListener('visibilitychange', onVisibility)"), '缺 PNL visibilitychange 监听')
+  ok(clientSource.includes('bindVisibility()') && clientSource.includes('unbindVisibility()'), '缺 PNL 监听生命周期管理')
+  return 'visibilitychange → 取消旧 timer → cycle()'
+})
+check('行情请求有序列防护，旧响应不会覆盖新数据', () => {
+  for (const token of ['marketSeq.current', 'refreshSeq.current', 'requestSeq.current']) {
+    ok(clientSource.includes(token), '产物里缺少 ' + token)
+  }
+  return '面板 / 徽标 / 底部指数条均有 request sequence'
+})
+check('详情页驻留期间持续刷新报价/分时', () => {
+  ok(clientSource.includes('详情驻留期间也要更新报价/分时'), '缺详情驻留刷新说明')
+  ok(clientSource.includes("call(A_QUOTE_DETAIL, { symbol: view, force: true })"), '详情报价未强制刷新')
+  ok(clientSource.includes("call(A_MINUTE, { symbol: view, force: true })"), '详情分时未强制刷新')
+  return '按行情节奏轮询，回前台立即补拉'
+})
+check('手动刷新绕过雪球报价短 TTL', () => {
+  ok(clientSource.includes('fetchIndices(force)'), '指数 fetch 未透传 force')
+  ok(clientSource.includes('refreshMarket(true)'), '手动刷新未传 force')
+  return 'force=true'
 })
 check("PANEL_TABS 含 ['pnl','盈亏']，且前 4 项顺序与字面量未变", () => {
   const line = clientSource.split('\n').find((l) => l.includes('const PANEL_TABS ='))
@@ -1272,6 +1296,93 @@ check('指数条只发一次指数请求（action=quote），没有额外网络�
   eq(calls.length, 1, '指数条期间的 fetch 次数（不应触发 pnl.get / 其它接口）')
   return '1 次 quote'
 })
+
+// ---------------------------------------------------------------- 5d. 悬浮徽章折叠与指针事件隔离
+// 折叠按钮位于可点击/可拖动徽章内部。测试真实回调，并故意把按钮事件继续送到根节点，
+// 验证即使冒泡隔离失效，根节点也不会把 pointerup 当成「打开大面板」。
+section('[5d] 悬浮徽章：收起胶囊 / 展开 / 背景开合隔离')
+const badgeControlProbe = (() => {
+  try {
+    const initial = render(main, SLOT_BADGE, undefined).tree
+    const rootOf = (tree) => treeHosts(tree).find((h) => classOf(h).split(/\s+/).includes('xq-badge'))
+    const controlOf = (tree) => treeHosts(tree).find((h) => classOf(h).split(/\s+/).includes('xq-badge-control'))
+    const caretOf = (tree) => {
+      const h = treeHosts(tree).find((x) => classOf(x).split(/\s+/).includes('xq-caret'))
+      return h ? treeText(h) : null
+    }
+    const target = { closest: (selector) => selector === '.xq-badge-control' ? target : null }
+    let captured = false
+    const currentTarget = {
+      style: {}, offsetWidth: 320, offsetHeight: 80,
+      setPointerCapture() { captured = true },
+      hasPointerCapture() { return captured },
+      releasePointerCapture() { captured = false },
+    }
+    const event = (pointerId) => ({
+      target, currentTarget, pointerType: 'mouse', button: 0,
+      clientX: 20, clientY: 20, pointerId,
+      stopPropagation() { this.stopped = true },
+    })
+    const fullCaret = caretOf(initial)
+    const foldRoot = rootOf(initial)
+    const foldButton = controlOf(initial)
+    if (!foldRoot || !foldButton) throw new Error('完整徽章缺 root 或折叠按钮')
+    const down = event(91)
+    foldButton.props.onPointerDown(down)
+    foldRoot.props.onPointerDown(down) // 故意强制模拟最坏情况的冒泡
+    const up = event(91)
+    foldButton.props.onPointerUp(up)
+    foldRoot.props.onPointerUp(up)     // 没有根节点 pointerdown 时必须忽略
+    foldButton.props.onClick({ stopPropagation() {} })
+    const compact = render(main, SLOT_BADGE, undefined).tree
+    const compactCaret = caretOf(compact)
+    const expandButton = controlOf(compact)
+    if (!expandButton) throw new Error('胶囊态缺展开按钮')
+    expandButton.props.onClick({ stopPropagation() {} })
+    const expanded = render(main, SLOT_BADGE, undefined).tree
+    // 非控件背景区域仍保留原有行为：开合大面板。
+    const expandedRoot = rootOf(expanded)
+    const backgroundTarget = { closest: () => null }
+    const bgDown = Object.assign(event(92), { target: backgroundTarget })
+    const bgUp = Object.assign(event(92), { target: backgroundTarget })
+    expandedRoot.props.onPointerDown(bgDown)
+    expandedRoot.props.onPointerUp(bgUp)
+    const closed = render(main, SLOT_BADGE, undefined).tree
+    return { initial, compact, compactCaret, fullCaret, expanded, closed, error: null }
+  } catch (err) {
+    return { error: err }
+  }
+})()
+function badgeControlReady() {
+  if (!badgeControlProbe || badgeControlProbe.error) {
+    throw new Error('前置失败：徽章交互探针抛错（' + ((badgeControlProbe && badgeControlProbe.error && badgeControlProbe.error.message) || '未产出结果') + '）')
+  }
+}
+check('标题栏按钮将徽章缩成小胶囊，隐藏指数/自选/调宽手柄', () => {
+  badgeControlReady()
+  ok(hasClass(badgeControlProbe.compact, 'xq-badge-compact'), '收起后缺 .xq-badge-compact')
+  ok(!hasClass(badgeControlProbe.compact, 'xq-idxgrid'), '收起后指数列表仍显示')
+  ok(!hasClass(badgeControlProbe.compact, 'xq-wgrid'), '收起后自选列表仍显示')
+  ok(!hasClass(badgeControlProbe.compact, 'xq-badge-grip'), '收起后调宽手柄仍显示')
+  return '胶囊仅保留标题栏'
+})
+check('折叠按钮的 pointerdown/up 不会误开合大面板（即使强制冒泡）', () => {
+  badgeControlReady()
+  eq(badgeControlProbe.compactCaret, badgeControlProbe.fullCaret, '按钮操作前后面板开合 caret')
+  ok(hasClass(badgeControlProbe.expanded, 'xq-badge'), '恢复后徽章缺失')
+  ok(!hasClass(badgeControlProbe.expanded, 'xq-badge-compact'), '按钮恢复后仍是胶囊')
+  eq(caretOfTree(badgeControlProbe.expanded), badgeControlProbe.fullCaret, '展开徽章后面板开合 caret')
+  return '按钮只切换徽章形态，不改 ui.open'
+})
+check('徽章背景区域仍可开合大面板', () => {
+  badgeControlReady()
+  eq(caretOfTree(badgeControlProbe.closed), badgeControlProbe.fullCaret === '▾' ? '▴' : '▾', '背景点击后的 caret')
+  return badgeControlProbe.fullCaret + ' → ' + caretOfTree(badgeControlProbe.closed)
+})
+function caretOfTree(tree) {
+  const h = treeHosts(tree).find((x) => classOf(x).split(/\s+/).includes('xq-caret'))
+  return h ? treeText(h) : null
+}
 
 // ---------------------------------------------------------------- 6. slots 缺失时的降级
 readyGuard = null

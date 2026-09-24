@@ -832,7 +832,7 @@ function installWatchlist(core) {
   core.actWatchlistRemove = actWatchlistRemove
 }
 
-// UI 状态持久化（tab/open/dockH/badgeW/badgePos）与它的读写动作。字段语义与钳制逐字保留。
+// UI 状态持久化（tab/open/dockH/badgeW/badgePos/badgeCompact）与它的读写动作。字段语义与钳制逐字保留。
 
 function installUiState(core) {
   const ctx = core.ctx
@@ -840,7 +840,7 @@ function installUiState(core) {
   // ---- UI 状态持久化 ----
   async function loadUiState() {
     if (core.uiState) return core.uiState
-    core.uiState = { pos: null, tab: 'market', minimized: false }
+    core.uiState = { pos: null, tab: 'market', minimized: false, badgeCompact: false }
     const fs = ctx.get('fs')
     const sp = ctx.get('sandboxPolicy')
     const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
@@ -875,6 +875,7 @@ function installUiState(core) {
       open: s.open !== false,
       dockH: (s.dockH !== undefined && isFinite(hNum) && hNum >= 160 && hNum <= 1200) ? hNum : null,
       badgeW: (s.badgeW !== undefined && isFinite(Number(s.badgeW)) && Number(s.badgeW) >= 120 && Number(s.badgeW) <= 480) ? Number(s.badgeW) : null,
+      badgeCompact: s.badgeCompact === true,
       badgePos: (s.badgePos && isFinite(Number(s.badgePos.x)) && isFinite(Number(s.badgePos.y)))
         ? { x: Number(s.badgePos.x), y: Number(s.badgePos.y) } : null
     }
@@ -884,6 +885,7 @@ function installUiState(core) {
     const s = await loadUiState()
     if (args.tab !== undefined) s.tab = String(args.tab)
     if (args.open !== undefined) s.open = !!args.open
+    if (args.badgeCompact !== undefined) s.badgeCompact = !!args.badgeCompact
     if (args.badgePos && typeof args.badgePos === 'object' && isFinite(Number(args.badgePos.x)) && isFinite(Number(args.badgePos.y))) {
       s.badgePos = { x: Number(args.badgePos.x), y: Number(args.badgePos.y) }
     }
@@ -1457,9 +1459,10 @@ function pnlWarn(ctx, error) {
 function installPnl(core) {
   const ctx = core.ctx
   // 内存快照缓存（调度器判定用）+ 最近一次生效的心跳
-  core.pnl = { snapshot: null, pollMs: DEFAULT_POLL_MS }
+  core.pnl = { snapshot: null, pollMs: DEFAULT_POLL_MS, refreshInflight: null }
   let boundaryStop = null
   let settleStop = null
+  let schedulerAlive = true
   // 收盘补拉**每天只做一次**：15:00 之后盘中心跳还会唤醒好几次，
   // 若不记住「本交易日已补过」，5 分钟窗口内会重复打 5~6 次上游。
   let settleDate = null
@@ -1473,41 +1476,55 @@ function installPnl(core) {
    * 拉一次账本并写入快照。动作与边界定时器共用。
    * @param {string} reason - 诊断用：route / force / boundary / startup / close-settle
    */
+  // 单飞锁：路由请求、边界唤醒、收盘补拉可能同时到达；同一时刻只允许一条
+  // 账本请求链写快照，避免慢请求晚返回后把较新的盈亏覆盖掉。
   async function refresh(reason) {
-    const state = await loadPnlConfig(core)
-    const cookie = typeof state.cookie === 'string' ? state.cookie : ''
-    if (!cookie) return null
-    core.pnl.pollMs = pnlPollMs(state)
-    // fundKey：存盘的 → 现探第一个组合（旧插件同语义，探到就落盘）
-    let fundKey = typeof state.fundKey === 'string' ? state.fundKey : ''
-    if (!fundKey) {
-      const list = await listPortfolios(core, cookie)
-      const first = list.length > 0 ? list[0].fund_key : ''
-      if (first) {
-        fundKey = first
-        try { await savePnlConfig(core, { fundKey: first }) } catch (e) { /* 存不下不影响本次取值 */ }
+    if (core.pnl.refreshInflight) return core.pnl.refreshInflight
+    const task = (async function () {
+      const state = await loadPnlConfig(core)
+      const cookie = typeof state.cookie === 'string' ? state.cookie : ''
+      if (!cookie) return null
+      core.pnl.pollMs = pnlPollMs(state)
+      // fundKey：存盘的 → 现探第一个组合（旧插件同语义，探到就落盘）
+      let fundKey = typeof state.fundKey === 'string' ? state.fundKey : ''
+      if (!fundKey) {
+        const list = await listPortfolios(core, cookie)
+        const first = list.length > 0 ? list[0].fund_key : ''
+        if (first) {
+          fundKey = first
+          try { await savePnlConfig(core, { fundKey: first }) } catch (e) { /* 存不下不影响本次取值 */ }
+        }
       }
-    }
-    const pnl = await collectPnl(core, cookie, fundKey)
-    const now = new Date()
-    const info = sessionInfo(now)
-    const prev = (await loadPnlSnapshot(core)) || {}
-    // 标记位：今天是否已拉过「开盘后的值」/「收盘后的值」。
-    // 盘前那次拉到的其实是昨天收盘，所以不能打今天的标。
-    const snapshot = {
-      pnl_yk: pnl.pnl_yk,
-      pnl_pct: pnl.pnl_pct,
-      error: pnl.error,
-      token_expired: pnl.token_expired,
-      yk_field: pnl.yk_field,
-      fetched_at: now.toISOString(),
-      fetched_reason: reason,
-      sessionDate: info.minutes >= OPEN_MIN ? info.date : (prev.sessionDate ?? null),
-      closeDate: info.minutes >= CLOSE_MIN ? info.date : (prev.closeDate ?? null),
-    }
-    await savePnlSnapshot(core, snapshot)
-    core.pnl.snapshot = snapshot
-    return snapshot
+      const pnl = await collectPnl(core, cookie, fundKey)
+      const now = new Date()
+      const info = sessionInfo(now)
+      const prev = (await loadPnlSnapshot(core)) || {}
+      // 失败请求只是一次 attempt，不能把当天标成「已取到开盘/收盘值」；否则
+      // shouldFetch 会永久冻结到下一交易日。失败时还保留上一份有效数值，避免一次
+      // 网络抖动把界面上的盈亏闪成 0。
+      const good = !pnl.error && !pnl.token_expired
+      const snapshot = {
+        pnl_yk: good ? pnl.pnl_yk : (prev.pnl_yk ?? null),
+        pnl_pct: good ? pnl.pnl_pct : (prev.pnl_pct ?? null),
+        error: pnl.error,
+        token_expired: pnl.token_expired,
+        yk_field: good ? pnl.yk_field : (prev.yk_field ?? ''),
+        fetched_at: good ? now.toISOString() : (prev.fetched_at ?? now.toISOString()),
+        fetched_reason: reason,
+        sessionDate: good && info.minutes >= OPEN_MIN ? info.date : (prev.sessionDate ?? null),
+        closeDate: good && info.minutes >= CLOSE_MIN ? info.date : (prev.closeDate ?? null),
+      }
+      await savePnlSnapshot(core, snapshot)
+      core.pnl.snapshot = snapshot
+      return snapshot
+    })()
+    core.pnl.refreshInflight = task
+    task.then(function () {
+      if (core.pnl.refreshInflight === task) core.pnl.refreshInflight = null
+    }, function () {
+      if (core.pnl.refreshInflight === task) core.pnl.refreshInflight = null
+    })
+    return task
   }
 
   /** 现在该不该打上游（无快照 → 该；盘中 → 该；否则看今天的标记位）。 */
@@ -1523,6 +1540,7 @@ function installPnl(core) {
    * @param {string} reason - 唤醒后 refresh 用的诊断原因
    */
   function arm(ms, reason) {
+    if (!schedulerAlive) return
     stopTimer(boundaryStop)
     boundaryStop = stopOf(ctx.timeout(function () {
       wake(reason).catch(function () {})
@@ -1531,6 +1549,7 @@ function installPnl(core) {
 
   /** 按既定节奏排下一次唤醒：盘中按心跳、盘外睡到下一个边界。 */
   function schedule() {
+    if (!schedulerAlive) return
     const now = new Date()
     const info = sessionInfo(now)
     arm(nextPollMs(info, now, core.pnl.pollMs), 'boundary')
@@ -1542,6 +1561,7 @@ function installPnl(core) {
       // 不该拉就什么都不做（例如节假日/午间的边界），避免无谓请求
       if (await shouldFetchNow()) await refresh(reason)
     } catch (e) { pnlWarn(ctx, e) }
+    if (!schedulerAlive) return
     // 15:00 那次拉到的收盘价可能还没落定：45 秒后再补一次，**每个交易日只补一次**。
     // **绕过 shouldFetch**：15:00 那次已经打过 closeDate 标记，按规则就再也不会拉了。
     const after = sessionInfo(new Date())
@@ -1561,6 +1581,7 @@ function installPnl(core) {
     // 覆盖"09:30 时进程还没在跑"这种情况；错开插件加载高峰，3 秒后再打。
     arm(STARTUP_DELAY_MS, 'startup')
     return function () {
+      schedulerAlive = false
       stopTimer(boundaryStop)
       boundaryStop = null
       stopTimer(settleStop)
@@ -1651,6 +1672,7 @@ function installPnl(core) {
       await savePnlConfig(core, { cookie: '', fundKey: '' })
       const cleared = await loadPnlConfig(core)
       const clearedMs = pnlPollMs(cleared)
+      schedule()
       return {
         ok: true, configured: false, valid: false, error: '', portfolios: [],
         fundKey: '', poll_ms: clearedMs, poll_sec: clearedMs / 1000,
@@ -1683,6 +1705,7 @@ function installPnl(core) {
     const saved = await loadPnlConfig(core)
     const effective = pnlPollMs(saved)
     core.pnl.pollMs = effective
+    schedule()
     return {
       ok: true,
       configured: typeof saved.cookie === 'string' && saved.cookie.length > 0,
@@ -1714,7 +1737,7 @@ function installApi(core) {
     const symbols = Array.isArray(args.symbols) ? args.symbols : [String(args.symbols || '')]
     const list = symbols.filter(function (s) { return /^[A-Za-z0-9_.]+$/.test(s) })
     if (!list.length) return { list: [], status: null }
-    const data = await core.getJSON('/v5/stock/batch/quote.json', { symbol: list.join(',') }, { ttl: 10000 })
+    const data = await core.getJSON('/v5/stock/batch/quote.json', { symbol: list.join(',') }, { ttl: args.force === true ? 0 : 10000 })
     const items = (data && data.data && data.data.items) || []
     const first = items[0]
     const status = first && first.market ? first.market.status_id : null
@@ -1726,7 +1749,7 @@ function installApi(core) {
 
   async function actQuoteDetail(args) {
     const symbol = String(args.symbol || '')
-    const data = await core.getJSON('/v5/stock/quote.json', { symbol: symbol, extend: 'detail' }, { ttl: 15000 })
+    const data = await core.getJSON('/v5/stock/quote.json', { symbol: symbol, extend: 'detail' }, { ttl: args.force === true ? 0 : 15000 })
     return { quote: pickQuote(data.data && data.data.quote), market: data.data && data.data.market }
   }
 
@@ -1750,7 +1773,7 @@ function installApi(core) {
 
   async function actMinute(args) {
     const symbol = String(args.symbol || '')
-    const data = await core.getJSON('/v5/stock/chart/minute.json', { symbol: symbol, period: '1d' }, { ttl: 10000 })
+    const data = await core.getJSON('/v5/stock/chart/minute.json', { symbol: symbol, period: '1d' }, { ttl: args.force === true ? 0 : 10000 })
     const d = data && data.data ? data.data : null
     if (!d || !d.items) return { last_close: null, items: [] }
     return {

@@ -34,13 +34,15 @@ export function XueqiuPanel() {
   const [indices, setIndices] = React.useState([])
   const [hot, setHot] = React.useState([])
   const [hotMarket, setHotMarket] = React.useState('cn')
-  // 竞态防护：热榜/搜索的响应序号（旧响应到达时序号已过期则丢弃，防慢请求覆盖新结果）
+  // 竞态防护：行情/热榜/搜索的响应序号（旧响应到达时序号已过期则丢弃，防慢请求覆盖新结果）
+  const marketSeq = React.useRef(0)
   const hotSeq = React.useRef(0)
   const searchSeq = React.useRef(0)
   // 轮询闭包读当前市场（interval 闭包不随状态更新，直接捕获 state 会拿到 stale 值）
   const hotMarketRef = React.useRef(hotMarket)
   hotMarketRef.current = hotMarket
   const [news, setNews] = React.useState([])
+  const newsSeq = React.useRef(0)
   const [newsMore, setNewsMore] = React.useState(false)   // 翻页加载中
   const [newsNoMore, setNewsNoMore] = React.useState(false) // 已到最旧
   const [searchQ, setSearchQ] = React.useState('')
@@ -68,19 +70,25 @@ export function XueqiuPanel() {
   const tab = ui.tab
   function setTab(t) { ui.set({ tab: t }) }
 
-  function refreshMarket() {
+  function refreshMarket(force) {
+    const my = ++marketSeq.current
     return Promise.all([
       fetchWatchlist(),
-      fetchIndices()
+      fetchIndices(force)
     ]).then(function (res) {
+      if (marketSeq.current !== my) return
       const wl = (res[0] && res[0].symbols) || []
       const status = res[1] ? res[1].status : null
-      setMarketOpen(status === 5 || status === 6)
+      // 空响应/临时异常没有足够信息判断盘中，不要把轮询误降到休市节奏；
+      // 下一轮成功拿到状态后再切换。
+      if (status === 5 || status === 6) setMarketOpen(true)
+      else if (status !== null && status !== undefined) setMarketOpen(false)
       setWatchlist(wl)
       setIndices((res[1] && res[1].list) || [])
       setErr('')
       if (!wl.length) return
-      return fetchQuote(wl).then(function (data) {
+      return fetchQuote(wl, force).then(function (data) {
+        if (marketSeq.current !== my) return
         const list = (data && data.list) || []
         // 批量行情会整只丢弃无效/退市代码：补占位行（现价/涨跌全 '--'，仍可删除/查详情），
         // 否则"加进自选却凭空消失"没有任何反馈
@@ -98,25 +106,27 @@ export function XueqiuPanel() {
         setQuotes(list.concat(missing))
       })
     }).catch(function (e) {
-      setErr(String((e && e.message) || e))
+      if (marketSeq.current === my) setErr(String((e && e.message) || e))
     })
   }
 
   function refreshContent() {
     const my = ++hotSeq.current
+    const newsMy = ++newsSeq.current
     const market = hotMarketRef.current   // 读当前市场（轮询闭包防 stale）
     Promise.all([
       call(A_HOT, { market: market, size: HOT_LIST_SIZE }),
       call(A_NEWS, { count: NEWS_PAGE_SIZE })
     ]).then(function (res) {
       if (hotSeq.current !== my) return   // 期间用户切了市场/触发过手动刷新：丢弃旧响应
+      if (newsSeq.current !== newsMy) return
       setHot((res[0] && res[0].list) || [])
       setNews((res[1] && res[1].items) || [])
       setNewsMore(false)
       setNewsNoMore(false)
       setErr('')
     }).catch(function (e) {
-      setErr(String((e && e.message) || e))
+      if (hotSeq.current === my && newsSeq.current === newsMy) setErr(String((e && e.message) || e))
     })
   }
 
@@ -124,8 +134,10 @@ export function XueqiuPanel() {
   function loadMoreNews() {
     if (newsMore || newsNoMore || !news.length) return
     const maxId = news[news.length - 1].id
+    const my = ++newsSeq.current
     setNewsMore(true)
     call(A_NEWS, { count: NEWS_PAGE_SIZE, max_id: maxId }).then(function (res) {
+      if (newsSeq.current !== my) return
       const items = (res && res.items) || []
       const seen = {}
       news.forEach(function (it) { seen[it.id] = true })
@@ -134,7 +146,7 @@ export function XueqiuPanel() {
       else setNews(news.concat(fresh))
       setNewsMore(false)
     }).catch(function () {
-      setNewsMore(false)
+      if (newsSeq.current === my) setNewsMore(false)
     })
   }
 
@@ -209,6 +221,38 @@ export function XueqiuPanel() {
     })
     return function () { alive = false }
   }, [view])
+
+  // 详情驻留期间也要更新报价/分时；原来只在切换标的时请求一次，打开十几分钟后
+  // 现价会永久停在旧值。回到前台立即补一次，force 跳过短 TTL。
+  React.useEffect(function () {
+    if (!view) return function () {}
+    let alive = true
+    function refreshLive() {
+      if (pageHidden()) return
+      Promise.all([
+        call(A_QUOTE_DETAIL, { symbol: view, force: true }).catch(function () { return null }),
+        call(A_MINUTE, { symbol: view, force: true }).catch(function () { return null })
+      ]).then(function (res) {
+        if (!alive) return
+        const q = res[0] && res[0].quote
+        const m = res[1]
+        if (!q && !m) return
+        setDetail(function (d) {
+          if (!d) return d
+          return Object.assign({}, d, q ? { quote: q } : {}, m ? { minute: m } : {})
+        })
+      })
+    }
+    const liveMs = marketOpen ? POLL_MARKET_OPEN_MS : POLL_MARKET_CLOSED_MS
+    const stop = rt.ctx.interval(refreshLive, liveMs)
+    function onVis() { if (!pageHidden()) refreshLive() }
+    try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+    return function () {
+      alive = false
+      if (stop) stop()
+      try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+    }
+  }, [view, marketOpen])
 
   // K线按周期独立拉取：切周期只清图表数据、只发 1 个请求，报价与周期丸全程保持可点
   React.useEffect(function () {
@@ -340,7 +384,7 @@ export function XueqiuPanel() {
         // 盈亏一并刷新：refresh() 内部已做并发去重，与后台轮询不会重复请求；
         // 它自己吞掉失败（返回 null 而非拒绝），所以这里的 loading 语义与原来完全一致。
         const pnlRt = getPnlRuntime()
-        Promise.all([refreshMarket(), refreshContent(), pnlRt ? pnlRt.refresh() : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
+        Promise.all([refreshMarket(true), refreshContent(), pnlRt ? pnlRt.refresh(true) : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
       }
     }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
   ]))

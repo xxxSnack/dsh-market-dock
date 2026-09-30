@@ -80,11 +80,17 @@ function clearAll() { for (const t of timers) clearTimeout(t); timers.clear() }
 
 const shell = {
   resolve(spec) { return { command: String((spec && spec.command) || ''), timeoutMs: spec && spec.timeoutMs } },
-  async run(spec) {
+  run() {
+    // DSH 0.2 起 shell 服务没有 run()（改名 execute）：插件若退回旧 API，这里要炸得很响。
+    throw new Error('[pnl-rpc] shell.run 已不存在（DSH 0.2 起改名 execute）：插件仍在调用旧 API')
+  },
+  execute(spec) {
     const command = String((spec && spec.command) || '')
     // 断言式栅栏：凭据请求绝不跟随重定向
     if (/\s-L\s/.test(command)) throw new Error('[pnl-rpc] 不该出现 -L（旧实现是 redirect:manual）')
-    return { exitCode: 0, stdout: { text: cannedResponse(command) }, stderr: { text: '' } }
+    const value = { exitCode: 0, stdout: { text: cannedResponse(command) }, stderr: { text: '' } }
+    // 0.2：execute 返回句柄，前台执行 = await handle.result()
+    return { result: async function () { return value } }
   }
 }
 function inJail(p) { return p === JAIL || p.startsWith(JAIL + path.sep) }

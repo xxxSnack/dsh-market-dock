@@ -54,11 +54,17 @@ function scriptedShell(responses) {
       return { command: command }
     },
     run() {
+      // DSH 0.2 起 shell 服务没有 run()（改名 execute）：插件若退回旧 API，这里要炸得很响。
+      throw new Error('[pnl-cookie] shell.run 已不存在（DSH 0.2 起改名 execute）：插件仍在调用旧 API')
+    },
+    execute() {
       if (queue.length === 0) throw new Error('[pnl-cookie] 脚本用尽：出现了预期外的请求')
       const next = queue.shift()
       if (next instanceof Error) throw next
       const entry = next || {}
-      return { exitCode: entry.exitCode === undefined ? 0 : entry.exitCode, stdout: { text: String(entry.text === undefined ? '' : entry.text) } }
+      const value = { exitCode: entry.exitCode === undefined ? 0 : entry.exitCode, stdout: { text: String(entry.text === undefined ? '' : entry.text) } }
+      // 0.2：execute 返回句柄，前台执行 = await handle.result()
+      return { result: async function () { return value } }
     },
   }
 }

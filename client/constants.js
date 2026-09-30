@@ -60,6 +60,8 @@ export const POLL_TICKER_MS = 30000          // 底部指数条
 export const POLL_DOCK_SESSION_MS = 60000    // 面板头部交易时段文案重算
 // 今日盈亏：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
 export const PNL_POLL_FALLBACK_MS = 60000
+export const ALERT_POLL_MS = 30000
+export const ALERT_NOTICE_LIMIT = 20       // 首次加载仅展示有限待确认事件，避免旧事件撑爆面板
 
 // ---- 槽位 id 与 order（7 个注册逐一对应，注册顺序见 slots.js）----
 export const SLOT_TOOLVIEW = 'tool.call.toolview'

@@ -4,7 +4,7 @@
 不会覆盖这里），并承载本地改动。
 
 - 上游：`dsh-xueqiu@1.22.15`（https://github.com/wanderer-yk/dsh-xueqiu ，MIT）
-- 本 fork 包名：`dsh-xueqiu-debug`，版本 `1.22.15-fork.1`
+- 本 fork 包名：`dsh-xueqiu-debug`，版本 `1.22.15-fork.2`
 - cordis 插件 id：`xueqiu` → `xueqiu-debug`
 - 槽位实例 id：`xueqiu-panel` / `xueqiu-badge` / `xueqiu-ticker`
   → `xueqiu-debug-panel` / `xueqiu-debug-badge` / `xueqiu-debug-ticker`
@@ -53,13 +53,13 @@
 
 ### 1.3 目录地图
 
-**host（`lib/`，29 个模块，顺序见 `lib/manifest.txt`）**
+**host（`lib/`，31 个模块，顺序见 `lib/manifest.txt`）**
 
 | 模块 | 职责 |
 |---|---|
 | `constants.js` | UA/BASE/SITE/curl 名/默认自选表/调度与钳制常量 |
 | `config.js` | 插件配置解析（`stateDir` / `watchlist` / `pnlStateDir`），未配置时全部走默认值 |
-| `cache.js` `gate.js` `http.js` | 请求管道：TTL 缓存+去重 → 并发/限速/看门狗 → curl/ensureCookie/getJSON（含重试链） |
+| `cache.js` `gate.js` `shell.js` `http.js` | 请求管道：TTL 缓存+去重 → 并发/限速/看门狗 → **shell 前台执行兼容层** → curl/ensureCookie/getJSON（含重试链） |
 | `normalize.js` | 纯函数：nz/sanitize/pickQuote/mapKline/mapPosts/mapKOL/mapFinance |
 | `state.js` `watchlist.js` `login.js` `ui-state.js` | 状态落点、自选（含云端镜像）、可选登录、UI 状态持久化 |
 | `pnl/*.js` | 今日盈亏：`constants`/`session`（交易时段纯函数）/`http`（Cookie+带状态码 curl）/`store`（**共用** `dsh-ths-pnl` 的 config.json+snapshot.json）/`collect`（组合·采集·校验）/`index`（3 个 act* + 边界调度） |
@@ -316,6 +316,36 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
 
 **防回归**：`test/smoke-client.mjs` 检查前台恢复、序列守卫、详情驻留刷新和手动 force 接线；`test/pnl-session.mjs` 锁住北京时间边界；完整测试套件共 382 项断言通过。
 
+### 5.6 DSH 0.2 改名 `shell.run` → `shell.execute`，插件整条数据链路失效
+
+**症状**（升级到 `0.2.0-rc.2` 后）：面板/徽标/底部指数条「显示和之前差别很大，也不能正常使用」。
+实际是**没有任何数据**：徽标在没有报价时整块自选网格不渲染，只剩标题栏一条；底部条只剩余额 chip；
+工具卡片退化成通用行；盈亏 chip 显示「数据异常」。6 个 Agent 工具也全部报
+`Error: [network] shell.run is not a function`。
+
+**根因**：DSH 0.2 把 `ctx.shell` 的前台执行方法从 `run(spec)` 改名为 `execute(spec)`，
+**并且改了返回语义**——`execute` 返回「执行句柄」，前台执行要 `await handle.result()`
+（句柄另有 `status`/`done`/`readOutput`/`kill` 供后台使用）。旧写法在 0.2 下直接抛
+`shell.run is not a function`；若只把名字换成 `execute` 而忘了 `.result()`，会拿到句柄对象，
+`exitCode` 为 undefined，表现为「请求成功但输出为空」——比抛错更难查。
+
+**改动**
+| 位置 | 改动 |
+|---|---|
+| `lib/shell.js`（新增） | `runShell(shell, spec)`：有 `execute` 走新 API（`await handle.result()`），否则回落 `run` |
+| `lib/manifest.txt` | 注册 `shell.js`（排在 `http.js` 之前） |
+| `lib/http.js` | `ensureCookie` 与 `curl` 两处改调 `runShell` |
+| `lib/pnl/http.js` | `pnlRequest` 改调 `runShell` |
+
+**防回归**（两层）
+1. 5 个测试文件的假 shell 全部改成 **0.2 形状**：`execute(spec)` 返回 `{ result() }`，
+   同时保留一个**会抛错的 `run()`**——插件若退回旧 API，测试立刻红。
+   `test/pnl-rpc.mjs` 的「迟到响应」闸门也搬到了 `result()` 上，语义不变。
+2. `lib/shell.js` 里对「`execute` 直接 resolve 成结果对象」的形态做了防御，
+   避免未来执行器再改返回形态时静默拿到空输出。
+
+**完整诊断记录**：`docs/dsh-0.2-shell-api-port.md`（含证据链、隔离实例验证方法、复核步骤）。
+
 ## 6. 已知问题（原样保留，未修）
 
 - `uiState.pos` / `uiState.minimized` 是旧「浮动面板」设计的死字段（`ui.get`/`ui.set` 从不读写）；
@@ -393,6 +423,15 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
   作为 `.xq-ticker` 行的最后一个子元素 —— 这是**面板收起时唯一能看到盈亏的落点**（`DockGate` 收起时
   直接 `return null`，头部 chip 跟着消失）。样式在 `styles.css` 里被 `.xq-ticker .xq-pnl-chip{background:none;padding:0;…}`
   压平成与指数同一行同一字号。
+  该槽位是宿主输入框下方的 `display:flex` **不换行**行，所以指数条默认会和宿主的统计文字
+  （`N 轮 M 步 · tok/s`、`… 缓存命中 96%`、成本插件的 `本会话 ¥0…`）挤在同一行。
+  让它**独占一行**的做法在 `client/ticker.js` 的 `ownLine()` 里（挂载时执行、卸载时还原）：
+  ① 沿父链找到真正的 flex 行 —— 宿主给槽位条目套了一层**无 class、`display:contents`** 的透明层，
+  那一层不生成盒子（`getBoundingClientRect` 全 0，给它设 `flex-wrap` 无效），必须跳过它再往上一层；
+  ② 给该行加 `flex-wrap:wrap`，给自己加 `flex:1 0 100%` + `order:9`（宿主原有统计行不动，指数条落到下面一行）；
+  ③ **当场自检**：自己必须落到另一行（垂直范围与所有兄弟不重叠）且没有任何兄弟被挤成 0 宽，
+  否则（含「行容器是居中收缩、百分比解析不出确定值」的情形）再试一次带 `align-self:stretch` 的变体，
+  仍不行就原样撤回 —— 最坏情况退回行内布局，绝不会像纯 CSS 那样把宿主统计挤没。
   两条注意：① `Ticker` 的 `usePnlState()` 必须写在**任何 early return 之前**（hook 顺序）；② 早退条件已放宽为
   `if (!indices.length && !showPnl) return null`，指数接口挂掉时不再把整行（含盈亏）一起抹掉。
 - 第 5 个 tab「盈亏」（`PnlTab`）：大字金额+百分比、数据时间、组合账户下拉、Cookie 粘贴框、

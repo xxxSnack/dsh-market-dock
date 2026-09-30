@@ -108,7 +108,14 @@
 .xq-sub{font-size:10.5px;color:var(--dsw-alias-label-secondary);}
 .xq-muted{font-size:12px;color:var(--dsw-alias-label-secondary);}
 .xq-err{font-size:12px;color:var(--dsw-alias-state-warn-primary);background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l1);border-radius:6px;padding:5px 8px;margin-bottom:6px;}
-.xq-actions{display:flex;gap:4px;justify-content:flex-end;}
+.xq-alert-notice{font-size:12px;color:var(--dsw-alias-label-primary);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary) 14%,var(--dsw-alias-bg-layer-1));border:1px solid var(--dsw-alias-state-warn-primary);border-radius:7px;padding:6px 8px;margin-bottom:7px;}
+.xq-alert-event{display:flex;align-items:center;gap:8px;margin-top:4px;}
+.xq-alert-event>span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.xq-actions{display:flex;gap:4px;justify-content:flex-end;align-items:center;flex-wrap:wrap;}
+.xq-alert-editor{display:inline-flex;align-items:center;gap:3px;white-space:nowrap;}
+.xq-alert-dir,.xq-alert-target{font-size:11px;height:21px;border:1px solid var(--dsw-alias-border-l2);border-radius:4px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
+.xq-alert-dir{width:34px;padding:1px;}
+.xq-alert-target{width:60px;padding:1px 4px;}
 .xq-input{font-size:12.5px;padding:4px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);}
 .xq-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary);}
 .xq-search-row{display:flex;gap:6px;margin-bottom:8px;}
@@ -162,7 +169,7 @@
 .xq-hot-row:last-child{border-bottom:none;}
 .xq-hot-row:hover{background:var(--dsw-alias-bg-layer-2);}
 .xq-rank{font-size:12px;font-weight:700;width:20px;text-align:center;color:var(--dsw-alias-label-secondary);}
-.xq-ticker{display:flex;gap:14px;font-size:11px;color:var(--dsw-alias-label-secondary);padding:2px 2px;flex-wrap:wrap;cursor:pointer;}
+.xq-ticker{display:flex;gap:14px;font-size:11px;color:var(--dsw-alias-label-secondary);padding:2px 2px;flex-wrap:wrap;justify-content:center;cursor:pointer;}
 .xq-ticker:hover{color:var(--dsw-alias-label-primary);}
 .xq-tick{display:inline-flex;gap:5px;align-items:baseline;}
 .xq-tick-name{color:var(--dsw-alias-label-secondary);}

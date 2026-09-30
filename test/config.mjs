@@ -47,7 +47,7 @@ async function boot (config) {
     interval: (fn, ms) => () => {},
     debounce: (fn) => Object.assign((...a) => fn(...a), { cancel () {} }),
     effect: (fn) => { try { return fn() } catch (e) { return undefined } },
-    get: (name) => (name === 'fs' ? fakeFs : name === 'sandboxPolicy' ? { workspaceRoot: WORK } : name === 'shell' ? { run: async () => { throw new Error('no shell') }, resolve: async (p) => p } : undefined),
+    get: (name) => (name === 'fs' ? fakeFs : name === 'sandboxPolicy' ? { workspaceRoot: WORK } : name === 'shell' ? { execute: () => ({ result: async () => { throw new Error('no shell') } }), run: () => { throw new Error('no shell') }, resolve: async (p) => p } : undefined),
     inject: (deps, cb) => {
       if (deps.includes('webServer')) cb({ effect: (f) => f(), webServer: { register: (cfg) => { routes.push(cfg); return () => {} } } })
       if (deps.includes('tools')) cb({ effect: (f) => f(), tools: { register: (spec) => { tools.push(spec); return () => {} } } })

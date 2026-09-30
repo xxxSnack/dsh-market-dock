@@ -11,6 +11,7 @@ import { call, A_HOT, A_NEWS, A_KLINE, A_QUOTE_DETAIL, A_MINUTE, A_FINANCE, A_KO
 import { getUiRuntime } from '../store/ui.js'
 import { getPnlRuntime } from '../store/pnl.js'
 import { fetchQuote, fetchIndices, fetchWatchlist } from '../store/market.js'
+import { fetchAlerts, saveAlert, removeAlert, ackAlerts } from '../store/alerts.js'
 import { LoginBox } from './login.js'
 import { MarketTab } from './market.js'
 import { DetailView } from './detail.js'
@@ -18,7 +19,7 @@ import { HotTab } from './hot.js'
 import { SearchTab } from './search.js'
 import { NewsTab } from './news.js'
 import { PnlTab } from './pnl.js'
-import { PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, SEARCH_STOCK_SIZE, SEARCH_POST_SIZE, POLL_MARKET_OPEN_MS, POLL_MARKET_CLOSED_MS, POLL_CONTENT_OPEN_MS, POLL_CONTENT_CLOSED_MS } from '../constants.js'
+import { PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, SEARCH_STOCK_SIZE, SEARCH_POST_SIZE, POLL_MARKET_OPEN_MS, POLL_MARKET_CLOSED_MS, POLL_CONTENT_OPEN_MS, POLL_CONTENT_CLOSED_MS, ALERT_POLL_MS, ALERT_NOTICE_LIMIT } from '../constants.js'
 
 const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab, pnl: PnlTab }
 
@@ -67,8 +68,123 @@ export function XueqiuPanel() {
   const [cookieInput, setCookieInput] = React.useState('')
   const [loginBusy, setLoginBusy] = React.useState(false)
   const [loginMsg, setLoginMsg] = React.useState(null)   // {ok, text}
+  const [alertRules, setAlertRules] = React.useState([])
+  const [alertEvents, setAlertEvents] = React.useState([])
+  const [alertNotice, setAlertNotice] = React.useState([])
+  const [alertDrafts, setAlertDrafts] = React.useState({})
+  const [alertBusy, setAlertBusy] = React.useState({})
+  const [ackBusy, setAckBusy] = React.useState(false)   // 确认 RPC 在途：只用于按钮态，判定重入用 ref
+  const alertSeq = React.useRef(0)
+  const alertKnown = React.useRef(null)
+  const alertNotified = React.useRef({})
+  const ackPending = React.useRef(false)
   const tab = ui.tab
   function setTab(t) { ui.set({ tab: t }) }
+
+  function alertEventId(e) {
+    if (!e) return ''
+    return String(e.id != null ? e.id : (e.event_id != null ? e.event_id : [e.symbol, e.target, e.direction, e.triggered_at || e.created_at || e.time].join('|')))
+  }
+  function showAlertNotification(e) {
+    try {
+      if (typeof window === 'undefined' || !window.Notification) return
+      const title = '雪球价格提醒'
+      const text = (e.name || e.symbol || '标的') + ' ' + (e.direction === 'below' ? '≤' : '≥') + ' ' + (e.target == null ? '' : e.target) + (e.current == null ? '' : '，现价 ' + e.current)
+      if (window.Notification.permission === 'granted') new window.Notification(title, { body: text, tag: 'xq-alert-' + alertEventId(e) })
+      else if (window.Notification.permission === 'default' && window.Notification.requestPermission) {
+        window.Notification.requestPermission().then(function (permission) {
+          if (permission === 'granted') { try { new window.Notification(title, { body: text, tag: 'xq-alert-' + alertEventId(e) }) } catch (ignore) {} }
+        }).catch(function () {})
+      }
+    } catch (ignore) { /* 浏览器权限/实现异常静默回退到页面提示 */ }
+  }
+  function refreshAlerts() {
+    const my = ++alertSeq.current
+    return fetchAlerts().then(function (data) {
+      if (alertSeq.current !== my) return
+      const rules = (data && Array.isArray(data.rules) ? data.rules : [])
+      const events = (data && Array.isArray(data.events) ? data.events : [])
+      const oldKnown = alertKnown.current
+      const initial = oldKnown === null
+      const fresh = initial ? [] : events.filter(function (e) { return !oldKnown[alertEventId(e)] })
+      const known = oldKnown || {}
+      events.forEach(function (e) { known[alertEventId(e)] = true })
+      alertKnown.current = known
+      setAlertRules(rules)
+      setAlertEvents(events)
+      // 首轮（含面板重挂后重新挂载）建立 alertKnown 基线：宿主的 events 是持久化的历史事件，
+      // 不能当成新事件弹浏览器通知，否则每次打开面板都会为旧事件刷屏；真正的新事件只会出现在
+      // 基线之后的轮询里（含可见性变化补拉、手动刷新）。
+      // 但「不弹通知」不等于「不可见」：alertEvents 只进 state、不直接渲染，历史未确认事件若也不进
+      // alertNotice 就没有任何 ack 入口。所以首轮静默（不调 showAlertNotification）把最近
+      // ALERT_NOTICE_LIMIT 条放进页面通知区：取尾部与宿主保留新事件的约定一致（host 侧
+      // store.events 超出 ALERT_MAX_EVENTS 时 slice(-ALERT_MAX_EVENTS)，events 为时间升序），
+      // 也避免陈年旧事件撑爆面板；确认掉展示的这批后重挂面板即可看到更早的一批，不会被永久藏住。
+      // 追加时按 alertEventId 去重，不重复堆叠。
+      const notice = initial ? events.slice(-ALERT_NOTICE_LIMIT) : fresh
+      if (notice.length) {
+        if (!initial) {
+          notice.forEach(function (e) {
+            const id = alertEventId(e)
+            if (!alertNotified.current[id]) { alertNotified.current[id] = true; showAlertNotification(e) }
+          })
+        }
+        setAlertNotice(function (prev) {
+          const prior = prev || []
+          return prior.concat(notice.filter(function (e) { return !prior.some(function (x) { return alertEventId(x) === alertEventId(e) }) }))
+        })
+      }
+      return data
+    }).catch(function () { /* 提醒失败不影响行情 */ })
+  }
+  function setAlert(symbol, rawTarget, direction, enabled) {
+    const target = Number(rawTarget)
+    if (!isFinite(target) || (direction !== 'above' && direction !== 'below')) {
+      setErr('请输入有效提醒价位，并选择 above/below')
+      return
+    }
+    setAlertBusy(function (b) { return Object.assign({}, b, { [symbol]: true }) })
+    saveAlert(symbol, target, direction, enabled !== false).then(function (data) {
+      setAlertRules((data && data.rules) || [])
+      setErr('')
+    }).catch(function (e) {
+      setErr(String((e && e.message) || e))
+    }).then(function () { setAlertBusy(function (b) { const n = Object.assign({}, b); delete n[symbol]; return n }) })
+  }
+  function removeAlertRule(symbol) {
+    setAlertBusy(function (b) { return Object.assign({}, b, { [symbol]: true }) })
+    removeAlert(symbol).then(function (data) {
+      setAlertRules((data && data.rules) || [])
+      setErr('')
+    }).catch(function (e) {
+      setErr(String((e && e.message) || e))
+    }).then(function () { setAlertBusy(function (b) { const n = Object.assign({}, b); delete n[symbol]; return n }) })
+  }
+  function acknowledgeAlerts(events) {
+    const ids = (events || []).map(function (e) { return e && (e.id != null ? e.id : e.event_id) }).filter(function (id) { return id != null && id !== '' })
+    if (!ids.length) return
+    if (ackPending.current) return   // 上一笔确认还在路上：不重复提交，也不叠加待删集合
+    ackPending.current = true
+    setAckBusy(true)
+    // key 用 alertEventId 的字符串形态，与下面过滤时算出的 id 同构（宿主 id 万一是数字也不会漏删）
+    const acked = {}
+    ids.forEach(function (id) { acked[String(id)] = true })
+    // 先等 RPC 成功再动本地状态：原来先乐观删除，ack RPC 一失败宿主仍记录着事件，
+    // 但事件已被 alertKnown 认作「已知」，下轮轮询既不会再通知也不会把它放回通知区，
+    // 表现为「点了确认却没确认掉，而且再也看不见了」。失败时保留事件并报错，可直接重试。
+    ackAlerts(ids).then(function (data) {
+      const remaining = (data && Array.isArray(data.events)) ? data.events : null
+      if (remaining) setAlertEvents(remaining)   // 宿主回传剩余事件，直接以它为准
+      else setAlertEvents(function (prev) { return (prev || []).filter(function (e) { return !acked[alertEventId(e)] }) })
+      setAlertNotice(function (prev) { return (prev || []).filter(function (e) { return !acked[alertEventId(e)] }) })
+      setErr('')
+    }).catch(function (e) {
+      setErr('确认提醒失败：' + String((e && e.message) || e))
+    }).then(function () {
+      ackPending.current = false
+      setAckBusy(false)
+    })
+  }
 
   function refreshMarket(force) {
     const my = ++marketSeq.current
@@ -156,14 +272,26 @@ export function XueqiuPanel() {
     refreshMarket().then(function () { return refreshContent() })
       .then(function () { setLoading(false) })
       .catch(function () { setLoading(false) })
+    refreshAlerts()
     return function () { /* 一次性 */ }
+  }, [])
+
+  React.useEffect(function () {
+    // 宿主事件已持久化，后台页也要轮询；回前台时立即补拉一次。
+    const stop = rt.ctx.interval(function () { refreshAlerts() }, ALERT_POLL_MS)
+    function onVis() { refreshAlerts() }
+    try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+    return function () {
+      if (stop) stop()
+      try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+    }
   }, [])
 
   React.useEffect(function () {
     const marketMs = marketOpen ? POLL_MARKET_OPEN_MS : POLL_MARKET_CLOSED_MS
     const contentMs = marketOpen ? POLL_CONTENT_OPEN_MS : POLL_CONTENT_CLOSED_MS
-    // 页面隐藏时暂停轮询（省请求、降低风控概率），回到前台立即刷新一次
-    const stopA = rt.ctx.interval(function () { if (!pageHidden()) refreshMarket() }, marketMs)
+    // 行情持续轮询；热榜/快讯在隐藏页暂停以降低请求量。
+    const stopA = rt.ctx.interval(function () { refreshMarket() }, marketMs)
     const stopB = rt.ctx.interval(function () { if (!pageHidden()) refreshContent() }, contentMs)
     function onVis() {
       if (!pageHidden()) { refreshMarket(); refreshContent() }
@@ -228,7 +356,7 @@ export function XueqiuPanel() {
     if (!view) return function () {}
     let alive = true
     function refreshLive() {
-      if (pageHidden()) return
+      // 详情报价/分时即使页面隐藏也继续请求；浏览器可能对 timer 做节流。
       Promise.all([
         call(A_QUOTE_DETAIL, { symbol: view, force: true }).catch(function () { return null }),
         call(A_MINUTE, { symbol: view, force: true }).catch(function () { return null })
@@ -390,6 +518,20 @@ export function XueqiuPanel() {
   ]))
 
   const errBox = err ? el('div', { className: 'xq-err' }, err) : null
+  const alertBox = alertNotice.length ? el('div', { className: 'xq-alert-notice', role: 'status' }, [
+    el('strong', { key: 'title' }, '价格提醒'),
+    alertNotice.map(function (e) {
+      const id = alertEventId(e)
+      return el('div', { key: id, className: 'xq-alert-event' }, [
+        el('span', { key: 'text' }, (e.name || e.symbol || '标的') + ' 已触发 ' + (e.direction === 'below' ? '≤' : '≥') + ' ' + (e.target == null ? '' : e.target) + (e.current == null ? '' : '（现价 ' + e.current + '）')),
+        el('button', {
+          key: 'ack', className: 'xq-btn-mini', disabled: ackBusy,
+          title: ackBusy ? '确认请求处理中…' : '确认后从宿主记录中移除该事件',
+          onClick: function () { acknowledgeAlerts([e]) }
+        }, ackBusy ? '确认中' : '确认')
+      ])
+    })
+  ]) : null
 
   // 每个 tab 的显式上下文工厂：字段 = 该 tab 函数体里用到的父级 state/句柄
   // （MarketTab/HotTab/SearchTab/NewsTab 的字段清单见各自文件头部注释；PnlTab 自取运行时，故返回空对象）
@@ -399,7 +541,9 @@ export function XueqiuPanel() {
         quotes: quotes, indices: indices, flashDir: flashDir,
         sortK: sortK, sortAsc: sortAsc, setSortK: setSortK, setSortAsc: setSortAsc,
         openDetail: openDetail, removeWatch: removeWatch,
-        manualCode: manualCode, setManualCode: setManualCode, addManual: addManual
+        manualCode: manualCode, setManualCode: setManualCode, addManual: addManual,
+        alertRules: alertRules, alertDrafts: alertDrafts, setAlertDrafts: setAlertDrafts,
+        setAlert: setAlert, removeAlert: removeAlertRule, alertBusy: alertBusy
       }
     },
     hot: function () {
@@ -457,5 +601,5 @@ export function XueqiuPanel() {
   }
 
   // key 变化触发 xq-fade-in 重放：tab/详情切换有轻微淡入
-  return el('div', null, [tabs, errBox, el('div', { key: 'v-' + (loginOpen ? 'login' : (view ? 'd' : tab)), className: 'xq-view' }, content)])
+  return el('div', null, [tabs, alertBox, errBox, el('div', { key: 'v-' + (loginOpen ? 'login' : (view ? 'd' : tab)), className: 'xq-view' }, content)])
 }

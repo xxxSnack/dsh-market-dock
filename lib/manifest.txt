@@ -5,6 +5,7 @@ config.js         # 插件配置解析（stateDir / watchlist；未配置时全�
 normalize.js      # 纯函数：nz/sanitize/pickQuote/mapKline/mapPosts/mapKOL/mapFinance
 cache.js          # URL 工具 enc/toQuery + TTL 缓存 + in-flight 去重（装到 core）
 gate.js           # 请求调度闸门：并发 2 / 最小间隔 / 30s 看门狗（装到 core）
+shell.js          # 纯函数：shell 前台执行的跨版本兼容层（run → execute+result）
 http.js           # classifyError + curl / ensureCookie / getJSON（含重试链，装到 core）
 state.js          # 状态文件落点：稳定目录优先、工作区回退、旧路径回读（装到 core）
 login.js          # 可选登录：Cookie 解析/落盘/云端自选读写与迁移（装到 core）
@@ -17,6 +18,7 @@ pnl/store.js      # 今日盈亏：与 dsh-ths-pnl 共用的 config.json / snaps
 pnl/collect.js    # 今日盈亏：组合列表/盈亏采集/Cookie 校验
 pnl/index.js      # 今日盈亏：installPnl(core) —— 三个 act* + 边界定时调度
 api.js            # 16 个 endpoint 对应的 act* 业务动作（装到 core）
+alerts.js         # 持久化价格提醒 RPC + 宿主后台 watcher
 actions.js        # RPC dispatch 表 + handleCall 包络（装到 core）
 tools/common.js   # 工具共用：xqToolOutput / xqIso
 tools/quote.js    # xueqiu_quote spec 工厂

@@ -2,6 +2,7 @@
 // 显式上下文 p：
 //   p.quotes / p.indices / p.flashDir / p.sortK / p.sortAsc / p.setSortK / p.setSortAsc
 //   p.openDetail / p.removeWatch / p.manualCode / p.setManualCode / p.addManual
+//   p.alertRules / p.alertDrafts / p.setAlertDrafts / p.setAlert / p.removeAlert / p.alertBusy
 import { el } from '../dom.js'
 import { fmt, fmtPct, fmtVol, colorOf } from '../format.js'
 
@@ -20,6 +21,32 @@ export function MarketTab(p) {
     else { p.setSortK(k); p.setSortAsc(false) }
   }
   function arrow(k) { return p.sortK === k ? (p.sortAsc ? ' ▲' : ' ▼') : '' }
+  function ruleFor(symbol) {
+    return (p.alertRules || []).find(function (r) { return r && r.symbol === symbol }) || null
+  }
+  function draftFor(q) {
+    const r = ruleFor(q.symbol)
+    const own = p.alertDrafts && p.alertDrafts[q.symbol]
+    return own || { direction: r && r.direction === 'below' ? 'below' : 'above', target: r && r.target != null ? String(r.target) : '' }
+  }
+  function changeDraft(q, patch) {
+    const d = draftFor(q)
+    p.setAlertDrafts(Object.assign({}, p.alertDrafts || {}, { [q.symbol]: Object.assign({}, d, patch) }))
+  }
+  function alertEditor(q) {
+    const r = ruleFor(q.symbol)
+    const d = draftFor(q)
+    const busy = p.alertBusy && p.alertBusy[q.symbol]
+    return el('div', { key: 'alert', className: 'xq-alert-editor', onClick: function (e) { e.stopPropagation() } }, [
+      el('select', { key: 'dir', className: 'xq-alert-dir', value: d.direction, disabled: busy, onChange: function (e) { changeDraft(q, { direction: e.target.value }) } }, [
+        el('option', { key: 'a', value: 'above' }, '≥'),
+        el('option', { key: 'b', value: 'below' }, '≤')
+      ]),
+      el('input', { key: 'target', className: 'xq-alert-target', type: 'number', step: 'any', placeholder: '价位', value: d.target, disabled: busy, onChange: function (e) { changeDraft(q, { target: e.target.value }) } }),
+      el('button', { key: 'set', className: 'xq-btn-mini', disabled: busy, title: r ? '更新提醒' : '设置提醒', onClick: function () { p.setAlert(q.symbol, d.target, d.direction, true) } }, r ? '更新' : '提醒'),
+      r ? el('button', { key: 'rm', className: 'xq-btn-mini', disabled: busy, title: '取消提醒', onClick: function () { p.removeAlert(q.symbol) } }, '取消') : null
+    ])
+  }
   const idxKids = p.indices.map(function (q) {
     return el('div', {
       key: q.symbol, className: 'xq-idx-card', title: '查看 ' + (q.name || q.symbol) + ' 详情',
@@ -43,7 +70,8 @@ export function MarketTab(p) {
       el('div', { key: 'v', className: 'xq-sub' }, fmtVol(q.volume, q.symbol)),
       el('div', { key: 'a2', className: 'xq-actions' }, [
         el('button', { key: 'd', className: 'xq-btn-mini', onClick: function (e) { e.stopPropagation(); p.openDetail(q.symbol) } }, '详情'),
-        el('button', { key: 'r', className: 'xq-btn-mini', title: '移除自选', onClick: function (e) { e.stopPropagation(); p.removeWatch(q.symbol) } }, '×')
+        el('button', { key: 'r', className: 'xq-btn-mini', title: '移除自选', onClick: function (e) { e.stopPropagation(); p.removeWatch(q.symbol) } }, '×'),
+        alertEditor(q)
       ])
     ])
   })

@@ -123,20 +123,28 @@ function makeCtx(opts) {
       rec.shellResolve.push(String((spec && spec.command) || ''))
       return { __smokeStub: true, command: String((spec && spec.command) || '') }
     },
-    run(spec) {
+    run() {
+      // DSH 0.2 起 shell 服务没有 run()（改名 execute）：插件若退回旧 API，这里要炸得很响。
+      throw new Error('[smoke] shell.run 已不存在（DSH 0.2 起改名 execute）：插件仍在调用旧 API')
+    },
+    execute(spec) {
       const command = String((spec && spec.command) || '')
       rec.shellRun.push(command)
+      let value
       if (responses) {
         // 回放预置 stdout：形如 `body\n__HTTP__200`，与真实 curl -w 输出同形
         if (responses.length === 0) throw new Error('[smoke] shell 脚本用尽：出现了预期外的请求')
         const next = responses.shift() || {}
         rec.shellRunSpecs.push(spec)
-        return {
+        value = {
           exitCode: next.exitCode === undefined ? 0 : next.exitCode,
           stdout: { text: String(next.text === undefined ? '' : next.text) },
         }
+      } else {
+        throw new Error('[smoke] shell.execute 被拦截：测试内禁止真实 shell / 网络')
       }
-      throw new Error('[smoke] shell.run 被拦截：测试内禁止真实 shell / 网络')
+      // 0.2 的 execute 返回「执行句柄」；前台执行 = await handle.result()（与真实 pwsh/bash 执行器同形）
+      return { result: async function () { return value } }
     },
   }
   const provided = {

@@ -1,35 +1,25 @@
 // 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度。
 // 形态 C：默认区域模式（320px 宽，前 12 只自选静态平铺换行）；⤡ 手柄可调宽 120–480px，双击复位 320。
 // 悬停弹层已砍掉：速览靠拉宽徽章，完整功能点徽章开面板。
-import { el, viewport, pageHidden, aSession, sessionsText } from './dom.js'
+import { el, viewport, aSession, sessionsText } from './dom.js'
 import { fmt, fmtPct, colorOf } from './format.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
-import { fetchIndices, fetchQuote, fetchWatchlist } from './store/market.js'
+import { fetchQuote, fetchWatchlist } from './store/market.js'
 import { BADGE_WATCH_LIMIT, BADGE_W_MIN, BADGE_W_MAX, BADGE_W_DEFAULT, BADGE_DRAG_THRESHOLD, EDGE_GAP, VIEWPORT_FALLBACK_W, VIEWPORT_FALLBACK_H, POLL_BADGE_MS } from './constants.js'
 
 // ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
 export function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui
-  const [idx, setIdx] = React.useState([])
   const [top, setTop] = React.useState([])
-  const [mOpen, setMOpen] = React.useState(true)
   const [, force] = React.useState(0)
   const refreshSeq = React.useRef(0)
 
   React.useEffect(function () {
     let alive = true
     function refresh() {
-      if (pageHidden()) return   // 页面隐藏时暂停徽章轮询
       const my = ++refreshSeq.current
-      fetchIndices().then(function (data) {
-        if (!alive || refreshSeq.current !== my) return
-        setIdx((data && data.list) || [])
-        const st = data ? data.status : null
-        if (st === 5 || st === 6) setMOpen(true)
-        else if (st !== null && st !== undefined) setMOpen(false)
-      }).catch(function () { /* 静默失败 */ })
-      // 徽章主体：自选前 12 只（轮动素材 / 平铺内容）；自选为空回退指数
+      // 徽章只展示标题与自选行情；行情请求不因页面隐藏而停止。
       fetchWatchlist().then(function (wl) {
         if (!alive || refreshSeq.current !== my) return
         const symbols = ((wl && wl.symbols) || []).slice(0, BADGE_WATCH_LIMIT)
@@ -37,9 +27,9 @@ export function MiniBadge() {
         return fetchQuote(symbols).then(function (data) {
           if (alive && refreshSeq.current === my) setTop((data && data.list) || [])
         })
-      }).catch(function () { /* 静默失败：保留指数 */ })
+      }).catch(function () { /* 静默失败：保留上一轮行情 */ })
     }
-    function onVis() { if (!pageHidden()) refresh() }
+    function onVis() { refresh() }
     refresh()
     // [fork-fix] 应用级水合入口：shell.overlay 全局只挂一次，不随会话切换重放旧持久化值
     hydrateUi()
@@ -179,18 +169,12 @@ export function MiniBadge() {
   // 区域模式：前 12 只全部平铺（换行）；单行模式：轮动页（页码指示）
   function wItem(q) {
     return el('span', { key: 'w-' + q.symbol, className: 'xq-witem', title: (q.name || q.symbol) + ' ' + fmt(q.current) + (q.percent !== undefined ? '  ' + fmtPct(q.percent) : '') }, [
-      el('span', { key: 'n', className: 'xq-badge-hint' }, (q.name || q.symbol) + ' '),
+      el('span', { key: 'n', className: 'xq-badge-hint' }, q.name || q.symbol),
+      el('span', { key: 'c', className: 'xq-badge-val' }, fmt(q.current)),
       el('span', { key: 'p', className: 'xq-badge-val ' + colorOf(q.percent) }, fmtPct(q.percent))
     ])
   }
-  // 指数区：4 指数两列（上证 深证 创业 科创50），有自选时作为区域头部，无自选时即主体
-  function idxRow(q) {
-    return el('span', { key: 'ix-' + q.symbol, className: 'xq-idxrow', title: (q.name || q.symbol) + ' ' + fmt(q.current) }, [
-      el('span', { key: 'n', className: 'xq-badge-hint' }, (q.name || q.symbol)),
-      el('span', { key: 'p', className: 'xq-badge-val ' + colorOf(q.percent) }, fmtPct(q.percent))
-    ])
-  }
-  const idxEls = el('div', { key: 'idx', className: 'xq-idxgrid' }, idx.map(idxRow))
+  // 悬浮徽标仅保留标题与自选行情，指数网格属于面板/底部条职责。
   const bodyEls = top.length
     ? el('div', { key: 'wg', className: 'xq-wgrid' }, top.map(wItem))
     : null
@@ -214,14 +198,14 @@ export function MiniBadge() {
   const badgeKids = [
     el('div', { key: 'hd', className: 'xq-badge-hd' }, [
       el('span', { key: 'logo' }, [el('b', { key: 'b' }, '雪球'), 'mini']),
-      el('span', { key: 'st', className: 'xq-status' + (aSession() === '盘中' ? ' xq-live' : ''), title: sessionsText() }, (function () { var s = aSession(); return s === '盘中' ? '● 盘中' : (s || (mOpen ? '● 盘中' : '休市')) })()),
+      el('span', { key: 'st', className: 'xq-status' + (aSession() === '盘中' ? ' xq-live' : ''), title: sessionsText() }, (function () { var s = aSession(); return s === '盘中' ? '● 盘中' : (s || '休市') })()),
       el('span', { key: 'sp', className: 'xq-spacer' }),
       compactButton,
       el('span', { key: 'ct', className: 'xq-caret' }, ui.open ? '▾' : '▴')
     ])
   ]
   if (!compact) {
-    badgeKids.push(idxEls, bodyEls, el('span', {
+    badgeKids.push(bodyEls, el('span', {
       key: 'grip', className: 'xq-badge-grip', title: '拖动调宽度 · 双击复位',
       onPointerDown: onGripDown, onPointerMove: onGripMove, onPointerUp: onGripUp, onPointerCancel: onGripUp,
       onDoubleClick: onGripDblClick

@@ -8,6 +8,7 @@ platform.js
 store/ui.js
 store/market.js
 store/pnl.js
+store/alerts.js
 charts/setup.js
 charts/kline.js
 charts/minute.js

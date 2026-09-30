@@ -27,6 +27,11 @@ export const A_KOL = 'kol'
 export const A_PNL_GET = 'pnl.get'
 export const A_PNL_VERIFY = 'pnl.verify'
 export const A_PNL_CONFIG = 'pnl.config'
+// 价格提醒：规则与事件由宿主持久化，客户端只负责展示与调用。
+export const A_ALERTS_GET = 'alerts.get'
+export const A_ALERTS_SET = 'alerts.set'
+export const A_ALERTS_REMOVE = 'alerts.remove'
+export const A_ALERTS_ACK = 'alerts.ack'
 
 // 注：用具名 async 函数表达式（构建器只认 `export function|const|let|var|class` 开头的导出行）。
 export const call = async function (action, args) {

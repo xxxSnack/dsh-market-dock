@@ -869,13 +869,16 @@ check('toolview 退化输入不抛错：运行中 / 不可读 / 空列表', () =
   const noProps = render(main, SLOT_NEWS, {}).tree
   ok(textHas(noProps, '查询中'), '无 props 应显示「查询中…」，实际：' + treeText(noProps))
 })
-check('shell.overlay 徽标渲染出 .xq-badge 结构', () => {
+// 徽标新契约：只保留标题栏 + 自选行情网格；红框指数区域（.xq-idxgrid）已从徽标移除，
+// 指数展示属于面板 / 底部指数条（.xq-ticker）职责。空数据静态渲染还没有 .xq-wgrid 可挂
+// （自选行情由 effect 异步加载），数据链路（effect → 假响应 → 复渲染）由 [5e] 单独验证。
+check('shell.overlay 徽标渲染出 .xq-badge 结构（不再渲染指数网格）', () => {
   const { tree } = render(main, SLOT_BADGE, undefined)
   ok(tree, 'MiniBadge 返回了 null')
   ok(hasClass(tree, 'xq-badge'), '缺 .xq-badge')
   ok(hasClass(tree, 'xq-badge-grip'), '缺 .xq-badge-grip（调宽手柄）')
   ok(hasClass(tree, 'xq-badge-control'), '缺 .xq-badge-control（独立折叠按钮）')
-  ok(hasClass(tree, 'xq-idxgrid'), '缺 .xq-idxgrid')
+  ok(!hasClass(tree, 'xq-idxgrid'), '徽标不应渲染 .xq-idxgrid（指数区域已移除）')
   ok(textHas(tree, '雪球'), '徽标缺「雪球」字样')
   ok(textHas(tree, '⤡'), '徽标缺手柄字符')
 })
@@ -1384,6 +1387,58 @@ function caretOfTree(tree) {
   return h ? treeText(h) : null
 }
 
+// ---------------------------------------------------------------- 5e. 悬浮徽标自选行情网格
+// 徽标只保留标题栏 + 自选最新行情网格（.xq-wgrid：名称/现价/涨跌幅），指数网格已移除（见 [4]）。
+// 静态渲染时 top 还是空的，.xq-wgrid 要等 MiniBadge 的 effect 拿到自选与报价才渲染 —— 与 [5c] 指数条
+// 同一套路：flush MiniBadge 的 effect、走进程内假响应（watchlist.get → quote），再复渲染断言。
+// useState 替身需要跨渲染记忆（reactor.stateful，[5c] 已打开），setTop 写进的数据才能进复渲染。
+section('[5e] 悬浮徽标自选行情网格（flush MiniBadge effect → 假响应 → 复渲染）')
+const badgeGridProbe = await (async () => {
+  try {
+    main.react.reactor.stateful = true   // 幂等：与 [5c] 相同的替身能力扩展，不是放宽断言
+    const fetchBefore = main.record.fetchCalls.length
+    const first = render(main, SLOT_BADGE, undefined)
+    const flush = flushEffects(main, first.effects)
+    await settle(8)
+    const second = render(main, SLOT_BADGE, undefined)
+    return { first, second, flush, calls: main.record.fetchCalls.slice(fetchBefore) }
+  } catch (err) {
+    return { error: err }
+  }
+})()
+function badgeGridReady() {
+  if (!badgeGridProbe || badgeGridProbe.error) {
+    throw new Error('前置失败：徽标行情网格探针抛错（' + ((badgeGridProbe && badgeGridProbe.error && badgeGridProbe.error.message) || '未产出结果') + '）')
+  }
+}
+check('徽标 effect 拿到自选与报价后，复渲染出 .xq-wgrid 自选行情网格', () => {
+  badgeGridReady()
+  ok(badgeGridProbe.flush.errors.length === 0, 'MiniBadge effect flush 抛错：' + badgeGridProbe.flush.errors.join(' | '))
+  ok(hasClass(badgeGridProbe.second.tree, 'xq-wgrid'), '复渲染缺 .xq-wgrid（自选最新行情没进到徽标里）')
+  ok(!hasClass(badgeGridProbe.second.tree, 'xq-idxgrid'), '有数据后徽标仍不得渲染 .xq-idxgrid（指数区域已移除）')
+  return classCount(badgeGridProbe.second.tree, 'xq-witem') + ' 个自选项'
+})
+check('自选项渲染出名称/现价/涨跌幅（价格结构来自假报价响应）', () => {
+  badgeGridReady()
+  ok(classCount(badgeGridProbe.second.tree, 'xq-witem') >= 1, '.xq-wgrid 里没有自选项（.xq-witem），实际文本：' + treeText(badgeGridProbe.second.tree).slice(0, 120))
+  const item = treeHosts(badgeGridProbe.second.tree).find((h) => classOf(h).split(/\s+/).includes('xq-witem'))
+  ok(item, '找不到 .xq-witem 自选项')
+  for (const needle of ['上证指数', '3210.55', '+0.42%']) {
+    ok(textHas(item, needle), '自选项文本缺 ' + JSON.stringify(needle) + '（实际：' + treeText(item) + '）')
+  }
+  ok(hasClass(item, 'xq-badge-val'), '自选项缺 .xq-badge-val（现价/涨跌值）')
+  ok(hasClass(item, 'xq-up'), '正涨幅没有着色类 .xq-up（colorOf(0.42) 应判涨）')
+  return treeText(item)
+})
+check('徽标一次刷新只发自选与报价请求（watchlist.get / quote），未出网', () => {
+  badgeGridReady()
+  const calls = badgeGridProbe.calls
+  eqJson([...new Set(calls.map((c) => c.url))], ['/xq-rpc'], '徽标 effect 期间的 fetch URL 集合')
+  eqJson([...new Set(calls.map((c) => c.action))].sort(), ['quote', 'watchlist.get'], '徽标 effect 期间的 action 集合')
+  eq(calls.length, 2, '徽标 effect 期间的 fetch 次数（应用级水合已由 [5] DockGate 预热，这里不应再有 ui.get）')
+  return '2 次调用：watchlist.get → quote'
+})
+
 // ---------------------------------------------------------------- 6. slots 缺失时的降级
 readyGuard = null
 section('[6] 降级路径：ctx.get(\'slots\') === undefined')
@@ -1411,7 +1466,7 @@ note('React 替身：createElement 真造树 + 真调函数组件（本次共调
 note('hook 账本（[5c]）：按「组件函数 + 本次调用」记 hook 序列，内联子组件的 hook 归到父组件 —— 与真实 React 的归属规则一致；' +
   '本次共记账 ' + main.react.reactor.hookLog.length + ' 条组件调用')
 note('替身能力边界（[5c] 依赖的部分）：没有 fiber/协调，每次渲染都从头重跑组件 body；effect 不做 deps 比对；' +
-  'setState 默认不触发重渲染（只有 [5c] 指数条那段临时打开 stateful，setter 才真正生效，共 ' +
+  'setState 默认不触发重渲染（只有 [5c] 指数条、[5e] 徽标网格探针临时打开 stateful，setter 才真正生效，共 ' +
   (main.react.reactor.stateful ? '已打开' : '未打开') + '）。' +
   '所以 hook 账本能证明的是「hook 归属 + 每次调用各自的 hook 数」，而不是 React 真正的 hook 链表实现。')
 note('effect 仅对白名单组件 flush：' + [...FLUSHABLE].join(', ') + '；图表组件（KlineChart 等）的 canvas effect 跳过')

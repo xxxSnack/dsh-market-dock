@@ -24,6 +24,7 @@ panel/news.js
 panel/pnl.js
 panel/positions.js
 panel/index.js
+restore.js
 badge.js
 dock.js
 ticker.js

@@ -5,12 +5,13 @@ import { el, viewport, aSession, sessionsText } from './dom.js'
 import { fmt, fmtPct, colorOf } from './format.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
 import { ensureAlertPermission } from './store/alerts-watch.js'
+import { RestorePill } from './restore.js'
 import { fetchQuote, fetchWatchlist } from './store/market.js'
 import { BADGE_WATCH_LIMIT, BADGE_W_MIN, BADGE_W_MAX, BADGE_W_DEFAULT, BADGE_DRAG_THRESHOLD, EDGE_GAP, VIEWPORT_FALLBACK_W, VIEWPORT_FALLBACK_H, POLL_BADGE_MS } from './constants.js'
 
 // ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
-// 门控与 DockGate 同款：水合完成前不挂载（否则刷新瞬间会先按默认参数画一次再做布局钳制），
-// 行情隐身时直接返回 null —— 组件不挂载，它那份 POLL_BADGE_MS 轮询自然不存在。
+// 门控与 DockGate 同款：水合完成前不挂载（否则刷新瞬间会先按默认参数画一次再做布局钳制）。
+// 行情隐身时不挂实体，只留左下角那枚恢复胶囊 —— 实例不挂载，它那份 POLL_BADGE_MS 轮询自然不存在。
 export function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui
@@ -21,7 +22,8 @@ export function MiniBadge() {
     const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
     return off
   }, [])
-  if (!ui.hydrated || ui.hidden) return null
+  if (!ui.hydrated) return null
+  if (ui.hidden) return el(RestorePill, null)
   return el(MiniBadgeBody, null)
 }
 

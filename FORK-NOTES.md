@@ -899,8 +899,15 @@ CSS 里确有 `.xq-pos-cell` / `.xq-pos-chg` / `.xq-pos-cleared`。
 
 ### 11.5 恢复入口（方案的核心权衡）
 
-全隐藏之后屏幕上没有任何东西可点，所以恢复入口必须独立于行情 UI。最终留两条：
+隐身后屏幕上只剩左下角一枚胶囊，恢复入口必须**不依赖行情 UI**。最终三条：
 
+0. **左下角恢复胶囊**（`client/restore.js` → `.xq-restore`，`fixed; left:12px; bottom:12px`，
+   11px 小字 + 一个状态点，默认 `opacity:.6`、hover 才完全显形）：**一按即恢复**。
+   由 `shell.overlay` 的徽章门控渲染（`if (ui.hidden) return el(RestorePill)`），所以跨会话、跨页面
+   （含设置页）都在，不会走丢；`Enter`/空格同样可用；**不发任何请求**（「隐身=零请求」不受影响）。
+   它只做「恢复」，不做开合切换 —— 隐藏动作在面板头/徽章上已有按钮，不缺入口。
+   > fork.7 最初是「全清空、只留快捷键+对话」，用户实测后的原话是「开启方式有点太麻烦了，
+   > 能不能改成左下角有一个比较简单的按钮」——恢复成本高过隐藏成本，这个开关就会被弃用，所以补上它。
 1. **快捷键** `xq.toggleHidden`，默认 `Ctrl/⌘ + Alt + Shift + X`，
    六套 profile（`web`/`desktop` × `windows`/`macos`/`linux`）全覆盖。
    它注册在宿主快捷键服务上 ⇒ 出现在 **设置 → 通用 → 快捷键**，能看键帽、能改键、能在冲突时发现。
@@ -908,10 +915,11 @@ CSS 里确有 `.xq-pos-cell` / `.xq-pos-chg` / `.xq-pos-cleared`。
    命令仍留在快捷键表里等用户指派（比彻底没有入口好）。
 2. **对话**：`xueqiu_display({ hidden })` 工具。用户说「把行情打开」就能恢复；不带参数只读状态。
 
-宿主没有 shortcuts 服务时 `ctx.inject(['shortcuts'])` 不回调，静默降级 —— 只剩第 2 条。
+宿主没有 shortcuts 服务时 `ctx.inject(['shortcuts'])` 不回调，静默降级 —— 还剩第 0、2 条。
 
 **被否掉的方案（别再提）**：CSS 隐藏（请求照跑）；只放设置页开关（藏得深、不"一键"）；
-从 profile 摘掉插件 + 重启（物理最干净，但不是按钮，每次开合都打断会话）；留一枚小图标（有残留）。
+从 profile 摘掉插件 + 重启（物理最干净，但不是按钮，每次开合都打断会话）；**一个像素都不留**
+（恢复成本过高，见上面的实测反馈）。
 
 ### 11.6 状态
 
@@ -929,9 +937,11 @@ CSS 里确有 `.xq-pos-cell` / `.xq-pos-chg` / `.xq-pos-cleared`。
 | `test/smoke-host.mjs` §[6] | 5 | `hidden` 缺省 false、`ui.set` 往返、落盘、`false` 不被当成「未传」 |
 | `test/smoke-host.mjs` §[7] | 4 | `xueqiu_display` 只读/双向拨动/零上游请求 |
 | `test/smoke-client.mjs` §[4] | 5 | 三处入口未水合时为 null、未水合期间只有一次 `alerts.get` |
-| `test/smoke-client.mjs` §[5f] | 7 | 命令形状（6 套键位/aliases/regions）、面板与徽章的「隐身」按钮、三处一起关、隐身后零请求、双向恢复、通知首轮静默且只弹新事件 |
+| `test/smoke-client.mjs` §[5f] | 8 | 命令形状（6 套键位/aliases/regions）、面板与徽章的「隐身」按钮、隐藏后面板/指数条为 null 且徽章换成恢复胶囊、隐身后零请求、点胶囊一按即恢复、胶囊键盘可用 + 命令双向、通知首轮静默且只弹新事件 |
 | `test/smoke-client.mjs` §[5f-2] | 1 | 默认键位冲突 → 降级为未绑定 |
 
 **已知边界**：隐身是「宿主级全局」，不区分工作区；想让某个项目单独隐身需要另存一份状态（未实现）。
+胶囊固定钉在左下角（`left:12px; bottom:12px`），暂不可拖动；若某天和别的左下角控件打架，
+再给它加一个可拖拽位置（照徽章 `badgePos` 的现成路子）。
 
 

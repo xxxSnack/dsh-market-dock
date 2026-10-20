@@ -1696,7 +1696,7 @@ check('徽标一次刷新只发自选与报价请求（watchlist.get / quote）�
 // 一个开关关掉三处常驻入口（面板 / 徽章 / 指数条），行情轮询随之全停；
 // 恢复入口是「注册到宿主快捷键表的可改键命令」+ 「xueqiu_display 工具让 AI 拨」。
 // 价格提醒**不受影响**：通知器是应用级运行时，随 apply 启动，与面板挂载/隐身无关。
-section('[5f] 行情隐身：三处门控 + 快捷键恢复 + 提醒照常')
+section('[5f] 行情隐身：入口门控 + 左下角恢复胶囊 + 快捷键 + 提醒照常')
 const hideCmd = main.shortcuts.commands[0]
 check('快捷键服务可用时注册了 xq.toggleHidden（带 6 个平台默认键位）', () => {
   eq(main.shortcuts.commands.length, 1, '注册的命令数量')
@@ -1740,15 +1740,20 @@ check('面板头部有「隐身」按钮，且 title 说清后果（连徽章/�
   ok(/完全隐藏行情/.test(String((btn.props && btn.props.title) || '')), '按钮 title 未说明会隐藏什么：' + String(btn.props && btn.props.title))
   return 'title=' + String(btn.props.title).slice(0, 24) + '…'
 })
-check('命令 run() 把三处入口一起关掉（不是只关面板）', () => {
+check('命令 run() 关掉面板/指数条，并把徽章换成左下角恢复胶囊', () => {
   const res = hideCmd.resolve({ region: 'page', modal: null, target: null })
   eq(res.status, 'handled', 'resolve 状态')
   eq(typeof res.run, 'function', 'run 可调用')
   res.run()
   eq(render(main, SLOT_PANEL, undefined).tree, null, '面板应返回 null')
-  eq(render(main, SLOT_BADGE, undefined).tree, null, '徽章应返回 null')
   eq(render(main, SLOT_TICKER, undefined).tree, null, '指数条应返回 null')
-  return '三处入口均为 null'
+  const badge = render(main, SLOT_BADGE, undefined).tree
+  ok(badge, '隐身后徽章槽位不该是空的（要留一枚恢复胶囊）')
+  ok(hasClass(badge, 'xq-restore'), '隐身后徽章槽位应是 .xq-restore 恢复胶囊，实际：' + treeText(badge).slice(0, 60))
+  ok(!hasClass(badge, 'xq-badge'), '恢复胶囊不该带 .xq-badge（行情界面必须真的消失）')
+  ok(!hasClass(badge, 'xq-wgrid'), '恢复胶囊里不该有任何行情数据')
+  ok(textHas(badge, '行情'), '恢复胶囊缺「行情」字样')
+  return '面板/指数条 null + 恢复胶囊'
 })
 check('隐身期间渲染三处入口不发任何请求（门控在挂实体之前就返回）', () => {
   const before = main.record.fetchCalls.length
@@ -1758,11 +1763,31 @@ check('隐身期间渲染三处入口不发任何请求（门控在挂实体之�
   eq(main.record.fetchCalls.length, before, '隐身后的 fetch 次数增量')
   return '0 次新增请求'
 })
-check('再拨一次即恢复（同一个命令双向开关，且不动 ui.open）', () => {
+check('点左下角胶囊一按即恢复（不用记快捷键）', () => {
+  const pill = treeHosts(render(main, SLOT_BADGE, undefined).tree).find((h) => classOf(h).split(/\s+/).includes('xq-restore'))
+  ok(pill, '找不到恢复胶囊节点')
+  ok(typeof pill.props.onClick === 'function', '恢复胶囊没有 onClick')
+  eq(pill.props.role, 'button', '恢复胶囊缺 role=button')
+  ok(/行情已隐藏/.test(String(pill.props.title || '')), '恢复胶囊的 title 没说清用途：' + String(pill.props.title))
+  pill.props.onClick({})
+  ok(hasClass(render(main, SLOT_BADGE, undefined).tree, 'xq-badge'), '点胶囊后徽章没有回来')
+  ok(render(main, SLOT_PANEL, undefined).tree, '点胶囊后面板没有回来（隐身不应顺带改 open）')
+  return '一点即恢复'
+})
+check('胶囊支持键盘（Enter/空格），命令本身仍是双向开关', () => {
+  hideCmd.resolve({ region: 'page', modal: null, target: null }).run()
+  const pill = treeHosts(render(main, SLOT_BADGE, undefined).tree).find((h) => classOf(h).split(/\s+/).includes('xq-restore'))
+  ok(pill, '隐藏后没有恢复胶囊')
+  eq(typeof pill.props.onKeyDown, 'function', '恢复胶囊没有 onKeyDown')
+  let prevented = false
+  pill.props.onKeyDown({ key: 'Enter', preventDefault() { prevented = true } })
+  ok(prevented, 'Enter 未阻止默认行为')
+  ok(hasClass(render(main, SLOT_BADGE, undefined).tree, 'xq-badge'), 'Enter 没有恢复徽章')
   hideCmd.resolve({ region: 'editable', modal: null, target: null }).run()
-  ok(render(main, SLOT_BADGE, undefined).tree, '恢复后徽章仍是 null')
-  ok(render(main, SLOT_PANEL, undefined).tree, '恢复后面板仍是 null（隐身不应顺带改 open）')
-  return '徽章/面板已恢复'
+  eq(render(main, SLOT_PANEL, undefined).tree, null, '再 run 一次应重新隐藏')
+  hideCmd.resolve({ region: 'editable', modal: null, target: null }).run()
+  ok(render(main, SLOT_PANEL, undefined).tree, '再 run 一次应恢复')
+  return '双向开关 + 键盘可用'
 })
 check('提醒通知器：历史事件静默，只有新事件弹一次通知', () => {
   const list = main.record.notifications

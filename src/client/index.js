@@ -2890,13 +2890,46 @@ function XueqiuPanel() {
   return el('div', null, [tabs, alertBox, errBox, el('div', { key: 'v-' + (loginOpen ? 'login' : (view ? 'd' : tab)), className: 'xq-view' }, content)])
 }
 
+// 隐身状态下的**唯一可见痕迹**：左下角一枚小胶囊，点一下就把行情界面全部恢复。
+//
+// 为什么需要它：原来隐身后屏幕上什么都不剩，只能靠快捷键（记不住）或对 AI 说话（要打字），
+// 恢复成本明显高于隐藏成本 —— 用户实测后要求「左下角一个简单按钮，一按就开」。
+//
+// 它由 shell.overlay 的徽章门控渲染（见 badge.js 的 MiniBadge），因此：
+//   · 全局唯一、跨会话/跨页面都在（设置页也看得见，正好不会走丢）；
+//   · **不发任何请求** —— 隐身期间「零请求」这条不变量不受影响（胶囊只是 ui 状态的一个开关）。
+//   · 只做「恢复」这一件事，不做开合切换：隐藏动作有面板头和徽章上的按钮，不缺入口。
+
+function RestorePill() {
+  const rt = getUiRuntime()
+  const ui = rt.ui
+  function restore() {
+    // 顺手确认通知权限：隐身后提醒照常，但浏览器里请求权限必须发生在用户手势内。
+    ensureAlertPermission()
+    ui.set({ hidden: false })
+  }
+  return el('div', {
+    className: 'xq-restore',
+    title: '行情已隐藏 · 点这里恢复（快捷键 Ctrl/⌘+Alt+Shift+X，或对 AI 说「把行情打开」）',
+    role: 'button',
+    tabIndex: 0,
+    onClick: restore,
+    onKeyDown: function (e) {
+      if (e && (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar')) { e.preventDefault(); restore() }
+    }
+  }, [
+    el('span', { key: 'dot', className: 'xq-restore-dot' }, null),
+    el('span', { key: 't', className: 'xq-restore-txt' }, '行情')
+  ])
+}
+
 // 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度。
 // 形态 C：默认区域模式（320px 宽，前 12 只自选静态平铺换行）；⤡ 手柄可调宽 120–480px，双击复位 320。
 // 悬停弹层已砍掉：速览靠拉宽徽章，完整功能点徽章开面板。
 
 // ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
-// 门控与 DockGate 同款：水合完成前不挂载（否则刷新瞬间会先按默认参数画一次再做布局钳制），
-// 行情隐身时直接返回 null —— 组件不挂载，它那份 POLL_BADGE_MS 轮询自然不存在。
+// 门控与 DockGate 同款：水合完成前不挂载（否则刷新瞬间会先按默认参数画一次再做布局钳制）。
+// 行情隐身时不挂实体，只留左下角那枚恢复胶囊 —— 实例不挂载，它那份 POLL_BADGE_MS 轮询自然不存在。
 function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui
@@ -2907,7 +2940,8 @@ function MiniBadge() {
     const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
     return off
   }, [])
-  if (!ui.hydrated || ui.hidden) return null
+  if (!ui.hydrated) return null
+  if (ui.hidden) return el(RestorePill, null)
   return el(MiniBadgeBody, null)
 }
 
@@ -3574,6 +3608,13 @@ const xqClientPlugin = {
 .xq-badge-control{flex:none;width:18px;height:18px;padding:0;border:1px solid var(--dsw-alias-border-l2);border-radius:50%;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:16px;text-align:center;cursor:pointer;}
 .xq-badge-control:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary);}
 .xq-badge-control:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px;}
+/* 行情隐身时左下角唯一可见的痕迹：小胶囊，点一下恢复全部行情界面。
+   固定定位、不参与任何布局，也不发请求 —— 「隐身=零请求」这条不变量不受影响。 */
+.xq-restore{position:fixed;left:12px;bottom:12px;z-index:1200;display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.4;cursor:pointer;user-select:none;opacity:.6;transition:opacity .15s,border-color .15s,color .15s;}
+.xq-restore:hover{opacity:1;border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-label-primary);}
+.xq-restore:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
+.xq-restore-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-brand-primary);opacity:.55;flex:none;}
+.xq-restore:hover .xq-restore-dot{opacity:1;}
 .xq-wgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:3px 12px;padding:1px 8px 1px 0;}
 .xq-witem{white-space:nowrap;display:flex;justify-content:space-between;gap:6px;}
 .xq-witem .xq-badge-hint{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;}

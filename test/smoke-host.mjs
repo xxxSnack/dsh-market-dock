@@ -113,6 +113,7 @@ function makeCtx(opts) {
     shellRun: [],
     shellRunSpecs: [],   // 脚本化回放时真正"发出去"的 shell spec
     disposers: [],       // ctx.effect 返回的回收函数（pnl 定时器清理用）
+    effectLabels: [],    // ctx.effect 的标签（用于断言"某个模块还挂没挂后台副作用"）
     timers: [],          // manualTimers 模式下排过的定时器（永不自动触发）
     timerStops: [],      // manualTimers 模式下被停止函数清掉的定时器间隔
   }
@@ -153,11 +154,12 @@ function makeCtx(opts) {
     sandboxPolicy: { workspaceRoot: WORK_DIR },
   }
 
-  function effect(fn) {
+  function effect(fn, label) {
     rec.effectCalls++
+    if (label) rec.effectLabels.push(String(label))
     const dispose = fn()
     if (typeof dispose === 'function') {
-      rec.disposers.push(dispose) // 记下来：收尾时可显式回收（pnl 的边界定时器）
+      rec.disposers.push(dispose) // 记下来：收尾时可显式回收
       return dispose
     }
     return () => {}
@@ -166,8 +168,10 @@ function makeCtx(opts) {
   const ctx = {
     timeout(cb, ms) {
       // manualTimers：不排真定时器，只登记 + 返回停止函数 —— 让用例完全确定，
-      // 不会有"启动 3 秒补拉"在断言进行到一半时突然触发。
-      if (o.manualTimers) {
+      // 不会有后台轮询在断言进行到一半时突然触发。
+      // manualTimersMinMs：**短于这个阈值**的定时器仍走真定时器 —— 请求调度闸门（gate.js）
+      // 用 100ms 的最小间隔做节流，如果连它也被"只登记不触发"，请求就会永远等下去。
+      if (o.manualTimers && ms >= (o.manualTimersMinMs === undefined ? 0 : o.manualTimersMinMs)) {
         const entry = { cb: cb, ms: ms, live: true }
         rec.timers.push(entry)
         return () => {
@@ -604,42 +608,48 @@ try {
   check('真实 ~/.dsh/dsh-xueqiu 未被触碰', sameJson(snapshotDir(REAL_XQ_HOME), baseline.realHome), JSON.stringify(snapshotDir(REAL_XQ_HOME)))
 
   /* ---------------------------------------------------------------- *
-   * 11. 今日盈亏（pnl.*）：无快照必拉 + 未配置语义 + 越界钳制 + 共用状态文件
+   * 11. 持仓 + 今日盈亏：**本地持仓 × 雪球行情**现算，账本只在同步时出现
    *
    * 用**带脚本 shell** 的新实例：假 shell 只回放预置 stdout（形如
-   * `body\n__HTTP__200`），于是"到底发了几次上游请求"变成可断言的确定量。
-   * 该实例用 manualTimers（定时器只登记、不自动触发），断言不会被
-   * "启动 3 秒补拉"打断；旧实例 stat 的定时器在这里显式回收。
+   * `body\n__HTTP__200`），于是"到底发了几次上游请求、打的是谁"变成可断言的确定量。
+   * 该实例用 manualTimers（定时器只登记、不自动触发）。
    * ---------------------------------------------------------------- */
-  section('[9] 今日盈亏 RPC（pnl.get / pnl.verify / pnl.config）')
+  section('[9] 持仓 RPC（positions.get / save / remove / sync + pnl.verify / config）')
   const PNL_DIR = path.join(SMOKE_HOME, 'dsh-ths-pnl') // 与旧插件 dsh-ths-pnl 同一路径
   const PNL_CONFIG = path.join(PNL_DIR, 'config.json')
-  const PNL_SNAPSHOT = path.join(PNL_DIR, 'snapshot.json')
+  const PNL_POSITIONS = path.join(PNL_DIR, 'positions.json')
   const readJsonFile = (p) => {
     try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (e) { return null }
   }
   const PNL_SESSIONS = ['pre', 'morning', 'lunch', 'afternoon', 'after', 'weekend']
 
-  // 回收旧实例的 effect：否则 stat 的启动补拉可能在断言中途触发、往 snapshot.json 写脏值
+  // 回收旧实例的 effect（保持与其它段一致的收尾习惯）
   for (const d of stat.rec.disposers) {
     try { d() } catch (e) { /* 回收失败不影响其它断言 */ }
   }
-  check('前置：旧实例的 effect 可回收（disposer 不抛错）', stat.rec.disposers.length >= 1, 'disposers=' + stat.rec.disposers.length)
 
   const PNL_ACCT = '{"error_code":"0","ex_data":{"common":[{"fund_key":"FK9","manualname":"组合九","brokername":"券商"}]}}'
   const PNL_SHARE = '{"error_code":"0","ex_data":{"data":[{"yk":1,"zf":0.1},{"yk":888.88,"zf":0.66}]}}'
+  const PNL_POS = '{"error_code":"0","ex_data":{"upload_time":"1792045716000","money_remain":"4074.39","total_value":"130466.00","total_asset":"134540.39","position_rate":"0.9697","position":[{"code":"600519","name":"贵州茅台","count":"100","cost":"1201.30","price":"1304.66","value":"130466.00"}]}}'
+  const XQ_QUOTE = '{"data":{"items":[{"quote":{"symbol":"SH600519","name":"贵州茅台","current":1304.66,"percent":4.37,"chg":54.66,"last_close":1250.00}},{"quote":{"symbol":"SZ000001","name":"平安银行","current":12.18,"percent":1.50,"chg":0.18,"last_close":12.00}}]}}'
+  const XQ_SEED = 'HTTP/2 200\nset-cookie: xq_a_token=SEED;\nset-cookie: u=42;\n'
   const p = makeCtx({
     manualTimers: true,
+    // 闸门的 100ms 最小间隔要能真的走完，否则请求会卡在延时上（见 ctx.timeout 注释）
+    manualTimersMinMs: 1000,
     shellResponses: [
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 1 存 Cookie 后当场校验 → account_list
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 2 校验顺带取组合列表 → account_list
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 3 pnl.get：无快照 → 探 fund_key
-      { text: PNL_SHARE + '\n__HTTP__200' },  // 4 pnl.get：取今日盈亏
-      { text: PNL_SHARE + '\n__HTTP__200' },  // 5 pnl.get(force)
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 6 pnl.verify
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 7 pnl.verify → 组合列表
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 8 clear 后再存 Cookie → 校验
-      { text: PNL_ACCT + '\n__HTTP__200' },   // 9 校验顺带取组合列表
+      { text: XQ_SEED },                          // 1 行情 Cookie 播种（xueqiu.com/hq）
+      { text: XQ_QUOTE },                         // 2 positions.save → 补名称/现价
+      { text: XQ_QUOTE },                         // 3 positions.save(第二只) → 标的集合变了，重新取
+      { text: PNL_ACCT + '\n__HTTP__200' },       // 4 pnl.config 存 Cookie → 校验
+      { text: PNL_ACCT + '\n__HTTP__200' },       // 5 校验顺带取组合列表
+      { text: PNL_ACCT + '\n__HTTP__200' },       // 6 positions.sync → 探 fund_key
+      { text: PNL_POS + '\n__HTTP__200' },        // 7 positions.sync → stock_position
+      { text: PNL_SHARE + '\n__HTTP__200' },      // 8 positions.sync → 账户级今日盈亏
+      { text: '<h1>Nginx forbidden.</h1> <br/>request info: 1.2.3.4\n__HTTP__403' }, // 9 同步失败
+      { text: XQ_QUOTE },                         // 10 clear 后 get(force) → 绕缓存取行情
+      { text: PNL_ACCT + '\n__HTTP__200' },       // 11 clear 后再存 Cookie → 校验
+      { text: PNL_ACCT + '\n__HTTP__200' },       // 12 校验顺带取组合列表
     ],
   })
   plugin.apply(p.ctx)
@@ -647,80 +657,83 @@ try {
   // 越界时返回空串：断言照样失败，但不会把后面所有断言一起崩掉（smoke 里更好定位）
   const cmdAt = (i) => String(p.rec.shellRun[i] || '')
 
-  check('pnl 边界定时器挂在 ctx.effect 内，首次只排一个启动补拉（3000ms）', p.rec.timers.length === 1 && p.rec.timers[0].ms === 3000 && p.rec.disposers.length >= 1, 'timers=' + JSON.stringify(p.rec.timers.map((t) => t.ms)) + ' disposers=' + p.rec.disposers.length)
+  check('宿主侧**不再挂盈亏定时器**（60s 账本心跳与 3s 启动补拉全删了）',
+    !p.rec.effectLabels.some((l) => l.indexOf('盈亏') >= 0) && p.rec.timers.every((t) => t.ms < 1000),
+    'effects=' + JSON.stringify(p.rec.effectLabels) + ' timers=' + JSON.stringify(p.rec.timers.map((t) => t.ms)))
 
-  // ---- 未配置：不请求上游、字段齐全 ----
-  const pnlIdle = jsonOf(await rpcP({ action: 'pnl.get' }))
-  check('未配置：pnl.get → 200 + ok:true + configured:false', pnlIdle && pnlIdle.ok === true && pnlIdle.data && pnlIdle.data.configured === false, JSON.stringify(pnlIdle))
-  check('未配置：pnl_yk / pnl_pct / updated_at 为 null、error 为空串', Boolean(pnlIdle && pnlIdle.data) && pnlIdle.data.pnl_yk === null && pnlIdle.data.pnl_pct === null && pnlIdle.data.updated_at === null && pnlIdle.data.error === '', JSON.stringify(pnlIdle && pnlIdle.data))
-  check('未配置：poll_ms 回退默认 60 秒、next_poll_ms 正数', Boolean(pnlIdle && pnlIdle.data) && pnlIdle.data.poll_ms === 60000 && pnlIdle.data.next_poll_ms > 0, JSON.stringify(pnlIdle && pnlIdle.data))
+  // ---- 没有任何凭据：本地持仓照样能取（这就是这次改造的核心）----
+  const posIdle = jsonOf(await rpcP({ action: 'positions.get' }))
+  check('未录持仓：positions.get → ok:true / configured:true / rows:[]', Boolean(posIdle && posIdle.ok === true && posIdle.data) && posIdle.data.configured === true && sameJson(posIdle.data.rows, []), JSON.stringify(posIdle))
+  check('未录持仓：合计全 null、poll_ms=30000、session 合法', Boolean(posIdle && posIdle.data) && posIdle.data.totals.value === null && posIdle.data.totals.day_profit === null && posIdle.data.poll_ms === 30000 && PNL_SESSIONS.indexOf(posIdle.data.session) >= 0, JSON.stringify(posIdle && posIdle.data))
+  check('未录持仓：零上游请求', p.rec.shellRun.length === 0, JSON.stringify(p.rec.shellRun))
 
-  const pnlIdleForce = jsonOf(await rpcP({ action: 'pnl.get', args: { force: true } }))
-  check('未配置：force 也拉不动（没有 Cookie 可用），仍 configured:false', Boolean(pnlIdleForce && pnlIdleForce.data) && pnlIdleForce.data.configured === false, JSON.stringify(pnlIdleForce))
+  // ---- 手工录入：一次行情请求，回传派生值 ----
+  const posAdd = jsonOf(await rpcP({ action: 'positions.save', args: { row: { code: '600519', qty: 100, cost: 1201.3 } } }))
+  check('positions.save → ok:true + 1 行', Boolean(posAdd && posAdd.ok === true && posAdd.data) && posAdd.data.rows.length === 1, JSON.stringify(posAdd))
+  check('名称由行情自动补全、现价/市值/盈亏现算', Boolean(posAdd && posAdd.data) && posAdd.data.rows[0].name === '贵州茅台' && posAdd.data.rows[0].price === 1304.66 && posAdd.data.rows[0].value === 130466 && posAdd.data.rows[0].day_profit === 5466, JSON.stringify(posAdd && posAdd.data && posAdd.data.rows[0]))
+  check('行情走雪球 batch/quote（先播种 Cookie 再取数）', p.rec.shellRun.length === 2 && cmdAt(0).indexOf('xueqiu.com/hq') >= 0 && cmdAt(1).indexOf('batch/quote.json') >= 0, JSON.stringify(p.rec.shellRun))
+  check('positions.json 落盘 schema=4，只存输入字段', (readJsonFile(PNL_POSITIONS) || {}).schema === 4 && sameJson(Object.keys((readJsonFile(PNL_POSITIONS) || {}).rows[0]).sort(), ['code', 'cost', 'name', 'qty']), JSON.stringify(readJsonFile(PNL_POSITIONS)))
 
-  const pnlVerifyIdle = jsonOf(await rpcP({ action: 'pnl.verify' }))
-  check('未配置：pnl.verify → configured:false / valid:false / portfolios:[]', Boolean(pnlVerifyIdle && pnlVerifyIdle.data) && pnlVerifyIdle.data.configured === false && pnlVerifyIdle.data.valid === false && sameJson(pnlVerifyIdle.data.portfolios, []), JSON.stringify(pnlVerifyIdle && pnlVerifyIdle.data))
-  check('未配置：pnl.verify 给可读中文原因', Boolean(pnlVerifyIdle && pnlVerifyIdle.data) && pnlVerifyIdle.data.error === '未配置 Cookie', String(pnlVerifyIdle && pnlVerifyIdle.data && pnlVerifyIdle.data.error))
-  check('未配置：pnl.verify 回传 5/3600 秒边界', Boolean(pnlVerifyIdle && pnlVerifyIdle.data) && pnlVerifyIdle.data.min_sec === 5 && pnlVerifyIdle.data.max_sec === 3600, JSON.stringify(pnlVerifyIdle && pnlVerifyIdle.data))
-  check('未配置：三个动作累计零上游请求（不白打账本）', p.rec.shellRun.length === 0, JSON.stringify(p.rec.shellRun))
+  const posAdd2 = jsonOf(await rpcP({ action: 'positions.save', args: { row: { code: '000001', name: '平安银行', qty: 500, cost: 11 } } }))
+  check('加第二只：合计按逐行取整后相加', Boolean(posAdd2 && posAdd2.data) && posAdd2.data.totals.value === 130466 + 6090 && posAdd2.data.totals.day_profit === 5466 + 90, JSON.stringify(posAdd2 && posAdd2.data && posAdd2.data.totals))
 
-  // ---- pollSec 钳制 ----
+  // ---- 行情 10 秒缓存：同一批标的的连续 get 不再打上游 ----
+  const before = p.rec.shellRun.length
+  const posCached = jsonOf(await rpcP({ action: 'positions.get' }))
+  check('同批标的的第二次 get 命中行情缓存（0 新请求）', p.rec.shellRun.length === before, `${p.rec.shellRun.length} vs ${before}`)
+  check('缓存命中也返回完整视图', Boolean(posCached && posCached.data) && posCached.data.rows.length === 2, JSON.stringify(posCached && posCached.data && posCached.data.rows.length))
+
+  // ---- pollSec 钳制 + 落盘 ----
   const cfgBig = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 99999 } }))
   check('pnl.config：pollSec 超上限 → 夹到 3600 秒（不报错）', Boolean(cfgBig && cfgBig.data) && cfgBig.ok === true && cfgBig.data.poll_ms === 3600000 && cfgBig.data.poll_sec === 3600, JSON.stringify(cfgBig))
   const cfgSmall = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 1 } }))
   check('pnl.config：pollSec 低于下限 → 夹到 5 秒', Boolean(cfgSmall && cfgSmall.data) && cfgSmall.data.poll_ms === 5000 && cfgSmall.data.poll_sec === 5, JSON.stringify(cfgSmall))
-  check('pnl.config：回传 min_sec / max_sec = 5 / 3600', Boolean(cfgSmall && cfgSmall.data) && cfgSmall.data.min_sec === 5 && cfgSmall.data.max_sec === 3600, JSON.stringify(cfgSmall && cfgSmall.data))
   const cfgBad = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 'abc' } }))
   check('pnl.config：pollSec 非数字 → ok:false + 精确中文提示', Boolean(cfgBad) && cfgBad.ok === false && cfgBad.error === '刷新间隔请填 5–3600 之间的秒数', JSON.stringify(cfgBad))
   const cfgEmpty = jsonOf(await rpcP({ action: 'pnl.config', args: {} }))
   check('pnl.config：空 patch → ok:false（没有可保存的字段）', Boolean(cfgEmpty) && cfgEmpty.ok === false && cfgEmpty.error === '没有可保存的字段', JSON.stringify(cfgEmpty))
-  const cfgJunk = jsonOf(await rpcP({ action: 'pnl.config', args: { pollSec: 60, 无关字段: { x: 1 } } }))
-  check('pnl.config：多余字段被忽略（不因未知字段抛错）', Boolean(cfgJunk) && cfgJunk.ok === true && cfgJunk.data.poll_ms === 60000, JSON.stringify(cfgJunk))
-  check('pollSec 落盘为 config.json 的秒数（与旧插件字段名一致）', (readJsonFile(PNL_CONFIG) || {}).pollSec === 60, JSON.stringify(readJsonFile(PNL_CONFIG)))
-  check('pollSec 的写入同样走 $DSH_HOME/dsh-ths-pnl（共用状态文件）', fs.existsSync(PNL_CONFIG) && fs.realpathSync(PNL_DIR) === fs.realpathSync(path.join(SMOKE_HOME, 'dsh-ths-pnl')))
+  check('pollSec 落盘为 config.json 的秒数', (readJsonFile(PNL_CONFIG) || {}).pollSec === 5, JSON.stringify(readJsonFile(PNL_CONFIG)))
+  check('状态文件落在 $DSH_HOME/dsh-ths-pnl（与旧插件同目录）', fs.existsSync(PNL_CONFIG) && fs.realpathSync(PNL_DIR) === fs.realpathSync(path.join(SMOKE_HOME, 'dsh-ths-pnl')))
 
-  // ---- 存 Cookie（先写一个"脏"Cookie，验证规整 + 当场校验）----
+  // ---- 存 Cookie：只服务「从账本同步」 ----
+  const runBeforeCfg = p.rec.shellRun.length
   const cfgSave = jsonOf(await rpcP({ action: 'pnl.config', args: { cookie: '  userid=abc ;\n  token=T1  ' } }))
   check('pnl.config：存 Cookie → ok:true + configured:true', Boolean(cfgSave && cfgSave.data) && cfgSave.ok === true && cfgSave.data.configured === true, JSON.stringify(cfgSave))
-  check('pnl.config：当场校验 → valid:true + 组合下拉（name 用 manualname）', Boolean(cfgSave && cfgSave.data) && cfgSave.data.valid === true && sameJson(cfgSave.data.portfolios, [{ fund_key: 'FK9', name: '组合九' }]), JSON.stringify(cfgSave && cfgSave.data))
+  check('pnl.config：当场校验 → valid:true + 组合下拉', Boolean(cfgSave && cfgSave.data) && cfgSave.data.valid === true && sameJson(cfgSave.data.portfolios, [{ fund_key: 'FK9', name: '组合九' }]), JSON.stringify(cfgSave && cfgSave.data))
   check('pnl.config：Cookie 被 normalizeCookie 规整后落盘', (readJsonFile(PNL_CONFIG) || {}).cookie === 'userid=abc; token=T1', JSON.stringify((readJsonFile(PNL_CONFIG) || {}).cookie))
-  check('pnl.config：校验用最小请求头打 account_list /2 次', p.rec.shellRun.length === 2 && cmdAt(0).indexOf('account/v1/account_list') >= 0 && cmdAt(0).indexOf('Referer') < 0, '实际 ' + p.rec.shellRun.length)
-  check('pnl.config：Cookie 头里是规整后的 userid（不是 pex_userid）', cmdAt(0).indexOf('userid=abc') >= 0 && cmdAt(0).indexOf('pex_userid') < 0, cmdAt(0))
+  check('pnl.config：校验打 account_list 2 次、最小请求头', p.rec.shellRun.length === runBeforeCfg + 2 && cmdAt(runBeforeCfg).indexOf('account/v1/account_list') >= 0 && cmdAt(runBeforeCfg).indexOf('Referer') < 0, '实际 ' + (p.rec.shellRun.length - runBeforeCfg))
+  check('pnl.config：Cookie 头里是规整后的 userid（不是 pex_userid）', cmdAt(runBeforeCfg).indexOf('userid=abc') >= 0 && cmdAt(runBeforeCfg).indexOf('pex_userid') < 0, cmdAt(runBeforeCfg))
+  check('存 Cookie **不触碰**本地持仓', (readJsonFile(PNL_POSITIONS) || {}).rows.length === 2)
 
-  // ---- 核心路径：磁盘上没有快照 → 必须真的拉一次（否则首屏永远空白）----
-  check('前置：磁盘上还没有 snapshot.json（"无快照必拉"才测得到）', !fs.existsSync(PNL_SNAPSHOT))
-  const pnlFirst = jsonOf(await rpcP({ action: 'pnl.get' }))
-  check('无快照：pnl.get 真的打了上游（探 fund_key + 取数，共 2 次）', p.rec.shellRun.length === 4, '实际 ' + p.rec.shellRun.length)
-  check('无快照：第 1 次是 account_list（最小头）', cmdAt(2).indexOf('account/v1/account_list') >= 0 && cmdAt(2).indexOf('Referer') < 0, cmdAt(2))
-  check('无快照：第 2 次是 time_share 且带探到的 fund_key', cmdAt(3).indexOf('asset/v1/time_share') >= 0 && cmdAt(3).indexOf('fund_key=FK9') >= 0, cmdAt(3))
-  check('pnl.get：取最后一个采样点的金额与百分比', Boolean(pnlFirst && pnlFirst.data) && pnlFirst.data.pnl_yk === 888.88 && pnlFirst.data.pnl_pct === 0.66, JSON.stringify(pnlFirst && pnlFirst.data))
-  check('pnl.get：yk_field / configured / error / token_expired', Boolean(pnlFirst && pnlFirst.data) && pnlFirst.data.yk_field === 'yk' && pnlFirst.data.configured === true && pnlFirst.data.error === '' && pnlFirst.data.token_expired === false, JSON.stringify(pnlFirst && pnlFirst.data))
-  check('pnl.get：session ∈ 六态、frozen:false（刚拉完）、updated_at 是 ISO', Boolean(pnlFirst && pnlFirst.data) && PNL_SESSIONS.indexOf(pnlFirst.data.session) >= 0 && pnlFirst.data.frozen === false && /^\d{4}-\d{2}-\d{2}T/.test(String(pnlFirst.data.updated_at)), JSON.stringify(pnlFirst && pnlFirst.data))
-  check('sanitize 原样过 pnl_yk（number）/ next_poll_ms（number）', Boolean(pnlFirst && pnlFirst.data) && typeof pnlFirst.data.pnl_yk === 'number' && pnlFirst.data.pnl_yk === 888.88 && typeof pnlFirst.data.next_poll_ms === 'number', JSON.stringify(pnlFirst && pnlFirst.data))
-  check('pnl.get 字段名与契约完全一致（不多不少）', Boolean(pnlFirst && pnlFirst.data) && sameJson(Object.keys(pnlFirst.data).sort(), ['configured', 'error', 'frozen', 'next_poll_ms', 'pnl_pct', 'pnl_yk', 'poll_ms', 'session', 'token_expired', 'updated_at', 'yk_field']), JSON.stringify(Object.keys((pnlFirst && pnlFirst.data) || {})))
-  check('探测到的 fund_key 回写 config.json（下次不用再探）', (readJsonFile(PNL_CONFIG) || {}).fundKey === 'FK9', JSON.stringify(readJsonFile(PNL_CONFIG)))
-  check('快照落盘 snapshot.json，fetched_reason=route', (readJsonFile(PNL_SNAPSHOT) || {}).pnl_yk === 888.88 && (readJsonFile(PNL_SNAPSHOT) || {}).fetched_reason === 'route', JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
-  check('快照带 sessionDate / closeDate 标记位（判定"今天是否拉过"）', typeof (readJsonFile(PNL_SNAPSHOT) || {}).sessionDate === 'string', JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
+  // ---- 从账本同步：只在点了这个动作时才打账本 ----
+  const runBeforeSync = p.rec.shellRun.length
+  const syncOk = jsonOf(await rpcP({ action: 'positions.sync', args: {} }))
+  check('positions.sync → ok:true', Boolean(syncOk && syncOk.ok === true && syncOk.data) && syncOk.data.ok === true, JSON.stringify(syncOk))
+  check('同步打 3 次账本（探组合 + 持仓 + 账户盈亏）', p.rec.shellRun.length === runBeforeSync + 3, '实际 ' + (p.rec.shellRun.length - runBeforeSync))
+  check('同步请求顺序：account_list → stock_position → time_share',
+    cmdAt(runBeforeSync).indexOf('account_list') >= 0 && cmdAt(runBeforeSync + 1).indexOf('stock_position') >= 0 && cmdAt(runBeforeSync + 2).indexOf('time_share') >= 0,
+    JSON.stringify(p.rec.shellRun.slice(runBeforeSync)))
+  check('同步报告：账本的 count/cost 进了本地', (readJsonFile(PNL_POSITIONS) || {}).rows.some((r) => r.code === '600519' && r.qty === 100 && r.cost === 1201.3), JSON.stringify(readJsonFile(PNL_POSITIONS)))
+  check('同步写入 cloud.synced_at / summary / account', Boolean(syncOk && syncOk.data && syncOk.data.view && syncOk.data.view.cloud) && typeof syncOk.data.view.cloud.synced_at === 'string' && syncOk.data.view.cloud.summary.total_value === 130466 && syncOk.data.view.cloud.account.pnl_yk === 888.88, JSON.stringify(syncOk && syncOk.data && syncOk.data.view && syncOk.data.view.cloud))
+  check('同步后派生值仍由行情现算（不搬账本的 price/value）', Boolean(syncOk && syncOk.data && syncOk.data.view) && syncOk.data.view.rows.every((r) => r.price === 1304.66 || r.price === 12.18), JSON.stringify((syncOk && syncOk.data && syncOk.data.view.rows) || []))
 
-  // ---- force：跳过 shouldFetch，强制再拉一次 ----
-  const pnlForce = jsonOf(await rpcP({ action: 'pnl.get', args: { force: true } }))
-  check('force:true 跳过 shouldFetch 判定：又打了一次上游', p.rec.shellRun.length === 5, '实际 ' + p.rec.shellRun.length)
-  check('force 那次已知道 fund_key，只打 time_share（不再探组合）', cmdAt(4).indexOf('asset/v1/time_share') >= 0, cmdAt(4))
-  check('force 那次 fetched_reason=force 落盘', (readJsonFile(PNL_SNAPSHOT) || {}).fetched_reason === 'force', JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
-  check('force 回包仍是契约字段齐全的成功响应', Boolean(pnlForce && pnlForce.data) && pnlForce.data.pnl_yk === 888.88 && pnlForce.data.frozen === false, JSON.stringify(pnlForce && pnlForce.data))
+  // ---- 同步失败：一个字段都不碰本地持仓 ----
+  const rowsBeforeFail = JSON.stringify((readJsonFile(PNL_POSITIONS) || {}).rows)
+  const syncFail = jsonOf(await rpcP({ action: 'positions.sync', args: {} }))
+  check('同步失败：RPC 仍成功、data.ok=false（失败只属于同步）', Boolean(syncFail && syncFail.ok === true && syncFail.data) && syncFail.data.ok === false, JSON.stringify(syncFail && syncFail.data && syncFail.data.error))
+  check('同步失败：本地持仓行完全没变', JSON.stringify((readJsonFile(PNL_POSITIONS) || {}).rows) === rowsBeforeFail)
+  check('同步失败：当日盈亏照常算出来', Boolean(syncFail && syncFail.data && syncFail.data.view) && syncFail.data.view.totals.day_profit !== null, JSON.stringify(syncFail && syncFail.data && syncFail.data.view && syncFail.data.view.totals))
+  check('同步失败：403 被标成 blocked（原因不唯一）', (readJsonFile(PNL_POSITIONS) || {}).cloud.blocked === true, JSON.stringify((readJsonFile(PNL_POSITIONS) || {}).cloud))
 
-  // ---- verify：用存好的 Cookie 打一次 account_list ----
-  const pnlVerify = jsonOf(await rpcP({ action: 'pnl.verify' }))
-  check('pnl.verify：valid:true + 组合列表（name 回退链）', Boolean(pnlVerify && pnlVerify.data) && pnlVerify.data.valid === true && sameJson(pnlVerify.data.portfolios, [{ fund_key: 'FK9', name: '组合九' }]), JSON.stringify(pnlVerify && pnlVerify.data))
-  check('pnl.verify：fundKey 回传存盘值 / poll_ms 回传 60000', Boolean(pnlVerify && pnlVerify.data) && pnlVerify.data.fundKey === 'FK9' && pnlVerify.data.poll_ms === 60000, JSON.stringify(pnlVerify && pnlVerify.data))
-  check('pnl.verify：又发了 2 次 account_list（校验 + 取组合）', p.rec.shellRun.length === 7, '实际 ' + p.rec.shellRun.length)
-
-  // ---- clear：清 Cookie 但**保留 snapshot**（最后已知盈亏不该被抹掉）----
+  // ---- clear：清凭据但**保留本地持仓**（它是主数据，跟凭据是两回事）----
+  const runBeforeClear = p.rec.shellRun.length
   const cfgClear = jsonOf(await rpcP({ action: 'pnl.config', args: { clear: true } }))
   check('pnl.config clear：configured:false / valid:false / portfolios:[]', Boolean(cfgClear && cfgClear.data) && cfgClear.ok === true && cfgClear.data.configured === false && cfgClear.data.valid === false && sameJson(cfgClear.data.portfolios, []), JSON.stringify(cfgClear && cfgClear.data))
-  check('pnl.config clear：不请求上游', p.rec.shellRun.length === 7, '实际 ' + p.rec.shellRun.length)
+  check('pnl.config clear：不请求上游', p.rec.shellRun.length === runBeforeClear, '实际 ' + (p.rec.shellRun.length - runBeforeClear))
   check('pnl.config clear：Cookie 已清空', (readJsonFile(PNL_CONFIG) || {}).cookie === '', JSON.stringify((readJsonFile(PNL_CONFIG) || {}).cookie))
-  check('pnl.config clear：snapshot.json 被保留（最后已知盈亏仍在）', (readJsonFile(PNL_SNAPSHOT) || {}).pnl_yk === 888.88, JSON.stringify(readJsonFile(PNL_SNAPSHOT)))
+  check('pnl.config clear：本地持仓保留（2 行）', (readJsonFile(PNL_POSITIONS) || {}).rows.length === 2, JSON.stringify((readJsonFile(PNL_POSITIONS) || {}).rows.length))
+  const posAfterClear = jsonOf(await rpcP({ action: 'positions.get', args: { force: true } }))
+  check('清凭据后当日盈亏照常（本地持仓 × 行情）', Boolean(posAfterClear && posAfterClear.data) && posAfterClear.data.totals.day_profit === 5466 + 90, JSON.stringify(posAfterClear && posAfterClear.data && posAfterClear.data.totals))
 
   // ---- 再存一次：确认 clear 之后能重新配置 ----
   const cfgSave2 = jsonOf(await rpcP({ action: 'pnl.config', args: { cookie: 'userid=abc;  token=T2\n', pollSec: 30 } }))
@@ -728,15 +741,16 @@ try {
   check('pnl.config：Cookie + pollSec 一次写入都生效', (readJsonFile(PNL_CONFIG) || {}).cookie === 'userid=abc; token=T2' && (readJsonFile(PNL_CONFIG) || {}).pollSec === 30, JSON.stringify(readJsonFile(PNL_CONFIG)))
   check('pnl.config：回传生效的 poll_sec（30）', Boolean(cfgSave2 && cfgSave2.data) && cfgSave2.data.poll_sec === 30 && cfgSave2.data.poll_ms === 30000, JSON.stringify(cfgSave2 && cfgSave2.data))
 
-  // ---- 收尾：依赖面 + 定时器可回收 ----
+  // ---- 删除 + 参数校验 ----
+  const posDel = jsonOf(await rpcP({ action: 'positions.remove', args: { code: '000001' } }))
+  check('positions.remove → 剩 1 行', Boolean(posDel && posDel.data) && posDel.data.rows.length === 1, JSON.stringify(posDel && posDel.data && posDel.data.rows.map((r) => r.code)))
+  const posDelBad = jsonOf(await rpcP({ action: 'positions.remove', args: { code: '不存在' } }))
+  check('删不存在的代码 → ok:false + 可读原因', Boolean(posDelBad) && posDelBad.ok === false && String(posDelBad.error).indexOf('没有') >= 0, JSON.stringify(posDelBad))
+
+  // ---- 收尾：依赖面 ----
   const pnlGot = []
   for (const n of p.rec.getNames) if (pnlGot.indexOf(n) < 0) pnlGot.push(n)
-  check('pnl 侧 ctx.get 依赖面 ⊆ {shell, fs, sandboxPolicy}', pnlGot.length > 0 && pnlGot.every((n) => ['shell', 'fs', 'sandboxPolicy'].indexOf(n) >= 0), JSON.stringify(pnlGot))
-  for (const d of p.rec.disposers) {
-    try { d() } catch (e) { /* 已回收 */ }
-  }
-  check('pnl 边界定时器可回收（disposer 停掉启动补拉 3000ms）', p.rec.timerStops.indexOf(3000) >= 0, JSON.stringify(p.rec.timerStops))
-  check('无真实定时器泄漏（manualTimers 下 pnl 只用登记式定时器）', p.rec.timers.every((t) => t.live === false), JSON.stringify(p.rec.timers))
+  check('持仓/盈亏侧 ctx.get 依赖面 ⊆ {shell, fs, sandboxPolicy}', pnlGot.length > 0 && pnlGot.every((n) => ['shell', 'fs', 'sandboxPolicy'].indexOf(n) >= 0), JSON.stringify(pnlGot))
   check('全程没有真实 shell / 网络：所有命令都是 curl 命令行', p.rec.shellRun.length > 0 && p.rec.shellRun.every((c) => /^curl(\.exe)?\s/.test(c)), '共 ' + p.rec.shellRun.length + ' 条')
 } catch (e) {
   failures.push('未捕获异常: ' + String((e && e.stack) || e))

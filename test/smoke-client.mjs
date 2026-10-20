@@ -567,9 +567,28 @@ function safeResponder(url, body) {
   if (action === 'hot') return { ok: true, data: { market: 'cn', list: [] } }
   if (action === 'news') return { ok: true, data: { items: [] } }
   if (action === 'login.status') return { ok: true, data: { loggedIn: false } }
-  // [5c] 盈亏未配置：指数条行末的今日盈亏 chip 文案因此是确定的「今日盈亏 未配置」。
-  // 此前这条 action 落到默认分支（data={}），chip 会渲染成「今日 +0.00 (+0.00%)」——文案随实现漂移，不好断言。
-  if (action === 'pnl.get') return { ok: true, data: { configured: false } }
+  // [5c] 账本凭据未配置：只影响「持仓」tab 同步区的文案，不影响任何实时数字。
+  // 之前这条落到默认分支（data={}）会让 chip 渲染成「今日 +0.00」——文案随实现漂移，不好断言。
+  if (action === 'pnl.verify') return { ok: true, data: { configured: false, valid: false, error: '未配置 Cookie', portfolios: [], fundKey: '', cloud: null, poll_ms: 30000, min_sec: 5, max_sec: 3600 } }
+  if (action === 'pnl.config') return { ok: true, data: { ok: true, configured: true, valid: true, error: '', portfolios: [{ fund_key: 'FK1', name: '我的组合' }], fundKey: 'FK1', poll_ms: 30000, poll_sec: 30, min_sec: 5, max_sec: 3600 } }
+  // 持仓：宿主现算视图（本地持仓 × 行情）。三行分别覆盖：盈利（涨红）、亏损（跌绿）、已清仓（qty=0）。
+  if (action === 'positions.get') return {
+    ok: true,
+    data: {
+      configured: true,
+      rows: [
+        { code: '600519', name: '贵州茅台', qty: 100, cost: 1201.3, xq_symbol: 'SH600519', price: 1304.66, prev_close: 1250, day_pct: 4.37, day_profit: 5466, day_rate: 4.3728, value: 130466, cost_value: 120130, hold_profit: 10336, hold_rate: 8.604 },
+        { code: '159865', name: '养殖ETF', qty: 18400, cost: 0.543, xq_symbol: 'SZ159865', price: 0.509, prev_close: 0.522, day_pct: -2.49, day_profit: -239.2, day_rate: -2.4904, value: 9365.6, cost_value: 9991.2, hold_profit: -625.6, hold_rate: -6.2615 },
+        { code: '603866', name: '桃李面包', qty: 0, cost: null, xq_symbol: 'SH603866', price: 4.22, prev_close: null, day_pct: null, day_profit: 0, day_rate: 0, value: 0, cost_value: null, hold_profit: -771.18, hold_rate: null }
+      ],
+      totals: { held: 2, missing: 0, value: 139831.6, cost_value: 140121.2, day_profit: 5226.8, day_base: 134604.8, day_rate: 3.883, hold_profit: 8939.22, hold_rate: 6.3797 },
+      updated_at: '2026-10-20T02:00:00.000Z',
+      as_of: '2026-10-20T02:30:00.000Z',
+      session: 'after', in_session: false,
+      poll_ms: 30000, next_poll_ms: 60000,
+      cloud: null, migrated_from: null
+    }
+  }
   return { ok: true, data: {} }
 }
 
@@ -934,11 +953,11 @@ check('flush 后 (ui.get) 水合生效，面板渲染出 .xq-dock', () => {
   ok(hasClass(tree, 'xq-dock-body'), '缺 .xq-dock-body')
   ok(hasClass(tree, 'xq-dock-resize'), '缺 .xq-dock-resize（高度拖拽条）')
 })
-check('面板渲染出 5 个 tab 与搜索行', () => {
+check('面板渲染出 6 个 tab 与搜索行', () => {
   const tree = panelTree('second')
-  for (const needle of ['行情', '热榜', '搜索', '快讯', '盈亏']) ok(textHas(tree, needle), '缺 tab 文案 ' + needle)
+  for (const needle of ['行情', '热榜', '搜索', '快讯', '盈亏', '持仓']) ok(textHas(tree, needle), '缺 tab 文案 ' + needle)
   ok(hasClass(tree, 'xq-search-row'), '缺 .xq-search-row')
-  eq(classCount(tree, 'xq-tab'), 5, 'tab 数量')
+  eq(classCount(tree, 'xq-tab'), 6, 'tab 数量')
   return treeHosts(tree).length + ' 个宿主节点'
 })
 check('flush 期间请求全部指向 /xq-rpc（未出网）', () => {
@@ -961,7 +980,7 @@ check('flush 后 effect 里登记了轮询（ctx.interval）', () => {
 check('数据加载完成后复渲染仍稳定（不抛错、面板结构不变）', () => {
   const tree = panelTree('third')
   ok(hasClass(tree, 'xq-dock'), '第三次渲染丢了 .xq-dock')
-  eq(classCount(tree, 'xq-tab'), 5, 'tab 数量')
+  eq(classCount(tree, 'xq-tab'), 6, 'tab 数量')
   return treeHosts(tree).length + ' 个宿主节点'
 })
 
@@ -977,15 +996,24 @@ const clientSource = (() => {
   }
 })()
 
-check("A_PNL_* 三个 action 常量值正确（'pnl.get'/'pnl.verify'/'pnl.config'）", () => {
-  const want = ["A_PNL_GET = 'pnl.get'", "A_PNL_VERIFY = 'pnl.verify'", "A_PNL_CONFIG = 'pnl.config'"]
+check("持仓/账本 action 常量值正确（positions.* + pnl.verify/pnl.config）", () => {
+  const want = [
+    "A_POSITIONS_GET = 'positions.get'",
+    "A_POSITIONS_SAVE = 'positions.save'",
+    "A_POSITIONS_REMOVE = 'positions.remove'",
+    "A_POSITIONS_SYNC = 'positions.sync'",
+    "A_PNL_VERIFY = 'pnl.verify'",
+    "A_PNL_CONFIG = 'pnl.config'",
+  ]
   const miss = want.filter((s) => !clientSource.includes(s))
   ok(miss.length === 0, '产物里找不到：' + miss.join(' | '))
-  return want.length + ' 个常量'
+  // 旧的 pnl.get 必须彻底消失：它是「60 秒账本心跳」的入口，留着就说明还有代码在打账本
+  ok(!clientSource.includes("A_PNL_GET = 'pnl.get'"), '产物里仍有 A_PNL_GET（账本心跳时代的入口）')
+  return want.length + ' 个常量（pnl.get 已移除）'
 })
-check('PNL_POLL_FALLBACK_MS = 60000（轮询兜底退避）', () => {
-  ok(clientSource.includes('PNL_POLL_FALLBACK_MS = 60000'), '产物里找不到 PNL_POLL_FALLBACK_MS = 60000')
-  return '60000'
+check('POSITIONS_POLL_FALLBACK_MS = 30000（行情轮询兜底退避）', () => {
+  ok(clientSource.includes('POSITIONS_POLL_FALLBACK_MS = 30000'), '产物里找不到 POSITIONS_POLL_FALLBACK_MS = 30000')
+  return '30000'
 })
 check('盈亏轮询在页面恢复前台时立即重取', () => {
   ok(clientSource.includes('function onVisibility()'), '缺 PNL onVisibility')
@@ -1010,29 +1038,29 @@ check('手动刷新绕过雪球报价短 TTL', () => {
   ok(clientSource.includes('refreshMarket(true)'), '手动刷新未传 force')
   return 'force=true'
 })
-check("PANEL_TABS 含 ['pnl','盈亏']，且前 4 项顺序与字面量未变", () => {
+check("PANEL_TABS 含 ['pnl','盈亏'] 与 ['positions','持仓']，且前 4 项顺序与字面量未变", () => {
   const line = clientSource.split('\n').find((l) => l.includes('const PANEL_TABS ='))
   ok(line, '产物里找不到 PANEL_TABS 定义行')
-  const ordered = ["['market', '行情']", "['hot', '热榜']", "['search', '搜索']", "['news', '快讯']", "['pnl', '盈亏']"]
+  const ordered = ["['market', '行情']", "['hot', '热榜']", "['search', '搜索']", "['news', '快讯']", "['pnl', '盈亏']", "['positions', '持仓']"]
   let at = -1
   for (const token of ordered) {
     const i = line.indexOf(token, at + 1)
     ok(i > at, 'PANEL_TABS 缺少或顺序不符：' + token + '（实际行：' + line.trim() + '）')
     at = i
   }
-  return '5 项，顺序正确'
+  return '6 项，顺序正确'
 })
 check('pnl 已接进 XQ_TABS / TAB_CTX（渲染分发不落回默认 tab）', () => {
   ok(/const XQ_TABS = \{[^}]*pnl: PnlTab[^}]*\}/.test(clientSource), 'XQ_TABS 未接 pnl: PnlTab')
   ok(/pnl: function \(\) \{\s*return \{\}/.test(clientSource), 'TAB_CTX 未提供 pnl（应为空上下文）')
   return 'XQ_TABS.pnl + TAB_CTX.pnl'
 })
-check('面板 tab 条文案顺序 = 行情/热榜/搜索/快讯/盈亏', () => {
+check('面板 tab 条文案顺序 = 行情/热榜/搜索/快讯/盈亏/持仓', () => {
   const tree = panelTree('second')
   const labels = treeHosts(tree)
     .filter((h) => classOf(h).split(/\s+/).includes('xq-tab'))
     .map((h) => treeText(h))
-  eqJson(labels, ['行情', '热榜', '搜索', '快讯', '盈亏'], 'tab 文案顺序')
+  eqJson(labels, ['行情', '热榜', '搜索', '快讯', '盈亏', '持仓'], 'tab 文案顺序')
 })
 check('头部 xq-dock-head 里渲染出常驻盈亏 chip', () => {
   const tree = panelTree('second')
@@ -1049,6 +1077,72 @@ check('样式契约：CSS 里有 .xq-pnl-* 规则且不含模板字面量标记'
   ok(css.includes('.xq-pnl-amt'), 'CSS 里没有 .xq-pnl-amt')
   ok(!css.includes('`') && !css.includes('${'), 'CSS 里出现反引号或 ${（#include-styles 内联会炸）')
   return 'chip + amt + ' + css.length + ' 字符'
+})
+
+// ---------------------------------------------------------------- 5b2. 持仓接线契约
+// 「持仓」tab（同花顺账本 stock_position）：静态契约（action 常量 / XQ_TABS / TAB_CTX / CSS）。
+section('[5b2] 持仓接线契约（action 常量 / XQ_TABS / TAB_CTX / 样式）')
+check("持仓 action 常量存在且为 'positions.get'", () => {
+  ok(clientSource.includes('A_POSITIONS_GET'), '产物里找不到 A_POSITIONS_GET')
+  ok(clientSource.includes("'positions.get'"), "产物里找不到字面量 'positions.get'")
+  return "A_POSITIONS_GET = 'positions.get'"
+})
+check('positions 已接进 XQ_TABS / TAB_CTX（渲染分发不落回默认 tab）', () => {
+  ok(/const XQ_TABS = \{[^}]*positions: PositionsTab[^}]*\}/.test(clientSource), 'XQ_TABS 未接 positions: PositionsTab')
+  ok(/positions: function \(\) \{\s*return \{\}/.test(clientSource), 'TAB_CTX 未提供 positions（应为空上下文）')
+  return 'XQ_TABS.positions + TAB_CTX.positions'
+})
+check('样式契约：CSS 里有 .xq-pos-* 规则且不含模板字面量标记', () => {
+  const tag = styleTags(main.dom)[main.styleAfter - 1]
+  const css = String(tag.textContent || '')
+  ok(css.includes('.xq-pos-grid'), 'CSS 里没有 .xq-pos-grid')
+  ok(css.includes('.xq-pos-cost'), 'CSS 里没有 .xq-pos-cost')
+  // 涨跌两列依赖：单元容器（两行右对齐）+ 涨跌单元 + 已清仓压暗
+  ok(css.includes('.xq-pos-chg') && css.includes('.xq-pos-cell'), 'CSS 里没有涨跌单元规则（.xq-pos-chg / .xq-pos-cell）')
+  ok(css.includes('.xq-pos-cleared'), 'CSS 里没有已清仓行规则 .xq-pos-cleared')
+  ok(!css.includes('`') && !css.includes('${'), 'CSS 里出现反引号或 ${（#include-styles 内联会炸）')
+  return 'grid + cost + 涨跌单元 + 已清仓 + ' + css.length + ' 字符'
+})
+
+// 层叠契约：**类加对了 ≠ 颜色生效**。真实事故：`.xq-pos-num`（声明了 color）与 `.xq-up/.xq-down` 都是
+// 单类选择器、优先级相同，而 `.xq-pos-num` 在 styles.css 里更靠后 → 「后写的赢」把涨跌色盖掉，
+// 界面上全是默认深色。只断言「className 含 xq-up」的检查抓不到这种 bug，所以这里判定
+// 「最终生效的 color 是哪条声明」—— 判定实现自身先用一份最小 CSS 反向对照过。
+function cssColorWinner(cssText, classList) {
+  const want = new Set(classList)
+  // **先剥注释**：注释里的反例代码（本插件就写了「必须像 .xq-pos-chg.xq-up 那样…」）会跟着后面的规则
+  // 一起被正则吞进选择器文本，含空格而被跳过 —— 那会让被注释提到的规则整条消失，测试绿得不明不白。
+  const text = String(cssText).replace(/\/\*[\s\S]*?\*\//g, '')
+  let best = null
+  const ruleRe = /([^{}]+)\{([^{}]*)\}/g
+  let m
+  while ((m = ruleRe.exec(text)) !== null) {
+    const color = (String(m[2]).match(/(?:^|;)\s*color\s*:\s*([^;]+)/) || [])[1]
+    if (!color) continue
+    for (const raw of String(m[1]).split(',')) {
+      const sel = raw.trim()
+      // 只判「单个纯类复合选择器」（本插件的配色都是这种形态）：跳过后代选择器 / @ 规则 / 元素选择器
+      if (!sel || sel.indexOf(' ') >= 0 || sel.indexOf('@') >= 0) continue
+      const names = (sel.match(/\.[A-Za-z0-9_-]+/g) || []).map((t) => t.slice(1))
+      if (!names.length || names.some((n) => !want.has(n))) continue
+      // 优先级高的赢；相同优先级时后写的赢（用 >= 保留后者）
+      if (!best || names.length >= best.spec) best = { spec: names.length, color: color.trim(), sel: sel }
+    }
+  }
+  return best
+}
+check('涨跌颜色的层叠契约：最终生效的 color 必须是涨红跌绿（不只是 className 带 xq-up）', () => {
+  const tag = styleTags(main.dom)[main.styleAfter - 1]
+  const css = String(tag.textContent || '')
+  const selfTest = cssColorWinner('.xq-up{color:red}.xq-pos-num{color:black}', ['xq-pos-num', 'xq-up'])
+  ok(selfTest && selfTest.color === 'black', '层叠判定自身失效（相同优先级时应后写的赢）：' + JSON.stringify(selfTest))
+  const gain = cssColorWinner(css, ['xq-pos-r', 'xq-pos-num', 'xq-pos-chg', 'xq-up'])
+  const loss = cssColorWinner(css, ['xq-pos-r', 'xq-pos-num', 'xq-pos-chg', 'xq-down'])
+  const flat = cssColorWinner(css, ['xq-pos-r', 'xq-pos-num', 'xq-pos-chg', 'xq-flat'])
+  ok(gain && /state-error-primary/.test(gain.color), '盈利格的最终颜色不是「涨红」：' + JSON.stringify(gain))
+  ok(loss && /state-success-primary/.test(loss.color), '亏损格的最终颜色不是「跌绿」：' + JSON.stringify(loss))
+  ok(flat && /label-secondary/.test(flat.color), '持平格的最终颜色不是次要灰：' + JSON.stringify(flat))
+  return '涨 ' + gain.sel + ' / 跌 ' + loss.sel
 })
 
 // ---------------------------------------------------------------- 5c. 运行时 hook 契约
@@ -1110,12 +1204,13 @@ function groupHooks(passes) {
 }
 
 // 驱动序列：market → pnl → market → hot → search → news → pnl → news（第 1 步不点击，直接沿用 [5]
-// 第三次渲染的 tab）。覆盖全部 5 个 tab 组件，保证「每个 tab 都是独立组件实例」这件事对 5 个都成立。
+// 第三次渲染的 tab）。覆盖全部 6 个 tab 组件，保证「每个 tab 都是独立组件实例」这件事对 6 个都成立。
 // 每次都用**真实点击处理器**切 tab（走组件的 onClick → ui.set({tab})），再像 [5] 那样重跑槽位 render
 // 重走整棵 dock 树 —— 与 React 里 setState 触发的那次重渲染在「组件 body 会被重新执行」这点上等价。
 const TAB_STEPS = [
   { label: '行情', tab: 'market', click: false, comp: 'MarketTab' },
   { label: '盈亏', tab: 'pnl', click: true, comp: 'PnlTab' },
+  { label: '持仓', tab: 'positions', click: true, comp: 'PositionsTab' },
   { label: '行情', tab: 'market', click: true, comp: 'MarketTab' },
   { label: '热榜', tab: 'hot', click: true, comp: 'HotTab' },
   { label: '搜索', tab: 'search', click: true, comp: 'SearchTab' },
@@ -1207,9 +1302,80 @@ check('「盈亏」tab 由独立组件 ' + where('PnlTab') + ' 挂载（hooks �
   ok(recs.length > 0, '切到「盈亏」的 ' + pnlPasses.length + ' 次渲染里，没有任何一次是以 PnlTab 身份执行的组件调用 —— ' +
     'PnlTab 的 hook 被记到了父组件头上（dispatch 用了裸函数调用）；这 ' + pnlPasses.length + ' 次渲染出现的组件是 [' +
     [...new Set(pnlPasses.flatMap((p) => p.recs.map((r) => r.name)))].join(', ') + ']')
-  ok(recs[0].count >= 7, 'PnlTab 名下只记到 ' + recs[0].count + ' 个 hook（usePnlState 2 个 + 自己的 5 个，应 ≥ 7）')
+  ok(recs[0].count >= 6, 'PnlTab 名下只记到 ' + recs[0].count + ' 个 hook（usePnlState 2 个 + 自己的 4 个，应 ≥ 6）')
   return 'PnlTab 独立挂载，hook 序列 [' + recs[0].hooks.join(' ') + ']'
 })
+check('「持仓」tab 由独立组件 ' + where('PositionsTab') + ' 挂载（hooks 不落在 XueqiuPanel 头上）', () => {
+  tabPassesReady()
+  const passes = tabPasses.filter((p) => p.tab === 'positions')
+  const recs = passes.flatMap((p) => p.recs.filter((r) => r.name === 'PositionsTab'))
+  ok(recs.length > 0, '切到「持仓」的 ' + passes.length + ' 次渲染里，没有任何一次是以 PositionsTab 身份执行的组件调用 —— ' +
+    '它的 hook 被记到了父组件头上（dispatch 用了裸函数调用）；这 ' + passes.length + ' 次渲染出现的组件是 [' +
+    [...new Set(passes.flatMap((p) => p.recs.map((r) => r.name)))].join(', ') + ']')
+  ok(recs[0].count >= 3, 'PositionsTab 名下只记到 ' + recs[0].count + ' 个 hook（2 个 useState + 1 个 useEffect，应 ≥ 3）')
+  return 'PositionsTab 独立挂载，hook 序列 [' + recs[0].hooks.join(' ') + ']'
+})
+
+// 持仓表格的**内容**契约：真渲染出账本字段（成本价 = cost、股数 = count），
+// 而不是只断言「tab 存在」—— 上一次整合（盈亏）就是因为只测了 tab 存在，漏了字段口径。
+// 注意：PositionsTab 不在 effect 白名单（FLUSHABLE）里，必须显式跑它登记的订阅 effect，
+// 否则运行时永远停在 getState() 的初始值（data=null）→ 只会渲染「持仓加载中…」。
+{
+  let tree = panelTree('second')
+  tabButton(tree, '持仓').props.onClick()
+  let r = render(main, SLOT_PANEL, undefined)
+  const subs = r.effects.filter((e) => e.name === 'PositionsTab')
+  let subscribeError = ''
+  try { for (const e of subs) e.fn() } catch (err) { subscribeError = String((err && err.message) || err) }
+  await settle(8)                          // 等假的 positions.get 回来
+  r = render(main, SLOT_PANEL, undefined)   // 数据到了再渲染一次，拿到真表格
+  tree = r.tree
+  check('持仓 tab 渲染出可编辑的本地持仓表（成本价 / 股数 / 合计 / 两列盈亏）', () => {
+    ok(subs.length > 0, 'PositionsTab 没有登记订阅 effect（subscribe 的 useEffect 缺席）')
+    ok(subscribeError === '', '订阅 effect 抛错：' + subscribeError)
+    ok(textHas(tree, '成本价'), '缺「成本价」列头；实际文本 = ' + JSON.stringify(treeText(tree).slice(0, 200)))
+    ok(textHas(tree, '1201.30'), '缺成本价数值 1201.30')
+    ok(textHas(tree, '100'), '缺股数 100')
+    ok(textHas(tree, '贵州茅台'), '缺持仓名称')
+    // 工具行：持仓现在是「本地可编辑数据 + 手动同步」，所以是添加/同步/刷新三个入口
+    ok(textHas(tree, '添加持仓'), '缺「＋ 添加持仓」按钮')
+    ok(textHas(tree, '从账本同步'), '缺「从账本同步」按钮（唯一会打账本的入口）')
+    ok(textHas(tree, '刷新行情'), '缺「刷新行情」按钮')
+    ok(textHas(tree, '编辑') && textHas(tree, '删除'), '每行缺「编辑 / 删除」操作')
+    // 合计四格：全是本地持仓 × 行情能算出来的量，不再依赖账本的资产口径（总资产/可用资金）
+    ok(textHas(tree, '今日盈亏') && textHas(tree, '持仓市值') && textHas(tree, '持仓成本'), '缺合计四格标签')
+    ok(textHas(tree, '139,831.60'), '持仓市值合计 = Σ现值 139,831.60；实际 = ' + JSON.stringify(treeText(tree).slice(0, 200)))
+    ok(textHas(tree, '140,121.20'), '持仓成本合计 = Σ(成本价×股数) 140,121.20')
+    ok(textHas(tree, '5,226.80'), '今日盈亏合计 5,226.80')
+    // 两个盈亏列：当日盈亏 =（现价 − 昨收）× 股数、持仓盈亏 =（现价 − 成本价）× 股数，
+    // 金额与涨跌幅都要出，颜色按 A 股习惯「涨红跌绿」。
+    ok(textHas(tree, '当日盈亏'), '缺「当日盈亏」列头')
+    ok(textHas(tree, '持仓盈亏'), '缺「持仓盈亏」列头')
+    ok(textHas(tree, '+10,336.00') && textHas(tree, '+8.60%'), '持仓盈亏缺金额或涨跌幅（+10,336.00 / +8.60%）')
+    ok(textHas(tree, '+5,466.00') && textHas(tree, '+4.37%'), '当日盈亏缺金额或涨跌幅（+5,466.00 / +4.37%）')
+    const chgCells = treeHosts(tree).filter((h) => classOf(h).split(/\s+/).includes('xq-pos-chg'))
+    ok(chgCells.length === 6, '涨跌单元应为 3 行 × 2 列 = 6 个，实际 ' + chgCells.length)
+    const dayUpCell = chgCells.filter((h) => treeText(h).includes('+5,466.00'))[0]
+    ok(!!dayUpCell, '没找到当日盈亏单元（+5,466.00）')
+    ok(!!dayUpCell && String(dayUpCell.props.title || '').includes('昨收 1250.00'), '当日盈亏单元缺少「昨收」口径说明')
+    // 账本口径（pre_* 昨日盈亏）已经完全不参与计算了：悬停里也不该再出现
+    ok(!!dayUpCell && String(dayUpCell.props.title || '').indexOf('昨日盈亏') < 0, '悬停里不该再有账本的「昨日盈亏」（pre_* 已不参与计算）')
+    const upCell = chgCells.filter((h) => treeText(h).includes('+10,336.00'))[0]
+    ok(!!upCell && classOf(upCell).includes('xq-up'), '盈利的持仓盈亏单元应带 .xq-up（涨红）')
+    const dnCell = chgCells.filter((h) => treeText(h).includes('-625.60'))[0]
+    ok(!!dnCell && classOf(dnCell).includes('xq-down'), '亏损的持仓盈亏单元应带 .xq-down（跌绿）')
+    const dayDn = chgCells.filter((h) => treeText(h).includes('-239.20'))[0]
+    ok(!!dayDn && classOf(dayDn).includes('xq-down'), '当日下跌单元应带 .xq-down')
+    // 已清仓（qty=0）：当日盈亏无意义 → `--`；收益率无意义 → 只显示已实现金额。
+    ok(textHas(tree, '已清仓'), 'qty=0 的行应标「已清仓」')
+    ok(chgCells.some((h) => treeText(h) === '-771.18'), '已清仓行的持仓盈亏应只显示金额 -771.18（不带涨跌幅）')
+    ok(chgCells.filter((h) => treeText(h) === '--').length === 1, '已清仓行的当日盈亏应显示 --')
+    return '成本价 1201.30 / 股数 100 / 名称 贵州茅台 / 市值 139,831.60 / 当日盈亏 -239.20 跌绿 / 行内可编辑'
+  })
+  // 收尾：切回行情，避免把「持仓」留在持久化状态里影响后续小节
+  tabButton(tree, '行情').props.onClick()
+  render(main, SLOT_PANEL, undefined)
+}
 check('XueqiuPanel 自身的 hook 数不随 tab 变化', () => {
   tabPassesReady()
   const seen = []
@@ -1277,7 +1443,10 @@ check('指数条行末是今日盈亏 chip（.xq-pnl-chip 作为最后一个子�
   const last = row.children[row.children.length - 1]
   ok(last && last.kind === 'host', '行末子节点不是宿主节点：' + stable(last && last.kind))
   ok(classOf(last).split(/\s+/).includes('xq-pnl-chip'), '行末子节点不是盈亏 chip（class=' + JSON.stringify(classOf(last)) + '）')
-  ok(textHas(last, '今日盈亏'), '盈亏 chip 文案缺「今日盈亏」：' + treeText(last))
+  // 有数据时 chip 是「今日 +5,226.80 (+3.88%)」，没数据时才是「今日盈亏 未录持仓」。
+  // 所以只钉「今日」前缀 + 金额，不再钉死完整文案（文案随状态分支变化）。
+  ok(textHas(last, '今日'), '盈亏 chip 文案缺「今日」前缀：' + treeText(last))
+  ok(textHas(last, '5,226.80'), '盈亏 chip 没显示今日盈亏金额（本地持仓 × 行情现算）：' + treeText(last))
   return treeText(last)
 })
 check('指数条里的盈亏 chip 由独立组件 PnlChip 挂载（hooks 不落在 Ticker 头上）', () => {

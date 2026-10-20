@@ -182,6 +182,20 @@ const exp403Shell = scriptedShell([httpResponse(403, '')])
 const exp403 = await collectPnl(fakeCore(exp403Shell), COOKIE, 'FK1')
 check('collectPnl：403 → token_expired=true', exp403.token_expired === true && exp403.error === 'TOKEN_EXPIRED (HTTP 403)', JSON.stringify(exp403))
 
+// 403 必须分两种：账本网关的通用拒绝页（HTML）≠ 会话失效（JSON）。混在一起会让用户去重登一个没坏的 Cookie。
+const exp403JsonShell = scriptedShell([httpResponse(403, '{"error_code":"400016","error_msg":"登录已失效"}')])
+const exp403Json = await collectPnl(fakeCore(exp403JsonShell), COOKIE, 'FK1')
+check('collectPnl：403 + JSON → token_expired=true（真过期）', exp403Json.token_expired === true && exp403Json.blocked === false, JSON.stringify(exp403Json))
+
+// 通用拒绝页的成因上游**不区分**（Cookie 令牌轮换 / 风控限流都会长这样），所以文案必须同时给出
+// 两条线索与各自的动作 —— 早先写成「不是 Cookie 过期」，真实事故里正好把用户钉在白等 10 分钟上。
+const wafShell = scriptedShell([httpResponse(403, '<h1>Nginx forbidden.</h1> <br/>request info: 1.2.3.4')])
+const waf = await collectPnl(fakeCore(wafShell), COOKIE, 'FK1')
+check('collectPnl：403 + Nginx HTML → blocked=true 且 token_expired=false（不谎报会话失效）',
+  waf.blocked === true && waf.token_expired === false, JSON.stringify(waf))
+check('collectPnl：通用 403 文案同时点出「重贴 Cookie」与「风控限流」两条处置',
+  /账本网关拒绝/.test(waf.error) && /重新复制 Cookie/.test(waf.error) && /风控限流/.test(waf.error), String(waf.error))
+
 const redirShell = scriptedShell([httpResponse(302, '')])
 const redir = await collectPnl(fakeCore(redirShell), COOKIE, 'FK1')
 check('collectPnl：3xx → 重定向未跟随（不是 token 过期）', redir.error === '接口重定向未跟随 (HTTP 302)' && redir.token_expired === false, JSON.stringify(redir))
@@ -212,6 +226,13 @@ check('verifyCookie：account_list 用 minimal 头（无 Referer）', verifyOkSh
 const verify403Shell = scriptedShell([httpResponse(403, '')])
 const verify403 = await verifyCookie(fakeCore(verify403Shell), COOKIE)
 check('verifyCookie：403 → "Cookie 已过期，请重新登录投资账本后重新粘贴"', verify403.valid === false && verify403.error === 'Cookie 已过期，请重新登录投资账本后重新粘贴', JSON.stringify(verify403))
+
+// 通用 403 拒绝页**不能**一口咬定「Cookie 已过期」（用户会去重登一个没坏的 Cookie），
+// 但也不能反过来一口咬定「Cookie 没问题」（真实事故就是令牌过期，重贴即恢复）—— 两条都要说。
+const verifyWafShell = scriptedShell([httpResponse(403, '<h1>Nginx forbidden.</h1> <br/>request info: 1.2.3.4')])
+const verifyWaf = await verifyCookie(fakeCore(verifyWafShell), COOKIE)
+check('verifyCookie：403 + Nginx HTML → 报网关拒绝 + 两条处置，而不是单说「Cookie 已过期」',
+  verifyWaf.valid === false && /账本网关拒绝/.test(verifyWaf.error) && /重新复制 Cookie/.test(verifyWaf.error) && /风控限流/.test(verifyWaf.error), JSON.stringify(verifyWaf))
 
 const verifyRejectShell = scriptedShell([httpResponse(200, '{"error_code":"9","error_msg":"无权限"}')])
 const verifyReject = await verifyCookie(fakeCore(verifyRejectShell), COOKIE)

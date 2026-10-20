@@ -79,7 +79,9 @@ const readManifest = (dir) => {
     return []
   }
   return readFileSync(p, 'utf8')
-    .split('\n')
+    // 按 CRLF 也切：若按 '\n' 切，行尾的 '\r' 会让下一行的 /#.*$/ 匹配不上（`.` 不匹配 \r），
+    // 于是注释行被当成模块名 —— 真实踩过（用 PowerShell Set-Content 改清单时写进了 CRLF）。
+    .split(/\r?\n/)
     .map((s) => s.replace(/#.*$/, '').trim())
     .filter(Boolean)
     .map((rel) => `${dir}/${rel}`)

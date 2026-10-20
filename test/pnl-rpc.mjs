@@ -160,123 +160,55 @@ const data = async (action, args) => {
 }
 const readShared = (f) => { try { return JSON.parse(fs.readFileSync(path.join(SHARED_DIR, f), 'utf8')) } catch (e) { return null } }
 
-/* ---------------- 1. 未配置 ---------------- */
-section('1. 未配置 Cookie')
+
+/* ---------------- 1. dispatch 契约 ---------------- */
+section('1. RPC 契约：本地持仓 + 账本同步六个动作')
 {
-  const d = await data('pnl.get', {})
-  check('configured=false', d.configured === false, JSON.stringify(d))
-  check('error 为空串', d.error === '', JSON.stringify(d.error))
-  check('pnl_yk 是 number|null', d.pnl_yk === null || typeof d.pnl_yk === 'number', typeof d.pnl_yk)
-  check('next_poll_ms 是数字', typeof d.next_poll_ms === 'number', typeof d.next_poll_ms)
-  check('session 是六态之一', ['pre', 'morning', 'lunch', 'afternoon', 'after', 'weekend'].indexOf(d.session) >= 0, String(d.session))
-  check('未配置时不打上游', shellCalls === 0, 'shellCalls=' + shellCalls)
+  // 未配置、无持仓时也得能调（这是「账本凭据坏了不影响实时数字」的最小证明）
+  const idle = await data('positions.get', {})
+  check('positions.get → ok:true / configured:true / rows:[]', idle.configured === true && Array.isArray(idle.rows) && idle.rows.length === 0, JSON.stringify(idle))
+  check('positions.get 不打上游', shellCalls === 0, String(shellCalls))
+  check('视图字段契约齐全', ['rows', 'totals', 'as_of', 'session', 'poll_ms', 'next_poll_ms', 'cloud', 'updated_at', 'configured'].every((k) => k in idle), JSON.stringify(Object.keys(idle)))
+  check('totals 字段契约齐全', ['held', 'missing', 'value', 'cost_value', 'day_profit', 'day_base', 'day_rate', 'hold_profit', 'hold_rate'].every((k) => k in idle.totals), JSON.stringify(Object.keys(idle.totals)))
+  check('payload 可 JSON 序列化且没有函数/undefined', (function () {
+    const text = JSON.stringify(idle)
+    return text.indexOf('undefined') < 0 && text.length > 10 && JSON.parse(text).configured === true
+  })(), '')
+
+  const gone = await rpc('pnl.get', {})
+  check('旧的 pnl.get 已从 dispatch 移除（未知操作）', gone.json && gone.json.ok === false && String(gone.json.error).indexOf('未知操作') >= 0, JSON.stringify(gone.json))
+
+  const verify = await data('pnl.verify', {})
+  check('pnl.verify → configured:false / valid:false / portfolios:[]', verify.configured === false && verify.valid === false && Array.isArray(verify.portfolios) && verify.portfolios.length === 0, JSON.stringify(verify))
+  check('pnl.verify → 可读中文原因 + 5/3600 秒边界', verify.error === '未配置 Cookie' && verify.min_sec === 5 && verify.max_sec === 3600, JSON.stringify(verify))
+  check('pnl.verify 顺手回传上次同步状态（cloud 字段）', 'cloud' in verify, JSON.stringify(Object.keys(verify)))
+  check('未配置时标题类动作累计零上游请求', shellCalls === 0, String(shellCalls))
 }
 
-/* ---------------- 2. 保存配置：越界夹取 + 当场校验 ---------------- */
-section('2. pnl.config 保存（含 pollSec 下界夹取）')
+/* ---------------- 2. 入参容错 ---------------- */
+section('2. 入参容错：怪参数只该报错，不该抛 TypeError')
 {
-  const d = await data('pnl.config', { cookie: 'userid=u1; v=tok_abc; pex_userid=DECOY', fundKey: 'FK1', pollSec: 1 })
-  check('ok=true', d.ok === true, JSON.stringify(d))
-  check('pollSec=1 被夹到 5', d.poll_sec === 5, String(d.poll_sec))
-  check('poll_ms=5000', d.poll_ms === 5000, String(d.poll_ms))
-  check('valid=true（假 account_list 通过）', d.valid === true, JSON.stringify(d))
-  check('portfolios 解析出 2 个组合', Array.isArray(d.portfolios) && d.portfolios.length === 2, JSON.stringify(d.portfolios))
-  check('组合名取 manualname', d.portfolios && d.portfolios[0] && d.portfolios[0].name === '我的组合', JSON.stringify(d.portfolios && d.portfolios[0]))
-
-  const cfg = readShared('config.json')
-  check('config.json 落到与旧插件共用的 $DSH_HOME/dsh-ths-pnl/', fs.existsSync(path.join(SHARED_DIR, 'config.json')))
-  check('config.json 字段与旧插件一致 {cookie,fundKey,pollSec}', !!cfg && typeof cfg.cookie === 'string' && cfg.fundKey === 'FK1' && cfg.pollSec === 5, JSON.stringify(cfg))
-  check('cookie 里带的是锚定读出的 userid（含 pex_userid 干扰）', !!cfg && cfg.cookie.indexOf('userid=u1') >= 0 && cfg.cookie.indexOf('pex_userid') >= 0)
+  const cases = [
+    ['positions.save：args 是 null', 'positions.save', null, '代码'],
+    ['positions.save：row 缺失', 'positions.save', {}, '代码'],
+    ['positions.save：code 为空', 'positions.save', { row: { qty: 1 } }, '代码'],
+    ['positions.save：qty 缺失', 'positions.save', { row: { code: '600519' } }, '股数'],
+    ['positions.remove：args 是字符串', 'positions.remove', 'oops', '代码'],
+    ['positions.remove：code 为空', 'positions.remove', {}, '代码'],
+  ]
+  for (const [name, action, args, hint] of cases) {
+    const r = await rpc(action, args)
+    check(name + ' → ok:false + 中文原因', Boolean(r.json) && r.json.ok === false && String(r.json.error).indexOf(hint) >= 0, JSON.stringify(r.json))
+  }
+  const unknownArgs = await rpc('positions.get', 'not-an-object')
+  check('positions.get：args 非对象也不炸（回退空参数）', Boolean(unknownArgs.json) && unknownArgs.json.ok === true, JSON.stringify(unknownArgs.json))
 }
 
-/* ---------------- 3. 取一次盈亏：走通 curl 状态码解析 + 快照落盘 ---------------- */
-section('3. pnl.get 首次取数（无快照 → 必须打上游）')
+/* ---------------- 3. 回环来源校验仍然生效 ---------------- */
+section('3. 安全：非回环来源仍被拒')
 {
-  const before = shellCalls
-  const d = await data('pnl.get', {})
-  check('configured=true', d.configured === true, JSON.stringify(d))
-  check('确实打了上游', shellCalls > before, 'delta=' + (shellCalls - before))
-  check('pnl_yk 取最后一个采样点 -300.1', d.pnl_yk === -300.1, String(d.pnl_yk))
-  check('pnl_pct 取 last.zf = -0.35', d.pnl_pct === -0.35, String(d.pnl_pct))
-  check("yk_field 命中 'yk'", d.yk_field === 'yk', String(d.yk_field))
-  check('token_expired=false', d.token_expired === false, JSON.stringify(d.token_expired))
-  check('error 为空', d.error === '', String(d.error))
-  check('updated_at 非空', typeof d.updated_at === 'string' && d.updated_at.length > 0, String(d.updated_at))
-  check('frozen 是 boolean', typeof d.frozen === 'boolean', typeof d.frozen)
-
-  const snap = readShared('snapshot.json')
-  const need = ['pnl_yk', 'pnl_pct', 'error', 'token_expired', 'yk_field', 'fetched_at', 'sessionDate', 'closeDate']
-  const missing = snap ? need.filter((k) => !(k in snap)) : need
-  check('snapshot.json 形状与旧插件一致（8 个字段齐）', missing.length === 0, '缺: ' + missing.join(','))
-  check('snapshot.pnl_yk=-300.1', !!snap && snap.pnl_yk === -300.1, JSON.stringify(snap && snap.pnl_yk))
-}
-
-/* ---------------- 4. 时段缓存：非交易时段不该重复打上游 ---------------- */
-section('4. 时段缓存')
-{
-  const before = shellCalls
-  const d = await data('pnl.get', {})
-  const session = d && d.session
-  const inSession = session === 'morning' || session === 'afternoon'
-  check(inSession ? '盘中允许再次请求（或命中缓存）' : '盘外直接回快照、不再打上游',
-    inSession ? shellCalls >= before : shellCalls === before,
-    'session=' + session + ' delta=' + (shellCalls - before))
-}
-
-/* ---------------- 5. pollSec 上界夹取 / 非数字抛错 ---------------- */
-section('5. pollSec 校验')
-{
-  const d = await data('pnl.config', { pollSec: 99999 })
-  check('pollSec=99999 夹到 3600', d.poll_sec === 3600 && d.poll_ms === 3600000, JSON.stringify(d))
-  const r = await rpc('pnl.config', { pollSec: 'abc' })
-  check('pollSec 非数字 → ok:false', !!r.json && r.json.ok === false, JSON.stringify(r.json))
-  check('错误文案提到 5–3600', !!r.json && /5.*3600/.test(String(r.json.error)), String(r.json && r.json.error))
-}
-
-/* ---------------- 6. Cookie 失效 / 重定向 / API 错误 / 空数据 ---------------- */
-section('6. 异常响应')
-{
-  mode = '401'
-  const v = await data('pnl.verify', {})
-  check('401 → valid=false', v.valid === false, JSON.stringify(v))
-  check('401 → 提示已过期', /过期/.test(String(v.error)), String(v.error))
-  mode = '302'
-  const v2 = await data('pnl.verify', {})
-  check('302 → valid=false 且不崩', v2.valid === false && !!v2.error, JSON.stringify(v2))
-  mode = 'nonjson'
-  const v3 = await data('pnl.verify', {})
-  check('非 JSON → valid=false', v3.valid === false, JSON.stringify(v3))
-  mode = 'apierr'
-  const g = await data('pnl.get', { force: true })
-  check('error_code≠0 → error 非空', !!g.error, JSON.stringify(g.error))
-  mode = 'empty'
-  const g2 = await data('pnl.get', { force: true })
-  check('空 data → error 非空（提示无数据）', !!g2.error, JSON.stringify(g2.error))
-  mode = 'ok'
-  const g3 = await data('pnl.get', { force: true })
-  check('force:true 恢复后能重新取到数', g3.pnl_yk === -300.1, JSON.stringify(g3.pnl_yk))
-}
-
-/* ---------------- 7. 清 Cookie 不抹掉最后已知盈亏 ---------------- */
-section('7. clear 语义（config 与 snapshot 分文件）')
-{
-  const d = await data('pnl.config', { clear: true })
-  check('clear 后 configured=false', d.configured === false, JSON.stringify(d))
-  check('clear 后 config.json 不再带 cookie', !readShared('config.json') || !readShared('config.json').cookie, JSON.stringify(readShared('config.json')))
-  const snap = readShared('snapshot.json')
-  check('clear 后 snapshot.json 仍在', !!snap, JSON.stringify(snap))
-  check('clear 后最后已知盈亏仍可读', !!snap && snap.pnl_yk === -300.1, JSON.stringify(snap && snap.pnl_yk))
-  const g = await data('pnl.get', {})
-  check('clear 后 pnl.get 报未配置', g.configured === false, JSON.stringify(g))
-}
-
-/* ---------------- 8. 既有契约回归 ---------------- */
-section('8. 既有契约回归')
-{
-  const r = await rpc('nope.nope', {})
-  check('未知 action 仍返回 未知操作', !!r.json && r.json.ok === false && /未知操作/.test(String(r.json.error)), JSON.stringify(r.json))
   const ui = await data('ui.get', {})
-  check("ui.get 的 tab 白名单含 'pnl' 或回退 market", ui.tab === 'market' || ui.tab === 'pnl', String(ui.tab))
+  check("ui.get 的 tab 白名单含 'positions' 或回退 market", ui.tab === 'market' || ui.tab === 'positions' || ui.tab === 'pnl', String(ui.tab))
   const dbg = await data('debug', {})
   check('debug 仍可用', !!dbg && typeof dbg === 'object', JSON.stringify(dbg))
 

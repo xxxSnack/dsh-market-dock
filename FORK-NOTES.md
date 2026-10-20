@@ -457,3 +457,389 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
 并存期两处会**各自**轮询（旧插件按自己的定时器、本插件按 `next_poll_ms`），大约每 60 秒各一次；
 账本接口能承受，但确认无误后建议摘掉旧的，只留一份轮询。
 
+---
+
+## 9. 持仓明细（同花顺账本 `stock_position`）
+
+盈亏只给到**账户级**的一个数（`pnl_yk`），拆不到「哪只、多少股、成本多少」。本节补的「持仓」tab 是
+**逐只持仓明细**：股数 `count` + 持仓成本价 `cost` + 现价 / 市值 / 持仓盈亏 / 持仓天数。
+
+### 9.1 接口是怎么找到的（可复现）
+
+账本持仓接口**从无公开文档**：上游 `dsh-ths-holdings` 的 README 写着「自动同步真实持仓数据」，
+但它的 `src/fetch.ts` 只调 `time_share` / `getQuotes` / `account_list` —— **从来没有取过逐只持仓**
+（这是宣传话术，也是上次整合时「账本没有持仓接口」这个误判的来源）。
+
+真实做法是从**网页端 bundle 里静态挖**（不需要抓包、不需要登录）：
+
+1. 取 `https://tzzb.10jqka.com.cn/pc/index.html`（入口，带 5 个 `<script>`）；
+2. 顺着 script 引用广度抓取 JS（应用主包是 `s.thsi.cn/cd/xcs-tzzb-front-app-pc/static/js/index.<hash>.js`，约 730KB）；
+3. 正则捞 `/caishen_fund/...` 端点表 → 命中 `pc/asset/v1/stock_position`（另有 `cleared_position` /
+   `asset_trend` / `remark/v1/position_remark`）；
+4. 在压缩代码里按 `key:"requestStockPosition",value:function` 定位 service 层方法，读出**参数与响应字段映射**。
+
+脚本落在 `tmp/ths-holdings-probe/`（`scan.mjs` 抓取、`ctx.mjs` 看上下文、`extract-service.mjs` 抽方法体、
+`probe-*.mjs` 只读探测、`live-positions.mjs` 单次线上校验），`tmp/` 不入库。
+其中 `cache/`（抓下来的 JS）与 `live/`（校验落盘的真实持仓）是**用完即弃**的中间产物，已删除；
+需要时重跑 `scan.mjs` / `live-positions.mjs` 即可重建。
+
+### 9.2 冻结的接口契约
+
+```
+POST https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/asset/v1/stock_position
+请求体（与 time_share 同族，原样可用）：
+  terminal=1&version=0.0.0&userid=<u>&user_id=<u>
+  &manual_id=&fundid=&fund_key=<fundKey>&rzrq_fund_key=&custid=
+请求头：UA + Accept + Accept-Language + Referer(/pc/index.html) + Cookie，**不跟随重定向**
+```
+
+响应 `ex_data`：
+
+| 字段 | 含义 | 我们的字段名 |
+|---|---|---|
+| `position[]` | 逐只持仓数组 | `rows` |
+| `position[].code` / `.name` / `.market` | 代码 / 名称 / 市场 | `code` / `name` / `market` |
+| `position[].count` | **持仓数量（股）** | `qty` |
+| `position[].cost` | **持仓成本价（摊薄成本）** | `cost` |
+| `position[].price` / `.value` | 现价 / 市值 | `price` / `value` |
+| `position[].hold_days` | 持仓天数 | `hold_days` |
+| `position[].hold_profit` / `.hold_rate` | 持仓盈亏（元） / 持仓收益率（**小数比率**） | 同名（`hold_rate` 经 `ratioPct` 换算成百分数） |
+| `position[].pre_profit` / `.pre_rate` | **昨日**盈亏（元） / 昨日收益率（**小数比率**） | 同名（悬停展示，不占列） |
+| `position[].before_pre_profit` / `.before_pre_rate` | **前日**盈亏 / 前日收益率（同族口径） | 同名 |
+| `position[].y_profit` / `.w_profit` / `.m_profit` | 总 / 周 / 月盈亏（未映射） | — |
+| `position[].back` | 回本所需涨幅（(cost−price)/price，实测 0.0223 = 2.23%） | 未映射 |
+| **当日盈亏** | **上游没有**（见下） | `day_profit` / `day_rate`，宿主用行情另算 |
+| `position[].fee` / `.remark` | 费率 / 备注 | 同名 |
+| `money_remain` | 可用资金 | `summary.money_remain` |
+| `total_value` | **持仓总市值** | `summary.total_value` |
+| `total_asset` | **总资产（市值 + 可用资金）** | `summary.total_asset` |
+| `position_rate` | **仓位，小数比率**（0.9568 = 95.68%） | `summary.position_rate` + `summary.position_pct` |
+| `total_liability` | 总负债 | `summary.total_liability` |
+| `upload_time` | 账本数据时间（epoch 毫秒字符串） | `summary.upload_time` |
+
+字段含义取自前端映射而非猜测：`requestStockPosition` 里 `count→count`、`cost→cbjg`、`price→sj`、
+`value→sz`、`hold_profit→ccyk`、`hold_rate→ccykb`、`money_remain→zjye`。
+数值一律经 `toNum()`：容忍 `HK$1.234` / 千分位 / 空串，**取不到给 null**（界面 `--`，不假装 0）。
+
+**四个口径陷阱（都由真实响应实测钉死，测试里有回归）**：
+
+1. **不要把 `total_value` 当总资产**。前端的内部命名（`zzc: e.total_value`）会误导 —— 用真实数据一算就清楚：
+   `Σ(count×price)` = 90217.4 = `total_value`，而 `total_asset`(94291.79) = `total_value` + `money_remain`(4074.39)。
+   所以 **`total_value` = 持仓总市值、`total_asset` = 总资产**（含现金）。账本 bundle 自己的调试日志也印证：
+   `账户总资产 = 基金总资产 + 股票总资产`、`账户市值 = 基金总市值 + 股票总市值`（两个口径本就是分开的）。
+2. **`position_rate` 是小数比率，不是百分数**。`total_value / total_asset` = 0.9567899…，与它逐位相等；
+   直接 `toFixed(2)+'%'` 会显示成「0.96%」（差 100 倍）。宿主用 `ratioPct()` 统一乘 100（>1.5 视为已是百分数）。
+3. **逐只的 `hold_rate` / `pre_rate` 也是小数比率**（同族字段，别以为是百分数）。线上实测（`tmp` 里的单请求校验）：
+   上游给的是**4 位小数的小数比率** —— `-0.0217` / `-0.0631` / `-0.0163` / `-0.0623` / `-0.0002`。
+   换算后与「盈亏/成本」推算**逐位吻合**：-0.0623 → -6.23%，而 -620/(9330+620) = -6.23%；4/4 行命中。
+   若按百分数用（不乘 100），这些值会渲染成「-0.02%」—— **比实际小 100 倍**，看着像没波动。现已由
+   `ratioPct()` 在宿主侧统一换算（换算后精度 = 上游的 0.01% 粒度）。
+   > 踩过的坑：一开始我是从落盘的 `positions.json` 里读到 `-0.02` 才判断为小数比率的 —— 那其实是
+   > PowerShell `Format-Table` 的**显示舍入**，原始值有 4 位小数。结论对，但证据链当时是虚的；
+   > 现在是拿原始字符串对齐推算值。
+   灰色地带：判据是 `|n| <= 1.5`，若上游某天改发百分数，0~1.5% 会被放大 100 倍 —— 改判据时
+   `test/pnl-positions.mjs` §8 那条「启发式灰色地带」断言要同步改（有意钉住，不是漏测）。
+4. **港股字段带 `HK$` 前缀**（前端按 market/code 判定后加），`toNum()` 负责剥掉。
+
+**口径陷阱 5：`pre_*` 是「昨日」，而且这个接口根本没有逐只「当日」。**
+
+我一开始把 `pre_profit` 当成当日盈亏显示成「当日涨跌」列，用户一眼看出不对（列里合计 -153.80，
+而他当天实际亏 -2,182.20）。用雪球日线逐日核对后**分毫不差**地确证：
+
+| 持仓 | 10-13 收 | 10-14 收（昨收） | (昨收−前收)×股数 | 上游 `pre_profit` |
+|---|---|---|---|---|
+| 君正集团 | 4.76 | 4.75 | -0.01×5000 = **-50** | **-50** |
+| 养殖ETF | 0.524 | 0.522 | -0.002×18400 = **-36.80** | **-36.80** |
+| 牧原股份 | 40.90 | 40.89 | -0.01×700 = **-7** | **-7** |
+| 山西焦煤 | 6.49 | 6.45 | -0.04×1500 = **-60** | **-60** |
+
+`before_pre_profit` 同理是**前日**（养殖ETF -92.00、山西焦煤 +15.00 也对得上；君正/牧原对不上是因为
+那两天有过交易，账本按**当日股数**记账）。
+
+**逐只当日盈亏在上游根本不存在**：原始字段全集是
+`back, before_pre_profit, before_pre_rate, close_profit, close_rate, come_profit, cost, count, fee, hkmarket,
+hold_days, hold_profit, hold_rate, m12_rate, m1_rate, m3_rate, m6_rate, m_profit, market, name, position_rate,
+pre_profit, pre_rate, price, remark, stock_account, value, w_profit, y_profit`
+—— 只有 hold_（总）/ pre_（昨日）/ before_pre_（前日）/ w_、m_、y_（周月年）。
+账本自己的前端行模型也印证：它有 `dryk`（当日盈亏）/ `drykb`（当日盈亏率）两个列槽位，
+但 `requestStockPosition` 里**这两个字段显式写成 null**，靠 `hq` 槽位（行情 `xj` 最新价 + `zf` 涨幅）去补。
+
+**我们的做法**（`attachDayPnl`）：按账本自己的思路用行情补，但**用昨收而不是涨跌幅**：
+
+```
+当日盈亏 =（账本现价 − 雪球昨收）× 账本股数     当日涨跌幅 = 现价 / 昨收 − 1
+```
+
+- 为什么不用「市值 × 涨跌幅」：行情涨跌幅只有两位小数，取整误差被市值放大（实测 -2.95% × 23050
+  = **-700.64**，真实 **-700.00**）；用昨收能逐分对齐。
+- 行情取数失败**不影响持仓本身**：这几格留 null（界面 `--` 并在脚注提示），force 绕过行情 10s 缓存。
+- 代码映射 `positionSymbol()` 按**代码形态**走（6/9/5→SH、0/1/2/3→SZ、5 位→港股裸代码），
+  不依赖账本 `market` 枚举（实测沪=2、深=1，含义未公开）。
+- 线上单请求校验（`tmp` 里的 live 脚本）：逐只合计 **-2,082.20**，账户级 chip **-2,182.20** ——
+  差的 **100.00 整**是当天清仓那只（桃李面包 qty=0）的当日已实现部分：账本账户级含已实现与费用，
+  逐只接口只给在场持仓的浮动。这条差额写进了界面脚注，免得用户以为对不上。
+
+> 这三条都是「只测 tab 存在、不测字段口径」会漏掉的那类 bug —— 所以 `test/pnl-positions.mjs` 与
+> `test/smoke-client.mjs` 里都有断言：`总资产 = 总市值 + 可用资金`、`仓位显示 95.68% 而不是 0.96%`。
+
+### 9.3 节奏：TTL 门控，**没有后台定时器**（与盈亏的本质区别）
+
+- 盈亏是分时值 → 60s 心跳 + 09:30/13:00/15:00 边界；持仓**大多数时间不变** → 只在客户端显式调用时
+  按 `POSITION_TTL_MS`（15 分钟）判定要不要真打上游：**面板打开 / 切到持仓 tab / 页面回前台 / TTL 到期 /
+  点「立即同步」**。常态是 **0 请求**，也天然不可能形成突发。
+- TTL 看的是 `attempted_at`（最后一次尝试）而不是 `as_of`（最后一次成功）——**失败后不要在用户每次
+  开面板时重打上游**。`as_of` 只在成功时推进，界面的「数据时间」用它。
+- 失败（401/403、`error_code≠0`、302）**保留上一份持仓**并标 `stale`，只显示错误文案；`positions.json`
+  与 `config.json` / `snapshot.json` **分文件**，清 Cookie 不会抹掉末次已知持仓。
+
+> **WAF 实测（重要）**：账本前置 Nginx 对**突发**很敏感。本次排查时 20 连发的探测把 IP 打毛了——
+> 连平时稳定可用的 `time_share` 都连回 403 `<h1>Nginx forbidden.</h1>`（第一次约 1 分钟后自行恢复）。
+> 同时**宿主插件的 60s 常规轮询全程正常**（快照照常写入）。结论：请求形状没问题，**节奏才是风控变量**；
+> 这也是持仓走「低频 + 手动」而不是跟着盈亏心跳的原因。排查时不要连发。
+
+### 9.6 通用 403 的两种成因：Cookie 令牌轮换 / 风控限流（一次被推翻的排查结论）
+
+**症状**：持仓/盈亏报 HTTP 403。用户的第一反应是「Cookie 过期了，去重新登录」——而当时的界面文案
+偏偏写着「**不是** Cookie 过期，稍后会自动重试」，把人钉在白等 10 分钟上。两边都不对。
+
+**第一次结论（错，留档）**：判为「**IP 级**封禁」。当时的证据是同一时刻四个探测全是 403：
+
+| 探测 | 结果 |
+|---|---|
+| ① curl 完整头 stock_position | 403 `<h1>Nginx forbidden.</h1> <br/>request info: <IP>` |
+| ② curl 最小头 stock_position | 403 同上 |
+| ③ Node fetch stock_position | 403 同上 |
+| ④ curl 最小头 account_list（**只用来校验 Cookie 的端点**） | 403 同上 |
+
+**为什么错**：这四个探测带的是**同一份 Cookie**。所以「换传输、换请求头都一样」只能证明**与传输无关**，
+不能证明与凭据无关 —— 「Cookie 里的反爬令牌已过期」对它是一个完美解释（换什么传输都一样是应该的）。
+用户的现场事实直接推翻了这个结论：**浏览器一直能正常打开账本**，而且**重新粘贴 Cookie 后立刻恢复**
+（`config.json` 在 15:43:17 被重写，18 秒后 time_share 200、35 秒后 stock_position 200）。
+浏览器没事是因为它自己会滚动刷新 `v` 这类令牌；插件存的是**快照式**凭据，令牌轮换后手里那份就一直是旧的。
+
+**真相（两种成因并存，上游不区分）**：
+
+| 成因 | 现场特征 | 处置 |
+|---|---|---|
+| **Cookie 令牌过期/轮换** | 浏览器正常；同一份 Cookie 下所有端点都 403；重贴 Cookie 即恢复 | 重新从账本页面复制 Cookie 粘贴 |
+| **风控限流** | 连发探测后出现；正常 60s 节奏全程无事；等一会儿自己好 | 停手等待，别连点 |
+
+两者的响应体**一模一样**，从响应无法区分 —— 所以文案不能替上游下结论。
+
+**改动**（都带回归测试）：
+
+1. **判据**：`isWafPage(text)` —— 403 + HTML/`Nginx forbidden` → `blocked`（网关拒绝）；
+   403 + JSON → `token_expired`；401 一律算过期。
+2. **文案**（这一版才改对）：`GATEWAY_403_TEXT` 同时给出两条线索与各自动作；chip 标签「今日盈亏 403 拒绝」、
+   持仓行标「403 拒绝」（原来是「风控中」，等于替上游下了结论），title 里写决策树 ——
+   先重贴 Cookie；重贴后仍 403 就是限流，等窗口过去。
+3. **退避**：`BLOCKED_BACKOFF_MS = 10 分钟`，`blocked_until` 落盘（重启也不会立刻又去撞），窗口内不打上游
+   （`force:true` 例外）。**与成因无关地值得保留**：两种情况下连发都没有好处。
+4. **没做**：自动刷新 `v` 令牌。那等于把账本前端的反爬逻辑搬进插件，代价与风险都不划算 ——
+   重贴 Cookie 是 10 秒的事，且令牌轮换并不频繁。
+
+**排查纪律（修订版）**：
+
+- 先问「**浏览器**能不能打开账本」。能 → 就是我们存的那份凭据的问题，第一动作是**重贴 Cookie**（10 秒），
+  而不是等 10 分钟；
+- 真要探测，只发**一个** `account_list`，**且必须换成新 Cookie** —— 带着旧凭据探测，测的是旧凭据，
+  什么结论都得不出来（这次的教训）；
+- 不要连发：既有被限流之虞，又证明不了任何事。
+
+**回归**：`test/pnl-cookie.mjs`（403+HTML → blocked + 文案含两条处置；403+JSON → token_expired；
+`verifyCookie` 同判据）；`test/pnl-positions.mjs` §5/§5b（含退避窗口内 0 请求、force 例外、成功即清窗口）；
+`test/smoke-host.mjs` 的 `pnl.get` 字段契约含 `blocked` / `blocked_until`。
+
+### 9.4 宿主与客户端接线
+
+| 层 | 位置 | 内容 |
+|---|---|---|
+| 端点/常量 | `lib/pnl/constants.js` | `STOCK_POSITION_URL`、`POSITIONS_FILE`、`POSITION_TTL_MS=900000` |
+| 采集 | `lib/pnl/collect.js` | `collectPositions(core, cookie, fundKey)` + `toNum` + `ratioPct` + `mapPosition`（只读） |
+| 落盘 | `lib/pnl/store.js` | `loadPositions` / `savePositions`（写失败静默，保留上一份；`schema` 不匹配当没有） |
+| 动作 | `lib/pnl/index.js` | `refreshPositions`（单飞 + 失败保留）+ `actPositionsGet`（TTL/force/stale） |
+| RPC | `lib/actions.js` | `'positions.get': core.actPositionsGet` |
+| 状态 | `client/store/positions.js` | 运行时持有者 + TTL 调度（`ensure`/`schedule`/可见性恢复补拉） |
+| UI | `client/panel/positions.js` | 账户合计四格 + 逐只持仓表（默认市值降序，7 列：名称/股数/成本价/现价/当日涨跌/市值/持仓盈亏） |
+| 接线 | `client/constants.js` / `lib/ui-state.js` / `client/panel/index.js` / `client/manifest.txt` | 第 6 个 tab `['positions','持仓']`；`validTabs` 加 `'positions'`；`XQ_TABS`/`TAB_CTX` 各一行；两个新模块进清单 |
+
+`positions.get` 返回：`{ configured, as_of, rows[], summary, error, token_expired, blocked, blocked_until, stale, refreshed, ttl_ms, fund_key }`。
+
+测试：`test/pnl-positions.mjs`（76 项：请求形状 / 字段映射 / 三个比率的口径换算 / `HK$` 与千分位 /
+缺失字段 null / TTL 门控 0 请求 / force / 风控 403 与真过期 403 的区分 / 退避窗口 / `error_code≠0` /
+空持仓 / 302 / `toNum` 与 `ratioPct` 边界 / 口径自证），`test/smoke-client.mjs` 增补 `[5b2]` 静态契约 +
+真渲染出的内容契约（「成本价 1201.30 / 股数 100 / 总资产 94,291.79 / 仓位 95.68%」+ 涨跌两列的
+金额、涨跌幅与红绿色类），`test/smoke-host.mjs` 钉住 `positions.get` 的返回键集合。
+
+### 9.5 与盈亏的关系
+
+同一份 Cookie、同一个 `fundKey`（`pnl.config` 存的那份），所以**持仓无需单独配置**：没配置时「持仓」
+tab 直接把用户引导到「盈亏」tab 粘贴 Cookie。两边的上游请求互不共享闸门（账本与雪球的风控预算是两回事），
+但持仓侧因为 TTL 门控实际上比盈亏更省。
+
+### 9.7 持仓表的涨跌呈现（「当日盈亏」列 + 红涨绿跌）
+
+需求来自两轮使用反馈：① 涨跌要**同时给出金额与涨跌幅**并红绿分色；② 第一版的「当日」其实是**昨日**
+（见 §9.2 陷阱 5），必须换成真正的当日盈亏。
+
+- **列布局**（7 列）：名称/代码 · 股数 · 成本价 · 现价 · **当日盈亏** · 市值 · 持仓盈亏。
+  栅格 `minmax(0,1.6fr) .8fr .9fr .8fr .95fr 1fr 1.1fr`，`min-width:500px`，容器
+  `overflow-x:auto` —— 面板可能只有 ~400px 宽，硬挤会把数字折行；表头与数据行同处一个滚动容器，
+  横向滚动时列不会错位。
+- **两个涨跌单元**：当日盈亏（`day_profit`/`day_rate`，宿主用行情算）、持仓盈亏
+  （`hold_profit`/`hold_rate`，账本值）。金额在上（`.xq-pos-amt`，600 字重）、涨跌幅在下
+  （`.xq-pos-rate`，10.5px、0.85 透明），整格颜色由 `colorOf(金额)` 决定 —— A 股习惯**涨红跌绿**：
+  `.xq-up` = `state-error-primary`（红）、`.xq-down` = `state-success-primary`（绿）、
+  `.xq-flat` = 次要灰。涨跌幅一律带符号、两位小数。
+- **账本「昨日盈亏」不占列，进悬停**：当日单元的 title 里写清「昨收 x / 账本昨日盈亏 y (z%)」——
+  信息不丢，口径也能自证（昨日的值应与用户对账本页面的印象一致）。
+- **已清仓行**（账本保留 `qty=0` 的行记已实现盈亏）：整行 `.xq-pos-cleared` 压暗（hover 恢复），
+  行内标「已清仓」；当日盈亏显示 `--`（无当日浮动可言），收益率不显示。
+- **取不到就 `--`**：金额与涨跌幅都缺时显示 `--`；整列都缺（行情挂了）时脚注写明
+  「当日盈亏暂不可用（雪球行情取数失败），其余字段不受影响」。
+- **换算放在宿主侧**（`ratioPct` 修比率口径、`attachDayPnl` 补当日值），前端只做格式化：
+  同一族的三个比率共用一条口径，避免「盈亏 tab 修了、持仓 tab 又忘」。
+  前端**不自算**：上游口径含费用等因素，自算会和账本页面不一致。
+
+回归断言在 `test/smoke-client.mjs`：6 个涨跌单元（3 行 × 2 列）、金额与涨跌幅同时出现、
+盈利格带 `.xq-up`、亏损格带 `.xq-down`、已清仓行只有已实现盈亏金额且当日涨跌是 `--`；样式侧另断言
+CSS 里确有 `.xq-pos-cell` / `.xq-pos-chg` / `.xq-pos-cleared`。
+（这些断言做过**变异验证**：把 `colorOf(...)` 换成写死的 `xq-flat`，该 check 立刻失败 ——
+ 说明它们真的在盯着颜色，而不是「渲染出数字就算过」。）
+
+**踩坑：类加对了，颜色却没生效（CSS 层叠）**。`.xq-up` / `.xq-down` / `.xq-flat` 是**单类**选择器；
+`.xq-pos-num`（数值单元格，声明了 `color`）同样是单类，而且在 styles.css 里**更靠后** ——
+优先级相同时「后写的赢」，涨跌色被默认前景色盖掉。
+
+- **症状极具欺骗性**：className 里 `xq-up`/`xq-down` 都在，静态断言与 DOM 检查全绿，界面上却全是深色，
+  用户的第一反应是「你的改动没生效」（实际上列、口径换算、已清仓标记都生效了，只有颜色没有）。
+  截图里采样像素可证：表格数字是 `126,127,129` / `15,17,21` 这类 R≈G≈B 的灰。
+- **修法**：配色写成**复合选择器** `.xq-pos-chg.xq-up`（2 个类 > 1 个类，与书写顺序解耦），
+  而不是给 `.xq-pos-num` 去掉颜色、或调整规则顺序（那样下次再加个数值单元格又会踩）。
+- **同类审计**：徽标 / 指数条 / 热榜 / 工具卡也在用 `xq-up`/`xq-down`，但它们的基类
+  （`.xq-badge-val`、`.xq-idx-cur`、`.xq-tv-price`…）都**不声明** `color`，所以只有持仓表中招 ——
+  同一张截图可对照：徽标里的百分比是绿的，持仓表里是深色。
+- **回归**：`test/smoke-client.mjs` 的**层叠契约** —— 不再只断言「className 含 `xq-up`」，
+  而是从内联 CSS 算出「最终生效的是哪条 `color` 声明」（极简层叠判定：只认纯类复合选择器，按类数比优先级，
+  同优先级取后写者）。两个细节值得留：① 判定自带**反向对照**（`.xq-up{red}` + 后写的
+  `.xq-pos-num{black}` 必须判 black），证明判定实现本身是对的；② 判定**先剥 CSS 注释** ——
+  注释里写的反例选择器（本文件就写了「必须像 `.xq-pos-chg.xq-up` 那样」）会被正则连同后面的选择器
+  一起吞掉、因含空格被跳过，让被注释提到的规则整条消失。这个坑我在写这条测试时真踩了一次：
+  测试是绿的，但报出的赢家是 `.xq-up` 而不是复合选择器 —— **绿得不明不白比红更危险**，所以加了自检。
+- **变异验证**：删掉三条复合规则（回到 bug 现场）→ 该 check 失败，诊断直接点名
+  `{"spec":1,"color":"var(--dsw-alias-label-primary)","sel":".xq-pos-num"}`。
+
+**缓存口径版本 `schema`**：行内数值的口径由宿主换算，所以 `positions.json` 里写了 `schema: 2`
+（`POSITIONS_SCHEMA`）。读缓存时 schema 不匹配就当**没有** —— 换口径后旧文件里的同名字段是错的
+（`hold_rate` 还是小数比率），照读会先给用户一串小 100 倍的收益率，看着像修复没生效。
+代价是升级后第一次打开「持仓」tab 会真打一次上游（正常「无快照」路径，1 次请求）。
+回归：`test/pnl-positions.mjs` §4b（造一份无 schema 的旧缓存 → 断言丢弃、重新取数、重新落盘带 schema）。
+
+---
+
+## 10. 本地持仓 + 派生盈亏（fork.6 架构变更：账本降级为「一次性导入」）
+
+> **本节取代 §8.3 / §9.3 / §9.5 / §9.7 里「账本 60s 心跳」「TTL 同步」「当日盈亏列口径」的写法。**
+> 那几节记的是 fork.5 及以前的设计，保留是为了后面的排查能看懂来龙去脉。
+
+### 10.1 为什么非改不可（真实事故）
+
+账本接口要求一个由**页面 JS 生成**的反爬令牌（`chameleon.min.<构建号>.js` 写入的 `v` Cookie），
+它寿命很短，而且**浏览器会不断重新生成**。我们保存的是某一刻的快照：
+
+- 同一份 Cookie，`10-19 10:33` 粘贴后能用到 `11:26`，之后 23 小时全是 `403 <h1>Nginx forbidden.</h1>`；
+- 同一时刻浏览器访问账本完全正常（它自己在续令牌）；
+- 重新粘贴能立刻恢复，然后又只能撑很短一段时间。
+
+排查过程中确认过的三件事（别再重复走）：
+
+1. **不是整站/IP 封禁**：`GET /pc/index.html`（不带 Cookie）返回 200，说明主机与出口 IP 都通；
+2. **不是会话过期**：`sess_tk` 是 JWT，`exp` 还有 30 天（`user` 里的 `2678400` = 31 天，与它吻合）；
+3. **不是我们的请求量**：盈亏心跳 60 次/小时，持仓同步上限 4 次/小时，抬升不到 7%
+   （第二部分之前也是 60 次/小时，一直没事）。
+
+**历史版本没有任何续期手段**（不读 `Set-Cookie`、没有刷新接口，三个副本都一样：
+当前 `lib/pnl/http.js`、HEAD 的 curl 版、`profiles/web/node_modules/dsh-ths-pnl` 里的 fetch 版）。
+它当年能「持续更新」，是因为上游当时接受长期冻结的快照 —— 也就是说这不是我们做少了什么，
+而是**上游收紧了**，静态快照天生只能用很短时间。
+
+对比之下，雪球那套是有续期的：`lib/http.js` 会解析响应头里的 `set-cookie` 并落盘换新的
+`xq_a_token`。账本侧没有这样的机会（服务端不下发、`v` 是客户端算出来的）。
+
+### 10.2 新分工
+
+| | 谁是主数据 | 什么时候请求上游 |
+| --- | --- | --- |
+| 持仓（股数 / 成本价） | **本地** `positions.json`，用户可增删改 | 只在用户点「从账本同步」时 |
+| 现价 / 当日盈亏 / 持仓盈亏 / 市值 | 雪球行情，**每次现算** | 按行情刷新间隔（默认 30s，盘外睡到边界） |
+| 账本账户口径（含已实现与费用） | 同步时取一次，存进 `cloud.account` | 只在同步时 |
+
+于是：**账本凭据废了，只影响「同步」这一个按钮**，当日盈亏照常实时。
+
+### 10.3 数据形状（`positions.json`，schema 4）
+
+```json
+{
+  "schema": 4,
+  "updated_at": "2026-10-20T02:30:00.000Z",
+  "rows": [{ "code": "601216", "name": "君正集团", "qty": 5000, "cost": 4.713 }],
+  "cloud": { "synced_at": "...", "fund_key": "...", "summary": { "total_asset": 94929.03 },
+             "account": { "pnl_yk": -2182.2, "pnl_pct": -2.25, "at": "..." },
+             "error": "", "blocked": false, "blocked_until": null }
+}
+```
+
+- **只有输入字段落盘**（`code`/`name`/`qty`/`cost`）。价格与盈亏绝不写盘 —— 否则用户改完股数，
+  现价里还带着上一次的旧值，界面自相矛盾。
+- `code` 是唯一键；港股统一成雪球形态（`HK00700` → `00700`），否则同一只标的会以两个键存在，
+  合并/去重全部失效。
+- v3（账本快照）会自动迁移：只取 `code/name/qty/cost`，派生字段全丢（`migrated_from` 标记来源）。
+
+### 10.4 口径
+
+```
+当日盈亏 = Σ (现价 − 昨收) × 股数
+当日涨跌幅 = 当日盈亏 / Σ (昨收 × 股数)        ← 基数是昨收市值，不是当前市值
+持仓盈亏 = Σ (现价 − 成本价) × 股数
+持仓收益率 = 持仓盈亏 / Σ(成本价 × 股数)
+```
+
+- **不用「市值 × 行情涨跌幅」**：涨跌幅只有两位小数，误差会被市值放大（实测 君正
+  `-2.95% × 23050 = -700.64`，真实 -700.00）。
+- 合计 = **逐行取整后相加**，保证界面上的合计等于各行显示值之和（用户真的会去加）。
+- 与账本账户口径的差：不含当日已实现与费用。实测那天逐只合计 `-2,082.20`，账本账户 `-2,182.20`，
+  差的正好是清仓那只的当日已实现 `100.00` —— 这两个数都保留，界面并列说明，不再让人以为算错。
+
+### 10.5 宿主侧（`lib/pnl/`）
+
+`installPnl(core)` 现在**一个定时器都不挂**（节奏由客户端按 `next_poll_ms` 驱动，
+浏览器关掉就彻底不发请求 —— 这对账本最友好，也是「账本废了也能用」的前提）。
+
+| action | 作用 | 打上游吗 |
+| --- | --- | --- |
+| `positions.get` | 本地持仓 × 行情 → 逐行派生值 + 合计（`force` 绕行情 10 秒缓存） | 只打雪球 |
+| `positions.save` | 增/改一行（`originalCode` 支持改代码；名称留空用行情补） | 只打雪球 |
+| `positions.remove` | 删一行 | 不打 |
+| `positions.sync` | 从账本导入/校对（`merge` 默认 / `replace`），**唯一**打账本的入口 | 账本 |
+| `pnl.verify` | 校验账本 Cookie + 组合列表 + 上次同步状态 | 账本 |
+| `pnl.config` | 存 Cookie / 组合 / 行情刷新间隔（`clear` 只清凭据，不动持仓） | 账本（仅校验时） |
+
+同步的合并口径：账本有则覆盖 `qty`/`cost`；账本有而本地无则新增（`qty=0` 的已清仓不新增）；
+本地有而账本无则**保留**并在报告里列出来。同步失败只写 `cloud.error`，**一个字段都不碰 `rows`**。
+
+`pnl.get` 已删除 —— 它是「60 秒账本心跳」的入口，留着就说明还有代码在打账本。
+
+### 10.6 回归
+
+- `test/pnl-positions.mjs`（123 项）：v3 迁移、无凭据可用、派生值不落盘、改股数/改代码/重名拒绝、
+  边界（qty=0 / 负数 / 缺失 / 成本缺失）、行情失败只影响当日列、合计逐行相加、节奏、
+  同步 merge/replace、**403/401/接口错/断网四种失败下持仓与盈亏完全不变**、坏文件兜底。
+- `test/smoke-host.mjs` §[9]（123 项）：宿主**不再挂盈亏定时器**、动作接线、文件落点、清除凭据语义。
+- `test/smoke-client.mjs`（80 项）：`pnl.get` 已从产物消失、持仓表内容契约（成本价/股数/合计/两列盈亏/
+  编辑删除按钮/已清仓）、指数条 chip 读的是同一份现算数据。
+- `test/pnl-rpc.mjs`（21 项）：dispatch 契约与入参容错。
+
+**派生值不落盘的代价**：跨进程重启后的第一屏需要一次行情请求才有价格（约 1 次批量）。
+这与「账本快照能离线看旧价格」是不同取舍 —— 宁可首次空一下，也不要展示与用户刚改的股数不一致的价格。
+
+

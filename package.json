@@ -1,7 +1,7 @@
 {
   "name": "dsh-xueqiu-debug",
-  "version": "1.22.15-fork.2",
-  "description": "dsh-xueqiu 的本地 fork（dsh-xueqiu-debug）— 雪球 mini 行情面板：免登录 A股/港美股实时行情、K线、分时图、热榜、搜索、7x24 快讯。嵌入式面板 + 可拖拽行情徽标。另并入原 dsh-ths-pnl 的同花顺投资账本「今日盈亏」（面板头部常驻 chip + 盈亏 tab，与旧插件共用同一份凭据与快照）。相对上游 1.22.15 的改动：修复徽章位置在切换会话后被旧持久化值覆盖回右下角（即拖拽位置看似「丢失」）；拖拽即时落盘；水合改为应用级一次性执行；适配 DSH 0.2（`shell.run` → `shell.execute`+`result()`，此前升级到 0.2 后所有联网数据链路整条失效）。详见 FORK-NOTES.md。",
+  "version": "1.22.15-fork.6",
+  "description": "dsh-xueqiu 的本地 fork（dsh-xueqiu-debug）— 雪球 mini 行情面板：免登录 A股/港美股实时行情、K线、分时图、热榜、搜索、7x24 快讯。嵌入式面板 + 可拖拽行情徽标。内置「本地持仓」：持仓（股数/成本价）以本地文件为主数据、可手工增删改，当日盈亏 / 持仓盈亏 / 市值全部由雪球行情现算（不再向同花顺账本要数）；同花顺投资账本降级为「一次性导入/校对」——只在用户点「从账本同步」时才请求，账本 Cookie 失效不再拖垮实时盈亏（见 FORK-NOTES §10）。相对上游 1.22.15 的改动：修复徽章位置在切换会话后被旧持久化值覆盖回右下角；拖拽即时落盘；水合改为应用级一次性执行；适配 DSH 0.2（shell.run → shell.execute+result()）；账本比率字段的小数口径修正；把「今日盈亏」从账本小时级失效的静态快照改为「本地持仓 × 行情」现算。",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -56,7 +56,7 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "build:check": "node tools/build.mjs --check",
-    "test": "node test/pnl-session.mjs && node test/pnl-cookie.mjs && node test/smoke-host.mjs && node test/pnl-rpc.mjs && node test/smoke-client.mjs && node test/config.mjs && node test/alerts.mjs && node test/alerts-watcher.mjs",
+    "test": "node test/pnl-session.mjs && node test/pnl-cookie.mjs && node test/pnl-positions.mjs && node test/smoke-host.mjs && node test/pnl-rpc.mjs && node test/smoke-client.mjs && node test/config.mjs && node test/alerts.mjs && node test/alerts-watcher.mjs",
     "verify": "node tools/verify-bundle.mjs && node tools/verify-wiring.mjs && node tools/verify-install.mjs",
     "check": "node tools/build.mjs --check && node --check src/index.js && node --check src/client/index.js && node -e \"new Function(require('fs').readFileSync('dynamic/host.js','utf8'))\" && node -e \"new Function(require('fs').readFileSync('dynamic/client.js','utf8'))\" && node -e \"JSON.parse(require('fs').readFileSync('package.json','utf8'))\""
   }

@@ -21,8 +21,9 @@ export const HOT_MARKETS = [['cn', 'A股'], ['us', '美股'], ['hk', '港股'], 
 export const HOT_MARKET_LABELS = { cn: 'A股', hk: '港股', us: '美股', global: '全球' }
 
 // ---- 面板 tab 条（key + 文案）----
-// 顺序：原有 4 项位置不动，盈亏（pnl）为**追加**的第 5 项（宿主 ui.get 的 tab 白名单同步放行）。
-export const PANEL_TABS = [['market', '行情'], ['hot', '热榜'], ['search', '搜索'], ['news', '快讯'], ['pnl', '盈亏']]
+// 顺序：原有 4 项位置不动，盈亏（pnl）为第 5 项、持仓（positions）为**追加**的第 6 项
+// （宿主 ui.get 的 tab 白名单同步放行）。
+export const PANEL_TABS = [['market', '行情'], ['hot', '热榜'], ['search', '搜索'], ['news', '快讯'], ['pnl', '盈亏'], ['positions', '持仓']]
 
 // ---- 请求规模参数（属于 call() 参数形状的一部分，与原字面量一致）----
 export const NEWS_PAGE_SIZE = 20          // news count
@@ -58,8 +59,8 @@ export const POLL_CONTENT_CLOSED_MS = 180000 // 面板：休市热榜/快讯
 export const POLL_BADGE_MS = 30000           // 徽标
 export const POLL_TICKER_MS = 30000          // 底部指数条
 export const POLL_DOCK_SESSION_MS = 60000    // 面板头部交易时段文案重算
-// 今日盈亏：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
-export const PNL_POLL_FALLBACK_MS = 60000
+// 今日盈亏（本地持仓 × 行情）：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
+export const POSITIONS_POLL_FALLBACK_MS = 30000
 export const ALERT_POLL_MS = 30000
 export const ALERT_NOTICE_LIMIT = 20       // 首次加载仅展示有限待确认事件，避免旧事件撑爆面板
 

@@ -4,12 +4,12 @@
 // 原来靠父级闭包读的 state/句柄改为「调用点组装显式上下文 p」传入；本文件只保留数据逻辑。
 //
 // tab 分发表：ui.tab → 组件。注意 DetailView 不在此表 —— 详情由 view 真值门控（旧 if/else 链
-// 也是先判 view），且宿主 ui.get 会把 tab 白名单化成 market/hot/search/news/pnl。把 detail 塞进
+// 也是先判 view），且宿主 ui.get 会把 tab 白名单化成 market/hot/search/news/pnl/positions。把 detail 塞进
 // 查表会让理论上不可达的 tab='detail' 渲染详情骨架（旧行为是落到快讯页），属于行为变化。
 import { el, pageHidden } from '../dom.js'
 import { call, A_HOT, A_NEWS, A_KLINE, A_QUOTE_DETAIL, A_MINUTE, A_FINANCE, A_KOL, A_SEARCH, A_SEARCH_POSTS, A_LOGIN_STATUS, A_LOGIN_SAVE, A_LOGIN_LOGOUT, A_WATCHLIST_ADD, A_WATCHLIST_REMOVE, A_WATCHLIST_PULL } from '../platform.js'
 import { getUiRuntime } from '../store/ui.js'
-import { getPnlRuntime } from '../store/pnl.js'
+import { getPositionsRuntime } from '../store/positions.js'
 import { fetchQuote, fetchIndices, fetchWatchlist } from '../store/market.js'
 import { fetchAlerts, saveAlert, removeAlert, ackAlerts } from '../store/alerts.js'
 import { LoginBox } from './login.js'
@@ -19,9 +19,10 @@ import { HotTab } from './hot.js'
 import { SearchTab } from './search.js'
 import { NewsTab } from './news.js'
 import { PnlTab } from './pnl.js'
+import { PositionsTab } from './positions.js'
 import { PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, SEARCH_STOCK_SIZE, SEARCH_POST_SIZE, POLL_MARKET_OPEN_MS, POLL_MARKET_CLOSED_MS, POLL_CONTENT_OPEN_MS, POLL_CONTENT_CLOSED_MS, ALERT_POLL_MS, ALERT_NOTICE_LIMIT } from '../constants.js'
 
-const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab, pnl: PnlTab }
+const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab, pnl: PnlTab, positions: PositionsTab }
 
 // ---------- 面板内容（数据 + tabs + 详情） ----------
 export function XueqiuPanel() {
@@ -509,10 +510,10 @@ export function XueqiuPanel() {
       key: 'btn', className: 'xq-btn', disabled: loading, title: '刷新全部数据',
       onClick: function () {
         setLoading(true)
-        // 盈亏一并刷新：refresh() 内部已做并发去重，与后台轮询不会重复请求；
-        // 它自己吞掉失败（返回 null 而非拒绝），所以这里的 loading 语义与原来完全一致。
-        const pnlRt = getPnlRuntime()
-        Promise.all([refreshMarket(true), refreshContent(), pnlRt ? pnlRt.refresh(true) : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
+        // 持仓/盈亏视图一并刷新（refresh 内部已做并发去重，与后台轮询不会重复请求）；
+        // force=true 绕过行情 10 秒缓存，用户点了「刷新」就该看到新价。
+        const posRt = getPositionsRuntime()
+        Promise.all([refreshMarket(true), refreshContent(), posRt ? posRt.refresh(true) : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
       }
     }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
   ]))
@@ -566,6 +567,9 @@ export function XueqiuPanel() {
     },
     pnl: function () {
       return {}   // PnlTab 自身订阅盈亏运行时，不需要父级任何字段
+    },
+    positions: function () {
+      return {}   // PositionsTab 自身订阅持仓运行时，不需要父级任何字段
     }
   }
 

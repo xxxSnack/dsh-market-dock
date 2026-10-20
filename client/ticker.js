@@ -1,7 +1,7 @@
 // 底部指数条（会话页，输入框下方氛围行）。
 // 除指数外还常驻一条「今日盈亏」：面板收起时（DockGate 直接返回 null）头部 chip 是看不到的，
 // 而这条氛围行始终在，所以它是「收起面板也能看到盈亏」的唯一落点。
-// 与头部 chip 共用同一个 PnlChip（也就共用同一个轮询器，见 store/pnl.js 的引用计数）。
+// 与头部 chip 共用同一个 PnlChip（也就共用同一个轮询器，见 store/positions.js 的引用计数）。
 import { el } from './dom.js'
 import { fmt, fmtPct, colorOf } from './format.js'
 import { getUiRuntime } from './store/ui.js'

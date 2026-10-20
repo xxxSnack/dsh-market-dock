@@ -898,7 +898,7 @@ function installUiState(core) {
   async function actUiGet() {
     const s = await loadUiState()
     const hNum = Number(s.dockH)
-    const validTabs = ['market', 'hot', 'search', 'news', 'pnl']
+    const validTabs = ['market', 'hot', 'search', 'news', 'pnl', 'positions']
     return {
       // 损坏状态文件的非法 tab 一律回退（防类型穿透）
       tab: (typeof s.tab === 'string' && validTabs.indexOf(s.tab) >= 0) ? s.tab : 'market',
@@ -944,45 +944,80 @@ function installUiState(core) {
   core.actUiSet = actUiSet
 }
 
-// 今日盈亏（同花顺投资账本）常量：端点 / UA / 轮询钳制 / 与 dsh-ths-pnl 共用的状态文件名。
+// 账本（同花顺投资账本）常量 + **本地持仓**的状态文件名。
+//
+// ⚠ 架构（fork.6 起）：账本从「分时数据源」降级为「一次性导入 / 校对工具」。
+//   · 持仓是**本地文件**（positions.json）里的主数据，用户可手动增删改；
+//   · 今日盈亏等实时数字由「本地持仓 × 雪球行情」现算，**一次账本请求都不发**；
+//   · 只有用户点「从账本同步」时才请求账本 HTTP 接口（见 index.js 的 actPositionsSync）。
+//
+// 为什么这么改（真实事故，别改回去）：账本要求一个由页面 JS（chameleon）生成的反爬令牌，
+// 它寿命很短且由**浏览器**不断重新生成；我们保存的是某一刻的快照，过了窗口就整片 403，
+// 而浏览器同一时刻完全正常。历史版本没有任何续期手段（不读 Set-Cookie、没有刷新接口），
+// 以前能用是因为上游当年接受长期冻结的快照。把「实时口径」压在这样一份凭据上，等于每小时断一次。
 //
 // 铁律（INTERFACE.md §0）：本文件属于宿主 lib/ 拼接产物，动态形态下整份源码会被
 // `new Function` 求值 —— 因此**禁止 node: import、禁止裸 setTimeout/fetch**，
 // 一切 IO 都走 ctx（shell / fs / sandboxPolicy），定时走 ctx.timeout。
 
-/** 当日盈亏分时端点（逐字搬自 dsh-ths-pnl，勿改）。 */
-const PNL_URL = 'https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/asset/v1/time_share'
 /** 组合账户列表端点，用来探测 fund_key / 校验 Cookie。 */
 const ACCOUNT_LIST_URL = 'https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/account/v1/account_list'
+/**
+ * 账户级当日盈亏分时端点。**只在手动同步时顺带取一次**，用来说明「账本口径」与
+ * 「本地浮动口径」差多少（账本含当日已实现与费用），不再作为实时数据源。
+ */
+const PNL_URL = 'https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/asset/v1/time_share'
+/**
+ * 持仓明细端点。前端 service 层 `requestStockPosition`（PC bundle 里的 `s.jJ`）指向
+ * `/caishen_fund/pc/asset/v1/stock_position`，请求体与 time_share 同族，响应 ex_data.position[]
+ * 里 `count`=股数、`cost`=持仓成本价（摊薄成本）—— 字段对照见 FORK-NOTES「持仓同步」一节。
+ */
+const STOCK_POSITION_URL = 'https://tzzb.10jqka.com.cn/caishen_httpserver/tzzb/caishen_fund/pc/asset/v1/stock_position'
 /** 账本网页端同款 UA（account_list 网关只认最小请求头，UA 必须与网页一致）。 */
 const PNL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
 /** 金额字段的候选名（接口未公开、字段名可能变），按优先级探测。 */
 const YK_KEYS = ['yk', 'today_yk', 'day_yk', 'todayyk', 'yk_today', 'today_profit', 'profit']
 
-/** 盘中心跳间隔下限：账本接口未公开，调太快会被风控盯上（5 秒）。 */
+/**
+ * 实时盈亏的刷新间隔：**行情**的节奏，不是账本的。
+ * 默认 30 秒（比原来 60 秒的账本心跳更密，但打的是雪球、有 10 秒缓存与并发闸门兜着）；
+ * 用户可在「盈亏」tab 调整（秒），越界夹到 [MIN, MAX]。
+ */
+const DEFAULT_POLL_MS = 30_000
+/** 刷新间隔下限：5 秒（再密没有意义，雪球侧 10s 缓存会直接命中）。 */
 const MIN_POLL_MS = 5_000
-/** 盘中心跳间隔上限（1 小时）。 */
+/** 刷新间隔上限（1 小时）。 */
 const MAX_POLL_MS = 3_600_000
-/** 盘中心跳默认值（60 秒）。 */
-const DEFAULT_POLL_MS = 60_000
-/** 收盘后隔多久再补拉一次，让收盘价落定（只补一次，之后冻结）。 */
-const CLOSE_SETTLE_MS = 45_000
-/** 宿主启动后的补拉延迟：错开插件加载高峰。 */
-const STARTUP_DELAY_MS = 3_000
 
-/** 状态目录名（**必须与 dsh-ths-pnl 相同**：两边共用同一份 Cookie / 快照）。 */
+/** 状态目录名（**必须与 dsh-ths-pnl 相同**：两边共用同一份 Cookie）。 */
 const PNL_STATE_DIR = 'dsh-ths-pnl'
 /** 凭据文件（Cookie / fundKey / pollSec），读-改-写合并式。 */
 const CONFIG_FILE = 'config.json'
-/** 快照文件（最后一次已知盈亏），与凭据分离：清 Cookie 不抹掉最后已知值。 */
-const SNAPSHOT_FILE = 'snapshot.json'
+/**
+ * 本地持仓文件。**这是主数据**：用户手改的就是它，云端同步也是写它。
+ * 只存输入字段（code / name / qty / cost），价格与盈亏一律现算、不落盘 ——
+ * 否则「编辑股数后现价还是旧的」这种自相矛盾的状态一定会出现。
+ */
+const POSITIONS_FILE = 'positions.json'
+/**
+ * 持仓文件的结构版本号。历次变更：
+ *   v3：账本快照（行内是账本派生字段：price/value/hold_profit/day_profit…）；
+ *   v4：**本地持仓**（行内只有 code/name/qty/cost，价格与盈亏由行情现算）。
+ * v3 → v4 会自动迁移（只取四个输入字段），不需要用户重录。
+ */
+const POSITIONS_SCHEMA = 4
+/**
+ * 云端同步失败后的「冷却提示」时长（10 分钟）。**不拦用户**（同步是用户刻意点的，他有权再试），
+ * 只用于在界面上说明「刚失败过，多半还是同一个原因」，避免反复点造成无谓的打点。
+ */
+const BLOCKED_BACKOFF_MS = 10 * 60_000
 /** Cookie 长度上限：RPC body 上限 1MB，这里再兜一层，防止把整个浏览器 Cookie 灌进状态文件。 */
 const MAX_COOKIE_LEN = 8_192
 
 /**
  * HTTP 状态码探针标记：curl `-w '\n__HTTP__%{http_code}'` 把状态码追加在 stdout 末尾。
- * 旧插件用 fetch 的 res.status，宿主侧只能用 curl —— 没有这个标记就拿不到状态码，
- * 也就无法区分「Cookie 过期(401/403)」和「接口报错(200 + error_code)」。
+ * 没有这个标记就拿不到状态码，也就无法区分「会话失效(401)」「账本网关拒绝(403 + HTML)」
+ * 和「接口报错(200 + error_code)」。
  */
 const HTTP_MARK = '__HTTP__'
 
@@ -1216,11 +1251,369 @@ const pnlRequest = async function (core, url, body, cookie, opts) {
   return splitStatus(String((result.stdout && result.stdout.text) || ''))
 }
 
-// 今日盈亏：与 dsh-ths-pnl **共用**同一份状态文件（$DSH_HOME/dsh-ths-pnl/）。
+// 今日盈亏：组合列表 / 盈亏采集 / Cookie 校验（同花顺投资账本）。
 //
-// 为什么要共用：旧插件（dsh-ths-pnl）与新版面板可能同时在跑，用户不应该重新粘一次
-// Cookie；快照分文件存放也是有意的 —— 清 Cookie（config.json）不该顺手抹掉
-// 「最后已知盈亏」（snapshot.json），反之亦然。
+// 三个坑逐字继承自旧插件（都是真实事故）：
+//   1. account_list 网关**只认最小请求头**（UA，多带 Accept/Referer 会被拒）；
+//   2. Cookie 里的 userid 必须**锚定**解析，否则会读到 pex_userid（→ 403）；
+//   3. 凭据类请求**绝不跟随重定向**（Cookie 不能外泄到别的 origin）。
+
+
+/** 3xx：网关重定向（旧实现 redirect:'manual' 拒绝跟随，这里同样按异常报出来）。 */
+const PNL_REDIRECT_STATUS = new Set([301, 302, 303, 307, 308])
+
+/**
+ * 403 的响应体是不是账本前置 Nginx 的通用拒绝页（HTML），而不是会话失效的 JSON。
+ *
+ * 为什么要分：两者处置不同。上游给的这条通用页**不区分原因**（实测），至少两种都会长这样：
+ *   - **Cookie 里的令牌过期/轮换**（`v` 这类反爬令牌有 TTL）—— 真实事故就是它：用户重新从账本页面
+ *     复制 Cookie 粘贴后立刻恢复，而同一时刻**浏览器一直正常**（浏览器自己会刷新令牌）；
+ *   - **突发请求触发限流** —— 这时该停手等待，连发只会延长窗口。
+ * 所以文案**不能**断言是哪一种（早先写成「不是 Cookie 过期」，正好把用户引到错误方向、白等 10 分钟），
+ * 而要同时给出两条线索与各自的处置。JSON 形态的 403 才是明确的会话失效。
+ */
+function isWafPage(text) {
+  const t = String(text == null ? '' : text).trim()
+  if (t === '') return false
+  return t.charAt(0) === '<' || /Nginx forbidden/i.test(t)
+}
+
+/** 通用 403 拒绝页的用户可读说明（两种可能 + 各自的动作，不替上游下结论）。 */
+const GATEWAY_403_TEXT = '账本网关拒绝 (HTTP 403)：Cookie 里的令牌可能已过期'
+  + '（从账本页面重新复制 Cookie 即可恢复），也可能只是风控限流（停一会儿会自动恢复）；已暂停重试'
+
+/**
+ * POST 表单并解析 JSON（错误语义与旧插件的 postForm 一一对应）。
+ * @returns {{ok:true, body:object}|{ok:false, tokenExpired:boolean, blocked:boolean, error:string}}
+ */
+async function postPnlForm(core, url, payload, cookie, opts) {
+  let res
+  try {
+    res = await pnlRequest(core, url, payload, cookie, opts)
+  } catch (error) {
+    return { ok: false, tokenExpired: false, blocked: false, error: '网络错误: ' + String((error && error.message) || error) }
+  }
+  const status = Number(res.status) || 0
+  if (PNL_REDIRECT_STATUS.has(status)) {
+    return { ok: false, tokenExpired: false, blocked: false, error: '接口重定向未跟随 (HTTP ' + status + ')' }
+  }
+  if (status === 401) {
+    return { ok: false, tokenExpired: true, blocked: false, error: 'TOKEN_EXPIRED (HTTP 401)' }
+  }
+  if (status === 403) {
+    // 403 分两种：通用拒绝页（HTML，原因见 isWafPage 注释）≠ 会话失效（JSON）
+    if (isWafPage(res.text)) {
+      return { ok: false, tokenExpired: false, blocked: true, error: GATEWAY_403_TEXT }
+    }
+    return { ok: false, tokenExpired: true, blocked: false, error: 'TOKEN_EXPIRED (HTTP 403)' }
+  }
+  if (status < 200 || status >= 300) {
+    return { ok: false, tokenExpired: false, blocked: false, error: 'HTTP ' + status }
+  }
+  try {
+    return { ok: true, body: JSON.parse(res.text) }
+  } catch (e) {
+    return { ok: false, tokenExpired: false, blocked: false, error: '响应解析失败' }
+  }
+}
+
+/** 取 Cookie 里的 userid（锚定解析，见文件头第 2 条）。 */
+function pnlUserId(cookie) {
+  return cookieField(normalizeCookie(cookie), 'userid') || ''
+}
+
+/** account_list 的请求体（旧插件逐字）。 */
+function accountPayload(userId) {
+  return 'terminal=1&version=0.0.0&userid=' + userId + '&user_id=' + userId
+}
+
+/** 从最后一个采样点里探出金额字段。 */
+function pickYk(point) {
+  for (const key of YK_KEYS) {
+    if (point?.[key] !== undefined && point?.[key] !== null) {
+      return { value: Number(point[key]) || 0, field: key }
+    }
+  }
+  return { value: 0, field: '' }
+}
+
+/** 组合账户列表（fund_key / manualname / brokername）。失败返回空数组（调用方决定文案）。 */
+const listPortfolios = async function (core, cookie) {
+  const userId = pnlUserId(cookie)
+  const r = await postPnlForm(core, ACCOUNT_LIST_URL, accountPayload(userId), cookie, { minimal: true })
+  if (!r.ok) return []
+  const common = r.body?.ex_data?.common ?? []
+  return common
+    .map(item => ({
+      fund_key: String(item?.fund_key ?? ''),
+      manualname: String(item?.manualname ?? ''),
+      brokername: String(item?.brokername ?? ''),
+    }))
+    .filter(p => p.fund_key.length > 0)
+}
+
+/**
+ * 取一次快照：今日盈亏金额 + 百分比（金额字段名动态探测）。
+ * @returns {{pnl_yk:number, pnl_pct:number, error:string, token_expired:boolean, blocked:boolean, yk_field:string}}
+ */
+const collectPnl = async function (core, cookie, fundKey) {
+  const userId = pnlUserId(cookie)
+  const payload = accountPayload(userId)
+    + '&manual_id=&fundid=&fund_key=' + String(fundKey ?? '') + '&rzrq_fund_key=&custid='
+  const r = await postPnlForm(core, PNL_URL, payload, cookie)
+  if (!r.ok) {
+    return { pnl_yk: 0, pnl_pct: 0, error: r.error, token_expired: r.tokenExpired, blocked: r.blocked, yk_field: '' }
+  }
+  if (r.body?.error_code !== undefined && String(r.body.error_code) !== '0') {
+    return { pnl_yk: 0, pnl_pct: 0, error: String(r.body?.error_msg ?? 'API 错误'), token_expired: false, blocked: false, yk_field: '' }
+  }
+  const points = r.body?.ex_data?.data ?? []
+  if (points.length === 0) {
+    return { pnl_yk: 0, pnl_pct: 0, error: '接口返回空数据（可能今日无成交/未上传数据）', token_expired: false, blocked: false, yk_field: '' }
+  }
+  const last = points[points.length - 1]
+  const yk = pickYk(last)
+  return {
+    pnl_yk: yk.value,
+    pnl_pct: Number(last?.zf) || 0,
+    error: '',
+    token_expired: false,
+    blocked: false,
+    yk_field: yk.field,
+  }
+}
+
+/** 容错取数：允许 `HK$1.234`、`1,234.5`、空串这类上游写法；取不到给 null（界面显示 `--`，不假装是 0）。 */
+function toNum(value) {
+  if (value === undefined || value === null) return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  const cleaned = String(value).replace(/HK\$/gi, '').replace(/,/g, '').trim()
+  if (cleaned === '') return null
+  const n = Number(cleaned)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
+ * 比率 → 百分数。**账本这一族接口的比率字段都是小数比率**，不是百分数（实测原始字符串对比）：
+ *
+ *   - `position_rate` 0.9568 / 0.7329 = 总市值/总资产（与 Σcount×price ÷ total_asset 逐位相等）；
+ *   - `hold_rate` -0.0623 = 该只持仓收益率（-620/(9330+620) = -6.23% 逐位吻合）；
+ *   - `pre_rate` -0.0002 = 当日收益率（同族字段，同为小数）。
+ *
+ * 上游给的是 4 位小数，直接当百分数渲染会**小 100 倍**（「-0.06%」看着像没波动，实际 -6%）。统一在
+ * 这里乘 100，兼容将来改成百分数口径的上游：|n| > 1.5 视为已经是百分数（注意这条启发式的灰色地带——
+ * 若上游某天真改发百分数，0~1.5% 的区间会被放大 100 倍；届时按此注释改判据）。
+ * 乘完做 6 位取整，消掉 0.086×100 = 8.600000000000001 这类浮点毛刺。
+ */
+function ratioPct(value) {
+  const n = toNum(value)
+  if (n === null) return null
+  if (Math.abs(n) <= 1.5) return Math.round(n * 100 * 1e6) / 1e6
+  return n
+}
+
+/**
+ * 一行**本地持仓**（positions.json 里的形状）。只有输入字段：
+ *
+ *   code 证券代码（唯一键）· name 名称 · qty 股数 · cost 持仓成本价（摊薄成本）
+ *
+ * 价格 / 市值 / 当日盈亏 / 持仓盈亏**一律现算、不落盘**（见 index.js 的 buildView）——
+ * 一旦落盘，用户改完股数后现价里还带着旧值，界面就会自相矛盾。
+ * 字段名与雪球行情层对齐（code/name），股数与成本价沿用账本口径（count/cost 的语义）。
+ *
+ * @returns {{code:string,name:string,qty:number|null,cost:number|null}|null} 代码为空返回 null
+ */
+function normalizeRow(raw) {
+  const r = raw || {}
+  let code = String(r.code == null ? '' : r.code).trim().toUpperCase()
+  // 港股：账本写 `HK00700`、雪球写 `00700`、用户可能两种都填 —— 统一成雪球形态（5 位裸代码），
+  // 否则同一个标的会以两个键存在，合并/去重全部失效。
+  const hk = /^HK(\d{5})$/.exec(code)
+  if (hk) code = hk[1]
+  if (!code) return null
+  const qty = toNum(r.qty)
+  const cost = toNum(r.cost)
+  return {
+    code: code,
+    name: String(r.name == null ? '' : r.name).trim(),
+    // 负股数/负成本没有意义（做空、负成本价不在本插件范围内）——收敛到 0 而不是静默取反。
+    qty: (qty !== null && qty < 0) ? 0 : qty,
+    cost: (cost !== null && cost < 0) ? 0 : cost,
+  }
+}
+
+/** 规整一整张持仓表：逐行 normalize，按 code 去重（后出现的覆盖先出现的），丢掉认不出的行。 */
+function normalizeRows(list) {
+  const out = []
+  const seen = Object.create(null)
+  const arr = Array.isArray(list) ? list : []
+  for (const raw of arr) {
+    const row = normalizeRow(raw)
+    if (!row) continue
+    if (seen[row.code] !== undefined) {
+      out[seen[row.code]] = row
+      continue
+    }
+    seen[row.code] = out.length
+    out.push(row)
+  }
+  return out
+}
+
+/**
+ * 一行**账本**持仓 → 本地持仓行。
+ *
+ * 只取 count（股数）与 cost（持仓成本价 = 摊薄成本，用户明确要的就是这一列），
+ * 其余字段一概不取：账本给的价格/盈亏是**它自己的快照时刻**的值，进了本地库就会过期，
+ * 而本地口径一律用行情现算（见 dayProfitOf / dayRateOf）。
+ *
+ * 顺带记住一个口径事实（别再踩）：账本的 pre_profit/pre_rate 是**昨日**盈亏、before_pre_* 是
+ * **前日**，不是当日；上游没有逐只当日字段（前端行模型里 dryk/drykb 也是显式 null）。
+ */
+function mapLedgerRow(row) {
+  const r = row || {}
+  return normalizeRow({
+    code: r.code,
+    name: r.name,
+    qty: r.count,
+    cost: r.cost,
+  })
+}
+
+/**
+ * 账本持仓代码 → 雪球行情代码。
+ *
+ * 以**代码形态**为准，不依赖账本的 `market` 枚举（实测沪市=2、深市=1，但那是账本内部枚举、
+ * 含义未公开，不能当契约）：
+ *   6 / 9 开头 → 沪市（600/601/603/605/688 沪A、900 B股）
+ *   5 开头     → 沪市基金（510300 等）
+ *   0 / 1 / 2 / 3 开头 → 深市（000/002/300 深A、1xx 深市基金/ETF、200 B股）
+ *   5 位纯数字 / 带 HK 前缀 → 港股（雪球用 5 位裸代码，如 00700）
+ *   字母开头   → 原样（美股等）
+ * 认不出来给空串：该只当日盈亏显示 --，不影响其余字段。
+ */
+function positionSymbol(code, market) {
+  const raw = String(code == null ? '' : code).trim().toUpperCase().replace(/^HK/, '')
+  if (!raw) return ''
+  if (/^\d{5}$/.test(raw)) return raw
+  if (/^\d{6}$/.test(raw)) {
+    const head = raw.charAt(0)
+    if (head === '5' || head === '6' || head === '9') return 'SH' + raw
+    if (head === '0' || head === '1' || head === '2' || head === '3') return 'SZ' + raw
+    return ''
+  }
+  if (/^[A-Z][A-Z0-9.]*$/.test(raw)) return raw
+  return ''
+}
+
+/** 保留两位小数（金额）。 */
+function round2(n) { return Math.round(n * 100) / 100 }
+
+/**
+ * 当日盈亏（元）。账本接口不给逐只当日值（见 mapLedgerRow），所以一律用行情现算：
+ *
+ *   当日盈亏 =（雪球现价 − 雪球昨收）× 本地股数
+ *
+ * 为什么不用「市值 × 行情涨跌幅」：行情涨跌幅只有两位小数，取整误差会被市值放大
+ * （实测 君正 -2.95% × 23050 = -700.64，而真实是 -700.00）。用昨收能逐分对齐。
+ * 昨收缺失时退化成「市值 × pct/(100+pct)」；两者都缺 → null（界面 --，不假装 0）。
+ */
+function dayProfitOf(price, qty, lastClose, pct, value) {
+  const p = toNum(price)
+  const q = toNum(qty)
+  const lc = toNum(lastClose)
+  if (p !== null && q !== null && lc !== null && lc > 0) return round2((p - lc) * q)
+  const v = toNum(value)
+  const pc = toNum(pct)
+  if (v !== null && pc !== null && pc > -100) return round2(v * pc / (100 + pc))
+  return null
+}
+
+/** 当日涨跌幅（百分数）= 现价 / 昨收 − 1；昨收缺失时用行情涨跌幅原样。 */
+function dayRateOf(price, lastClose, pct) {
+  const p = toNum(price)
+  const lc = toNum(lastClose)
+  if (p !== null && lc !== null && lc > 0) return Math.round((p / lc - 1) * 100 * 1e4) / 1e4
+  const pc = toNum(pct)
+  return pc === null ? null : pc
+}
+
+/**
+ * 从账本取一次持仓（**只有用户点「从账本同步」时才会走到这里**，见 index.js 的 actPositionsSync）。
+ *
+ * 请求体与 time_share **同族**（`terminal/version/userid/user_id/manual_id/fundid/fund_key/
+ * rzrq_fund_key/custid`）—— 实测该形状原样可用，故不额外带 `is_merge`（前端默认合仓开关关闭时
+ * 也不带，行为一致）。刻意不做任何写操作，本函数只读。
+ *
+ * 返回的行只有 code/name/qty/cost（本地口径），账户合计单独回传给「同步报告」用 ——
+ * 账本给的价格与盈亏是它自己的快照时刻的值，不进本地库。
+ *
+ * @returns {{rows:Array, summary:object|null, error:string, token_expired:boolean, blocked:boolean}}
+ */
+const collectPositions = async function (core, cookie, fundKey) {
+  const userId = pnlUserId(cookie)
+  const payload = accountPayload(userId)
+    + '&manual_id=&fundid=&fund_key=' + String(fundKey ?? '') + '&rzrq_fund_key=&custid='
+  const r = await postPnlForm(core, STOCK_POSITION_URL, payload, cookie)
+  if (!r.ok) {
+    return { rows: [], summary: null, error: r.error, token_expired: r.tokenExpired, blocked: r.blocked }
+  }
+  if (r.body?.error_code !== undefined && String(r.body.error_code) !== '0') {
+    return { rows: [], summary: null, error: String(r.body?.error_msg ?? 'API 错误'), token_expired: false, blocked: false }
+  }
+  const ex = r.body?.ex_data ?? {}
+  const rows = Array.isArray(ex.position) ? ex.position.map(mapLedgerRow).filter(Boolean) : []
+  return {
+    rows: rows,
+    summary: {
+      // 字段含义**由真实数据自证**（不是猜字段名）：实测
+      //   total_value  = Σ(count×price) = 持仓总市值（90217.4）
+      //   total_asset  = total_value + money_remain = 总资产（94291.79）
+      //   position_rate= total_value / total_asset = 0.9568（**小数比率**）
+      //   upload_time  = 账本数据时间（epoch 毫秒字符串）
+      money_remain: toNum(ex.money_remain),
+      total_value: toNum(ex.total_value),
+      total_asset: toNum(ex.total_asset),
+      position_rate: toNum(ex.position_rate),
+      position_pct: ratioPct(ex.position_rate),
+      total_liability: toNum(ex.total_liability),
+      upload_time: String(ex.upload_time ?? ''),
+    },
+    error: '',
+    token_expired: false,
+    blocked: false,
+  }
+}
+
+/** 校验 Cookie 是否被账本接受，并顺带回传组合列表。 */
+const verifyCookie = async function (core, cookie) {
+  const ck = normalizeCookie(cookie)
+  if (!ck) return { valid: false, error: '未配置 Cookie', portfolios: [] }
+  const userId = pnlUserId(ck)
+  if (!userId) return { valid: false, error: 'Cookie 缺少 userid 字段，可能已失效', portfolios: [] }
+  const r = await postPnlForm(core, ACCOUNT_LIST_URL, accountPayload(userId), ck, { minimal: true })
+  if (!r.ok) {
+    return {
+      valid: false,
+      error: r.tokenExpired ? 'Cookie 已过期，请重新登录投资账本后重新粘贴' : r.error,
+      portfolios: [],
+    }
+  }
+  const code = r.body?.error_code
+  if (code !== undefined && String(code) !== '0') {
+    return { valid: false, error: '账本拒绝请求: ' + String(r.body?.error_msg ?? '未知错误'), portfolios: [] }
+  }
+  const portfolios = await listPortfolios(core, ck)
+  return { valid: true, error: '', portfolios: portfolios, user_id: userId }
+}
+
+// 状态文件读写：账本**凭据**（config.json）+ **本地持仓**（positions.json）。
+//
+// 为什么持仓要独立一份、而且是主数据：持仓大多数时间不变，用户还可能想手改（补一只、改股数、
+// 删掉已清仓的）。它是「输入」，价格与盈亏是「输出」——输出绝不落盘（见 constants.js 的说明）。
+//
+// 旧快照文件 snapshot.json 属于「账本分时口径」时代（每分钟一次的账户级盈亏），已不再读写：
+// 留着不动，也不会被本插件删除（旧插件 dsh-ths-pnl 若还在用，它的数据不受影响）。
 //
 // 落点解析与宿主 state.js 同套路（稳定目录优先 + 沙箱可写性探测 + 工作区回退），
 // 但**独立 memo** core.pnlBasePromise：两套东西的默认目录不同、探测失败时机也不同。
@@ -1273,7 +1666,7 @@ const pnlStateWrite = async function (core, name, text) {
   const fs = core.ctx.get('fs')
   const sp = core.ctx.get('sandboxPolicy')
   const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
-  if (!fs) throw new Error('fs 服务不可用，无法保存今日盈亏配置')
+  if (!fs) throw new Error('fs 服务不可用，无法保存状态文件')
   const dir = await pnlStateBase(core)
   const target = await fs.resolve(dir ? dir + '/' + name : name, { cwd: root })
   await fs.writeText(target, String(text))
@@ -1300,161 +1693,98 @@ const savePnlConfig = async function (core, patch) {
   return next
 }
 
-/** 读快照（snapshot.json）。缺失 / 损坏都返回 null。 */
-const loadPnlSnapshot = async function (core) {
-  try {
-    const text = await pnlStateRead(core, SNAPSHOT_FILE)
-    const parsed = text == null ? null : JSON.parse(text)
-    return (parsed && typeof parsed === 'object') ? parsed : null
-  } catch (e) { return null }
-}
+// ---- 本地持仓（positions.json）----
 
-/** 写快照：**写不了不该让请求失败**，所以这里静默（与旧插件 saveSnapshot 一致）。 */
-const savePnlSnapshot = async function (core, snapshot) {
-  try {
-    await pnlStateWrite(core, SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2))
-    return true
-  } catch (e) { return false }
-}
-
-// 今日盈亏：组合列表 / 盈亏采集 / Cookie 校验（同花顺投资账本）。
-//
-// 三个坑逐字继承自旧插件（都是真实事故）：
-//   1. account_list 网关**只认最小请求头**（UA，多带 Accept/Referer 会被拒）；
-//   2. Cookie 里的 userid 必须**锚定**解析，否则会读到 pex_userid（→ 403）；
-//   3. 凭据类请求**绝不跟随重定向**（Cookie 不能外泄到别的 origin）。
-
-
-/** 3xx：网关重定向（旧实现 redirect:'manual' 拒绝跟随，这里同样按异常报出来）。 */
-const PNL_REDIRECT_STATUS = new Set([301, 302, 303, 307, 308])
-
-/**
- * POST 表单并解析 JSON（错误语义与旧插件的 postForm 一一对应）。
- * @returns {{ok:true, body:object}|{ok:false, tokenExpired:boolean, error:string}}
- */
-async function postPnlForm(core, url, payload, cookie, opts) {
-  let res
-  try {
-    res = await pnlRequest(core, url, payload, cookie, opts)
-  } catch (error) {
-    return { ok: false, tokenExpired: false, error: '网络错误: ' + String((error && error.message) || error) }
-  }
-  const status = Number(res.status) || 0
-  if (PNL_REDIRECT_STATUS.has(status)) {
-    return { ok: false, tokenExpired: false, error: '接口重定向未跟随 (HTTP ' + status + ')' }
-  }
-  if (status === 401 || status === 403) {
-    return { ok: false, tokenExpired: true, error: 'TOKEN_EXPIRED (HTTP ' + status + ')' }
-  }
-  if (status < 200 || status >= 300) {
-    return { ok: false, tokenExpired: false, error: 'HTTP ' + status }
-  }
-  try {
-    return { ok: true, body: JSON.parse(res.text) }
-  } catch (e) {
-    return { ok: false, tokenExpired: false, error: '响应解析失败' }
-  }
-}
-
-/** 取 Cookie 里的 userid（锚定解析，见文件头第 2 条）。 */
-function pnlUserId(cookie) {
-  return cookieField(normalizeCookie(cookie), 'userid') || ''
-}
-
-/** account_list 的请求体（旧插件逐字）。 */
-function accountPayload(userId) {
-  return 'terminal=1&version=0.0.0&userid=' + userId + '&user_id=' + userId
-}
-
-/** 从最后一个采样点里探出金额字段。 */
-function pickYk(point) {
-  for (const key of YK_KEYS) {
-    if (point?.[key] !== undefined && point?.[key] !== null) {
-      return { value: Number(point[key]) || 0, field: key }
-    }
-  }
-  return { value: 0, field: '' }
-}
-
-/** 组合账户列表（fund_key / manualname / brokername）。失败返回空数组（调用方决定文案）。 */
-const listPortfolios = async function (core, cookie) {
-  const userId = pnlUserId(cookie)
-  const r = await postPnlForm(core, ACCOUNT_LIST_URL, accountPayload(userId), cookie, { minimal: true })
-  if (!r.ok) return []
-  const common = r.body?.ex_data?.common ?? []
-  return common
-    .map(item => ({
-      fund_key: String(item?.fund_key ?? ''),
-      manualname: String(item?.manualname ?? ''),
-      brokername: String(item?.brokername ?? ''),
-    }))
-    .filter(p => p.fund_key.length > 0)
+/** 空持仓表：首次使用 / 文件损坏 / schema 认不出来时的兜底（**不会**让界面报错）。 */
+function emptyPositions(extra) {
+  return Object.assign({
+    schema: POSITIONS_SCHEMA,
+    updated_at: null,      // 本地最后一次修改（增删改都会刷新）
+    rows: [],              // 输入字段：code / name / qty / cost
+    cloud: null,           // 最后一次云端同步的元信息（见 index.js 的 syncMeta）
+  }, extra || {})
 }
 
 /**
- * 取一次快照：今日盈亏金额 + 百分比（金额字段名动态探测）。
- * @returns {{pnl_yk:number, pnl_pct:number, error:string, token_expired:boolean, yk_field:string}}
+ * 读本地持仓。**永不返回 null**（调用方不必到处判空）：读不到就是空表。
+ *
+ * 兼容两代结构：
+ *   v4 → 直接用；
+ *   v3（账本快照）→ 只取 code/name/qty/cost 四个输入字段迁移成 v4，
+ *                   派生字段（price/value/hold_profit/day_profit…）一律丢弃 —— 它们是
+ *                   账本某个时刻的快照，留着会让「编辑股数后现价不动」自相矛盾。
+ * 其它（损坏 / 未来版本 / 空文件）→ 空表。
  */
-const collectPnl = async function (core, cookie, fundKey) {
-  const userId = pnlUserId(cookie)
-  const payload = accountPayload(userId)
-    + '&manual_id=&fundid=&fund_key=' + String(fundKey ?? '') + '&rzrq_fund_key=&custid='
-  const r = await postPnlForm(core, PNL_URL, payload, cookie)
-  if (!r.ok) {
-    return { pnl_yk: 0, pnl_pct: 0, error: r.error, token_expired: r.tokenExpired, yk_field: '' }
-  }
-  if (r.body?.error_code !== undefined && String(r.body.error_code) !== '0') {
-    return { pnl_yk: 0, pnl_pct: 0, error: String(r.body?.error_msg ?? 'API 错误'), token_expired: false, yk_field: '' }
-  }
-  const points = r.body?.ex_data?.data ?? []
-  if (points.length === 0) {
-    return { pnl_yk: 0, pnl_pct: 0, error: '接口返回空数据（可能今日无成交/未上传数据）', token_expired: false, yk_field: '' }
-  }
-  const last = points[points.length - 1]
-  const yk = pickYk(last)
-  return {
-    pnl_yk: yk.value,
-    pnl_pct: Number(last?.zf) || 0,
-    error: '',
-    token_expired: false,
-    yk_field: yk.field,
-  }
-}
+const loadPositions = async function (core) {
+  let parsed = null
+  try {
+    const text = await pnlStateRead(core, POSITIONS_FILE)
+    parsed = text == null ? null : JSON.parse(text)
+  } catch (e) { parsed = null }
+  if (!parsed || typeof parsed !== 'object') return emptyPositions()
 
-/** 校验 Cookie 是否被账本接受，并顺带回传组合列表。 */
-const verifyCookie = async function (core, cookie) {
-  const ck = normalizeCookie(cookie)
-  if (!ck) return { valid: false, error: '未配置 Cookie', portfolios: [] }
-  const userId = pnlUserId(ck)
-  if (!userId) return { valid: false, error: 'Cookie 缺少 userid 字段，可能已失效', portfolios: [] }
-  const r = await postPnlForm(core, ACCOUNT_LIST_URL, accountPayload(userId), ck, { minimal: true })
-  if (!r.ok) {
+  const rows = normalizeRows(parsed.rows)
+  const cloud = (parsed.cloud && typeof parsed.cloud === 'object') ? parsed.cloud : null
+  const version = Number(parsed.schema)
+  if (version === POSITIONS_SCHEMA) {
     return {
-      valid: false,
-      error: r.tokenExpired ? 'Cookie 已过期，请重新登录投资账本后重新粘贴' : r.error,
-      portfolios: [],
+      schema: POSITIONS_SCHEMA,
+      updated_at: parsed.updated_at || null,
+      rows: rows,
+      cloud: cloud,
     }
   }
-  const code = r.body?.error_code
-  if (code !== undefined && String(code) !== '0') {
-    return { valid: false, error: '账本拒绝请求: ' + String(r.body?.error_msg ?? '未知错误'), portfolios: [] }
-  }
-  const portfolios = await listPortfolios(core, ck)
-  return { valid: true, error: '', portfolios: portfolios, user_id: userId }
+  // 旧结构（≤ v3）：能迁多少迁多少，`migrated_from` 让界面/日志能说清数据是哪来的。
+  return emptyPositions({
+    rows: rows,
+    cloud: cloud,
+    updated_at: parsed.updated_at || null,
+    migrated_from: Number.isFinite(version) ? version : 'unknown',
+  })
 }
 
-// 今日盈亏：installPnl(core) —— 三个 RPC 动作（pnl.get / pnl.verify / pnl.config）
-// 与「交易时段边界 + 盘中心跳」调度器。
+/**
+ * 写本地持仓。**抛错**（与凭据一致）：写不进去就不能假装保存成功 ——
+ * 用户刚改的股数丢了却弹出「已保存」，比直接报错糟糕得多。
+ */
+const savePositions = async function (core, store) {
+  const s = store || {}
+  const next = {
+    schema: POSITIONS_SCHEMA,
+    updated_at: s.updated_at || null,
+    rows: normalizeRows(s.rows),
+    cloud: (s.cloud && typeof s.cloud === 'object') ? s.cloud : null,
+  }
+  await pnlStateWrite(core, POSITIONS_FILE, JSON.stringify(next, null, 2))
+  return next
+}
+
+// 持仓 + 今日盈亏：installPnl(core)
 //
-// 宿主定节奏：客户端只按 next_poll_ms 打 pnl.get，拉不拉上游由宿主判定
-// （非交易时段直接回快照，不浪费请求、也不会被账本风控盯上）。
+// 数据流（全部现算，**一个定时器都没有**）：
 //
-// 调度器是本文件唯一持有定时器的地方：一律走 ctx.timeout（动态形态里没有全局
-// setTimeout），并且**归一化返回值**——它可能是函数，也可能是带 .dispose() 的对象。
+//   本地持仓 positions.json ──┐
+//                              ├─→ buildView() ─→ RPC「positions.get」 ─→ 界面
+//   雪球行情 batch/quote      ─┘        （20 只一批，命中 10 秒 TTL 缓存）
+//
+// 账本（同花顺投资账本）只出现在两处：
+//   · actPositionsSync —— 用户**刻意点击**「从账本同步」时，拉一次持仓（顺带账户级今日盈亏）；
+//   · actPnlVerify / actPnlSave —— 同步用的凭据（Cookie / 组合）读写与校验。
+// 节奏由客户端驱动（宿主回传 poll_ms / next_poll_ms，盘中按心跳、盘外睡到下一个边界），
+// 所以浏览器关掉就彻底不发请求 —— 这是对账本最友好的形态，也是本插件的兜底：账本凭据废了，
+// 只要本地持仓在，当日盈亏照样实时。
+//
+// 为什么不再让账本当实时数据源（真实事故，别改回去）：账本要求一个由页面 JS（chameleon）生成、
+// 寿命很短的反爬令牌，浏览器会不断重新生成，我们的静态快照过窗口就整片 403。历史版本没有任何
+// 续期手段，当年能用只是因为上游接受长期冻结的快照。把实时口径压在这样一份凭据上 = 每小时断一次。
+// 详见 FORK-NOTES 的「本地持仓」一节。
 
 
-// 说明：clampPollMs 在上游 dsh-ths-pnl 里定义于入口模块（不在 session.js），
-// 这里保持同样的归属，避免把「逐字搬 session.js」搅浑。
+/** 保留两位小数（金额）。 */
+function round2(n) { return Math.round(n * 100) / 100 }
+/** 保留四位小数（百分数）。 */
+function round4(n) { return Math.round(n * 10000) / 10000 }
+
 /**
  * 把用户填的秒数规整成合法的毫秒间隔。
  * 非数字 / NaN / 非正数返回 null（调用方回退默认值）；越界夹到 [MIN, MAX]。
@@ -1465,248 +1795,354 @@ function clampPollMs(value) {
   return Math.min(MAX_POLL_MS, Math.max(MIN_POLL_MS, Math.round(sec * 1000)))
 }
 
-/** 生效的盘中心跳：存盘秒数（钳制过）> 默认 60 秒。 */
+/** 生效的行情刷新间隔：存盘秒数（钳制过）> 默认 30 秒。 */
 function pnlPollMs(state) {
   const ms = clampPollMs(state && state.pollSec)
   return ms === null ? DEFAULT_POLL_MS : ms
 }
 
-/** ctx.timeout 的返回值可能是函数，也可能是带 .dispose() 的对象 —— 统一成「停止函数」。 */
-function stopOf(disposable) {
-  if (typeof disposable === 'function') return disposable
-  if (disposable && typeof disposable.dispose === 'function') return function () { disposable.dispose() }
-  return function () {}
+/** 批量取行情 → { SYMBOL: quote }。失败/无行情给空表（逐行留 null，不把整次视图判失败）。 */
+async function quoteMap(core, symbols, force) {
+  const by = Object.create(null)
+  const list = Array.isArray(symbols) ? symbols : []
+  if (!list.length || typeof core.actQuote !== 'function') return by
+  for (let i = 0; i < list.length; i += 20) {
+    try {
+      // force=false 时命中雪球侧 10 秒 TTL 缓存：面板其它 tab 也在刷同一批标的，能省就省。
+      const res = await core.actQuote({ symbols: list.slice(i, i + 20), force: force === true })
+      const items = (res && Array.isArray(res.list)) ? res.list : []
+      for (const q of items) {
+        if (q && q.symbol) by[String(q.symbol).toUpperCase()] = q
+      }
+    } catch (e) { /* 行情取不到 → 逐行给 null */ }
+  }
+  return by
 }
 
-/** 定时器回调里的异常只记日志：调度链不能因为一次网络失败断掉。 */
-function pnlWarn(ctx, error) {
-  try {
-    if (ctx.logger && typeof ctx.logger.warn === 'function') {
-      ctx.logger.warn(error instanceof Error ? error : new Error(String(error)))
+/** 行合计。**逐行已取整后再相加**，保证界面上的合计 == 各行显示值之和（用户真的会去加）。 */
+function totalsOf(rows) {
+  let value = null, costValue = null, dayProfit = null, dayBase = null, holdProfit = null
+  let held = 0, missing = 0
+  for (const r of rows) {
+    const qty = toNum(r.qty)
+    if (qty === null || qty <= 0) continue
+    held++
+    if (r.value === null || r.value === undefined) missing++
+    if (r.value !== null && r.value !== undefined) value = round2((value || 0) + r.value)
+    if (r.cost_value !== null && r.cost_value !== undefined) costValue = round2((costValue || 0) + r.cost_value)
+    if (r.day_profit !== null && r.day_profit !== undefined) dayProfit = round2((dayProfit || 0) + r.day_profit)
+    if (r.prev_close !== null && r.prev_close !== undefined) dayBase = round2((dayBase || 0) + r.prev_close * qty)
+    if (r.hold_profit !== null && r.hold_profit !== undefined) holdProfit = round2((holdProfit || 0) + r.hold_profit)
+  }
+  return {
+    held: held,                 // 计入合计的只数（股数 > 0）
+    missing: missing,           // 取不到现价的只数（合计因此不完整）
+    value: value,               // 持仓市值 Σ(现价 × 股数)
+    cost_value: costValue,      // 持仓成本 Σ(成本价 × 股数)
+    day_profit: dayProfit,      // 今日盈亏 Σ(当日盈亏)
+    // 今日涨跌幅的基数 = Σ(昨收 × 股数)；与「市值」不同分母，别混用。
+    day_base: dayBase,
+    day_rate: (dayProfit !== null && dayBase) ? round4(dayProfit / dayBase * 100) : null,
+    hold_profit: holdProfit,    // 持仓盈亏 Σ(现值 − 成本)
+    hold_rate: (holdProfit !== null && costValue) ? round4(holdProfit / costValue * 100) : null,
+  }
+}
+
+/**
+ * 组装一次「实时视图」：本地持仓 × 行情 → 逐行派生值 + 合计 + 节奏。
+ * **不写盘**：派生值不落盘（见 constants.js 的说明），要展示时现算。
+ *
+ * @param {{force?:boolean}} [opts] force=true 绕过行情 10 秒缓存（用户点了刷新/同步）
+ */
+async function buildView(core, opts) {
+  const o = opts || {}
+  const store = await loadPositions(core)
+  const rows = store.rows
+  const symbols = []
+  for (const r of rows) {
+    const sym = positionSymbol(r.code)
+    if (sym && symbols.indexOf(sym) < 0) symbols.push(sym)
+  }
+  const quotes = await quoteMap(core, symbols, o.force)
+  const view = rows.map(function (r) {
+    const sym = positionSymbol(r.code)
+    const q = sym ? quotes[sym.toUpperCase()] : null
+    const price = q ? toNum(q.current) : null
+    const prev = q ? toNum(q.last_close) : null
+    const pct = q ? toNum(q.percent) : null
+    const qty = toNum(r.qty)
+    const value = (price !== null && qty !== null) ? round2(price * qty) : null
+    const costValue = (r.cost !== null && r.cost !== undefined && qty !== null) ? round2(r.cost * qty) : null
+    const holdProfit = (value !== null && costValue !== null) ? round2(value - costValue) : null
+    const holdRate = (holdProfit !== null && costValue) ? round4(holdProfit / costValue * 100) : null
+    const dayProfit = dayProfitOf(price, qty, prev, pct, value)
+    return {
+      code: r.code,
+      name: r.name || (q && q.name ? String(q.name) : ''),
+      qty: qty,
+      cost: r.cost,
+      xq_symbol: sym,
+      price: price,                        // 现价（雪球）
+      prev_close: prev,                    // 昨收（雪球）
+      day_pct: pct,                        // 行情涨跌幅（原样，仅在昨收缺失时兜底用）
+      // 金额算不出来时，涨跌幅也不摆出来：一个「-- / +1.50%」的组合只会让人误读成当日涨了 1.5%。
+      day_profit: dayProfit,
+      day_rate: dayProfit === null ? null : dayRateOf(price, prev, pct),
+      value: value,
+      cost_value: costValue,
+      hold_profit: holdProfit,
+      hold_rate: holdRate,
     }
-  } catch (e) { /* 日志失败不影响调度 */ }
+  })
+  const totals = totalsOf(view)
+  const state = await loadPnlConfig(core)
+  const now = new Date()
+  const info = sessionInfo(now)
+  const pollMs = pnlPollMs(state)
+  return {
+    configured: true,                    // 本地持仓永远「已配置」——没有账本凭据也能用
+    rows: view,
+    totals: totals,
+    // 本地持仓文件的最后修改时间（用户改了什么，界面据此提示）
+    updated_at: store.updated_at || null,
+    // 行情时间：本视图的计算时刻；missing 见 totals.missing（> 0 说明合计不完整）
+    as_of: now.toISOString(),
+    session: info.state,
+    in_session: info.inSession,
+    poll_ms: pollMs,
+    next_poll_ms: nextPollMs(info, now, pollMs),
+    // 账本同步元信息（可能为 null）：只影响「持仓从哪来」的展示，不影响任何实时数字
+    cloud: store.cloud || null,
+    migrated_from: store.migrated_from === undefined ? null : store.migrated_from,
+  }
 }
 
 function installPnl(core) {
-  const ctx = core.ctx
-  // 内存快照缓存（调度器判定用）+ 最近一次生效的心跳
-  core.pnl = { snapshot: null, pollMs: DEFAULT_POLL_MS, refreshInflight: null }
-  let boundaryStop = null
-  let settleStop = null
-  let schedulerAlive = true
-  // 收盘补拉**每天只做一次**：15:00 之后盘中心跳还会唤醒好几次，
-  // 若不记住「本交易日已补过」，5 分钟窗口内会重复打 5~6 次上游。
-  let settleDate = null
+  // 一次视图的内存缓存 + 单飞，避免同一时刻两处调用各拉一遍行情
+  core.pnl = { view: null, inflight: null }
 
-  function stopTimer(stop) {
-    if (!stop) return
-    try { stop() } catch (e) { /* 已停止 */ }
-  }
-
-  /**
-   * 拉一次账本并写入快照。动作与边界定时器共用。
-   * @param {string} reason - 诊断用：route / force / boundary / startup / close-settle
-   */
-  // 单飞锁：路由请求、边界唤醒、收盘补拉可能同时到达；同一时刻只允许一条
-  // 账本请求链写快照，避免慢请求晚返回后把较新的盈亏覆盖掉。
-  async function refresh(reason) {
-    if (core.pnl.refreshInflight) return core.pnl.refreshInflight
-    const task = (async function () {
-      const state = await loadPnlConfig(core)
-      const cookie = typeof state.cookie === 'string' ? state.cookie : ''
-      if (!cookie) return null
-      core.pnl.pollMs = pnlPollMs(state)
-      // fundKey：存盘的 → 现探第一个组合（旧插件同语义，探到就落盘）
-      let fundKey = typeof state.fundKey === 'string' ? state.fundKey : ''
-      if (!fundKey) {
-        const list = await listPortfolios(core, cookie)
-        const first = list.length > 0 ? list[0].fund_key : ''
-        if (first) {
-          fundKey = first
-          try { await savePnlConfig(core, { fundKey: first }) } catch (e) { /* 存不下不影响本次取值 */ }
-        }
-      }
-      const pnl = await collectPnl(core, cookie, fundKey)
-      const now = new Date()
-      const info = sessionInfo(now)
-      const prev = (await loadPnlSnapshot(core)) || {}
-      // 失败请求只是一次 attempt，不能把当天标成「已取到开盘/收盘值」；否则
-      // shouldFetch 会永久冻结到下一交易日。失败时还保留上一份有效数值，避免一次
-      // 网络抖动把界面上的盈亏闪成 0。
-      const good = !pnl.error && !pnl.token_expired
-      const snapshot = {
-        pnl_yk: good ? pnl.pnl_yk : (prev.pnl_yk ?? null),
-        pnl_pct: good ? pnl.pnl_pct : (prev.pnl_pct ?? null),
-        error: pnl.error,
-        token_expired: pnl.token_expired,
-        yk_field: good ? pnl.yk_field : (prev.yk_field ?? ''),
-        fetched_at: good ? now.toISOString() : (prev.fetched_at ?? now.toISOString()),
-        fetched_reason: reason,
-        sessionDate: good && info.minutes >= OPEN_MIN ? info.date : (prev.sessionDate ?? null),
-        closeDate: good && info.minutes >= CLOSE_MIN ? info.date : (prev.closeDate ?? null),
-      }
-      await savePnlSnapshot(core, snapshot)
-      core.pnl.snapshot = snapshot
-      return snapshot
-    })()
-    core.pnl.refreshInflight = task
-    task.then(function () {
-      if (core.pnl.refreshInflight === task) core.pnl.refreshInflight = null
-    }, function () {
-      if (core.pnl.refreshInflight === task) core.pnl.refreshInflight = null
+  async function getView(opts) {
+    if (core.pnl.inflight) return core.pnl.inflight
+    let task = null
+    task = buildView(core, opts).then(function (view) {
+      core.pnl.view = view
+      if (core.pnl.inflight === task) core.pnl.inflight = null
+      return view
+    }, function (e) {
+      if (core.pnl.inflight === task) core.pnl.inflight = null
+      throw e
     })
+    core.pnl.inflight = task
     return task
   }
 
-  /** 现在该不该打上游（无快照 → 该；盘中 → 该；否则看今天的标记位）。 */
-  async function shouldFetchNow() {
-    const info = sessionInfo(new Date())
-    const snap = await loadPnlSnapshot(core)
-    return shouldFetch(info, snap)
+  /** 落盘一张新表并刷新视图（增删改共用）。 */
+  async function persist(rows, cloud) {
+    const store = await loadPositions(core)
+    await savePositions(core, {
+      rows: rows,
+      cloud: cloud === undefined ? store.cloud : cloud,
+      updated_at: new Date().toISOString(),
+    })
+    // 不 force：刚改完股数/成本时行情没变，用 10 秒缓存即可（同一批标的的 URL 相同，
+    // 命中缓存就不再多打一次雪球）。用户点「刷新」才走 force。
+    return getView({})
   }
 
   /**
-   * 排一次唤醒（先收掉上一个定时器，保证同一时刻只有一个）。
-   * @param {number} ms - 毫秒
-   * @param {string} reason - 唤醒后 refresh 用的诊断原因
+   * positions.get —— 取「本地持仓 × 行情」的实时视图。
+   * @param {{force?:boolean}} [args] force=true 绕过行情缓存（用户点刷新时用）
    */
-  function arm(ms, reason) {
-    if (!schedulerAlive) return
-    stopTimer(boundaryStop)
-    boundaryStop = stopOf(ctx.timeout(function () {
-      wake(reason).catch(function () {})
-    }, ms))
-  }
-
-  /** 按既定节奏排下一次唤醒：盘中按心跳、盘外睡到下一个边界。 */
-  function schedule() {
-    if (!schedulerAlive) return
-    const now = new Date()
-    const info = sessionInfo(now)
-    arm(nextPollMs(info, now, core.pnl.pollMs), 'boundary')
-  }
-
-  async function wake(reason) {
-    boundaryStop = null
-    try {
-      // 不该拉就什么都不做（例如节假日/午间的边界），避免无谓请求
-      if (await shouldFetchNow()) await refresh(reason)
-    } catch (e) { pnlWarn(ctx, e) }
-    if (!schedulerAlive) return
-    // 15:00 那次拉到的收盘价可能还没落定：45 秒后再补一次，**每个交易日只补一次**。
-    // **绕过 shouldFetch**：15:00 那次已经打过 closeDate 标记，按规则就再也不会拉了。
-    const after = sessionInfo(new Date())
-    if (after.minutes >= CLOSE_MIN && after.minutes <= CLOSE_MIN + 5 && settleDate !== after.date) {
-      settleDate = after.date
-      stopTimer(settleStop)
-      settleStop = stopOf(ctx.timeout(function () {
-        settleStop = null
-        refresh('close-settle').catch(function () {})
-      }, CLOSE_SETTLE_MS))
-    }
-    schedule()
-  }
-
-  ctx.effect(function () {
-    // 启动补拉：进程刚起若"该有值"（盘中 / 今天还没拉过 / 从未拉过）就立刻补一次，
-    // 覆盖"09:30 时进程还没在跑"这种情况；错开插件加载高峰，3 秒后再打。
-    arm(STARTUP_DELAY_MS, 'startup')
-    return function () {
-      schedulerAlive = false
-      stopTimer(boundaryStop)
-      boundaryStop = null
-      stopTimer(settleStop)
-      settleStop = null
-    }
-  }, 'xueqiu-debug: 今日盈亏边界定时器')
-
-  /**
-   * pnl.get（args 可选 `{ force?: boolean }`）
-   * force=true 跳过 shouldFetch 判定强制打一次上游；未知字段一律忽略。
-   */
-  async function actPnlGet(args) {
+  async function actPositionsGet(args) {
     const a = (args && typeof args === 'object') ? args : {}
-    const force = a.force === true
-    const now = new Date()
-    const info = sessionInfo(now)
+    return getView({ force: a.force === true })
+  }
+
+  /**
+   * positions.save —— 新增或修改一行本地持仓。
+   * @param {{row:{code,name?,qty,cost?}, originalCode?:string}} args
+   *        originalCode：改代码时传原来的代码（不改则不传）；不传时按 row.code 定位
+   */
+  async function actPositionsSave(args) {
+    const a = (args && typeof args === 'object') ? args : {}
+    const row = normalizeRow(a.row)
+    if (!row) throw new Error('请填写证券代码')
+    if (row.qty === null) throw new Error('请填写股数（可填 0 表示已清仓）')
+    const store = await loadPositions(core)
+    const original = String(a.originalCode == null ? row.code : a.originalCode).trim().toUpperCase()
+    const idx = store.rows.findIndex(function (r) { return r.code === original })
+    const dup = store.rows.findIndex(function (r) { return r.code === row.code })
+    if (dup >= 0 && dup !== idx) throw new Error('代码 ' + row.code + ' 已在持仓里')
+    // 名称留空时用行情补一个（顺手校验代码认不认得出来；失败就保持空，界面显示代码）
+    if (!row.name) {
+      const sym = positionSymbol(row.code)
+      if (sym) {
+        const q = (await quoteMap(core, [sym], false))[sym.toUpperCase()]
+        if (q && q.name) row.name = String(q.name)
+      }
+    }
+    const rows = store.rows.slice()
+    if (idx >= 0) rows[idx] = row
+    else rows.push(row)
+    return persist(rows)
+  }
+
+  /** positions.remove —— 删掉一行（code 唯一键）。 */
+  async function actPositionsRemove(args) {
+    const a = (args && typeof args === 'object') ? args : {}
+    const code = String(a.code == null ? '' : a.code).trim().toUpperCase()
+    if (!code) throw new Error('缺少要删除的代码')
+    const store = await loadPositions(core)
+    const rows = store.rows.filter(function (r) { return r.code !== code })
+    if (rows.length === store.rows.length) throw new Error('持仓里没有 ' + code)
+    return persist(rows)
+  }
+
+  /**
+   * positions.sync —— **唯一**打账本的实时入口（用户刻意点击）。
+   *
+   * 合并口径（默认 merge）：
+   *   · 账本有、本地有 → 用账本覆盖 qty/cost（账本是股数与成本的来源）。
+   *   · 账本有、本地无 → 新增（qty=0 的已清仓标的不加，避免把清仓记录塞进表里）。
+   *   · 本地有、账本无 → **保留**（可能是手工录入的、或不在这个组合里），在报告里说明。
+   * replace 模式：以账本为准整表替换（用户明确要求时才会走）。
+   *
+   * 失败（403 / 断网 / 接口报错）只写 cloud 元信息，**绝不碰 rows** ——
+   * 这正是这次改造的核心：同步坏了，持仓与当日盈亏照常。
+   *
+   * @param {{mode?:'merge'|'replace'}} [args]
+   */
+  async function actPositionsSync(args) {
+    const a = (args && typeof args === 'object') ? args : {}
+    const mode = a.mode === 'replace' ? 'replace' : 'merge'
     const state = await loadPnlConfig(core)
-    const effective = pnlPollMs(state)
-    const pollMs = nextPollMs(info, now, effective)
     const cookie = typeof state.cookie === 'string' ? state.cookie : ''
-    // 未配置：不请求上游，字段齐全（金额/时间给 null，error 空串）
-    if (!cookie) {
-      return {
-        configured: false, pnl_yk: null, pnl_pct: null, error: '', token_expired: false,
-        yk_field: '', updated_at: null, session: info.state, frozen: true,
-        poll_ms: effective, next_poll_ms: pollMs,
+    if (!cookie) throw new Error('未配置账本 Cookie：要先粘贴一次才能从账本同步（手工录入持仓不需要它）')
+    const store = await loadPositions(core)
+    const now = new Date()
+    const prevCloud = store.cloud || {}
+
+    let fundKey = typeof state.fundKey === 'string' ? state.fundKey : ''
+    if (!fundKey) {
+      const list = await listPortfolios(core, cookie)
+      const first = list.length > 0 ? list[0].fund_key : ''
+      if (first) {
+        fundKey = first
+        try { await savePnlConfig(core, { fundKey: first }) } catch (e) { /* 存不下不影响本次 */ }
       }
     }
 
-    let snap = await loadPnlSnapshot(core)
-    let frozen = true
-    // 注意：**没有快照时 shouldFetch 必为 true** —— 这是「首次配置后立刻出数」的关键路径，
-    // 不能被会话判定提前挡掉（非交易时段也要真的拉一次）。
-    if (force || shouldFetch(info, snap)) {
-      const fresh = await refresh(force ? 'force' : 'route')
-      if (fresh) { snap = fresh; frozen = false }
-    }
-    if (!snap) {
+    const res = await collectPositions(core, cookie, fundKey)
+    if (res.error) {
+      const cloud = {
+        synced_at: prevCloud.synced_at || null,    // 上一次**成功**的时间不变
+        attempted_at: now.toISOString(),
+        fund_key: fundKey,
+        summary: prevCloud.summary || null,
+        account: prevCloud.account || null,
+        error: res.error,
+        token_expired: Boolean(res.token_expired),
+        blocked: Boolean(res.blocked),
+        blocked_until: res.blocked ? new Date(now.getTime() + BLOCKED_BACKOFF_MS).toISOString() : null,
+      }
+      await persist(store.rows, cloud)
       return {
-        configured: true, pnl_yk: null, pnl_pct: null, error: '暂无数据', token_expired: false,
-        yk_field: '', updated_at: null, session: info.state, frozen: true,
-        poll_ms: effective, next_poll_ms: pollMs,
+        ok: false,
+        error: res.error,
+        token_expired: Boolean(res.token_expired),
+        blocked: Boolean(res.blocked),
+        blocked_until: cloud.blocked_until,
+        report: null,
+        view: core.pnl.view,
       }
     }
+
+    // 账户级今日盈亏：账本口径（含当日已实现与费用），与「持仓浮动」并列展示用。失败不影响同步。
+    const acct = await collectPnl(core, cookie, fundKey)
+
+    const ledgerRows = Array.isArray(res.rows) ? res.rows : []
+    const byCode = Object.create(null)
+    for (const row of store.rows) byCode[row.code] = row
+    const updated = []
+    const added = []
+    const kept = []
+    const cleared = []
+    let rows
+    if (mode === 'replace') {
+      rows = ledgerRows.filter(function (r) { return !(r.qty !== null && r.qty <= 0) })
+    } else {
+      rows = store.rows.slice()
+      for (const lr of ledgerRows) {
+        const local = byCode[lr.code]
+        if (local) {
+          local.qty = lr.qty
+          local.cost = lr.cost
+          if (lr.name) local.name = lr.name
+          if (lr.qty !== null && lr.qty <= 0) cleared.push(lr.code)
+          updated.push(lr.code)
+        } else if (lr.qty !== null && lr.qty > 0) {
+          rows.push(lr)
+          added.push(lr.code)
+        }
+      }
+      const ledgerCodes = Object.create(null)
+      for (const lr of ledgerRows) ledgerCodes[lr.code] = true
+      for (const row of store.rows) if (!ledgerCodes[row.code]) kept.push(row.code)
+    }
+
+    const cloud = {
+      synced_at: now.toISOString(),
+      attempted_at: now.toISOString(),
+      fund_key: fundKey,
+      summary: res.summary || null,
+      account: (acct && !acct.error) ? { pnl_yk: acct.pnl_yk, pnl_pct: acct.pnl_pct, at: now.toISOString() } : (prevCloud.account || null),
+      error: '',
+      token_expired: false,
+      blocked: false,
+      blocked_until: null,
+    }
+    const view = await persist(rows, cloud)
     return {
-      configured: true,
-      pnl_yk: snap.pnl_yk,
-      pnl_pct: snap.pnl_pct,
-      error: snap.error ?? '',
-      token_expired: Boolean(snap.token_expired),
-      yk_field: snap.yk_field ?? '',
-      updated_at: snap.fetched_at ?? null,
-      session: info.state,
-      // 盘外时 frozen=true：界面显示的就是收盘/上一次的值，不会再变
-      frozen: frozen,
-      poll_ms: effective,
-      next_poll_ms: pollMs,
+      ok: true,
+      report: { mode: mode, updated: updated, added: added, kept: kept, cleared: cleared, ledger_count: ledgerRows.length },
+      account: cloud.account,
+      view: view,
     }
   }
 
-  /** pnl.verify：用当前存的 Cookie 打一次 account_list（args 忽略）。 */
+  // 上面的失败分支已由 persist 刷新过视图，直接取内存里那一份即可。
+  /** pnl.verify —— 校验账本 Cookie 并回传组合列表 + 上次同步状态 + 当前节奏。 */
   async function actPnlVerify() {
     const state = await loadPnlConfig(core)
     const cookie = typeof state.cookie === 'string' ? state.cookie : ''
     const result = await verifyCookie(core, cookie)
-    const effective = pnlPollMs(state)
+    const store = await loadPositions(core)
     return {
       configured: Boolean(cookie),
       valid: result.valid,
       error: result.error,
-      // name 回退链：manualname → brokername → fund_key（客户端直接显示）
       portfolios: (result.portfolios ?? []).map(function (p) {
         return { fund_key: p.fund_key, name: p.manualname || p.brokername || p.fund_key }
       }),
       fundKey: typeof state.fundKey === 'string' ? state.fundKey : '',
-      poll_ms: effective,
+      cloud: store.cloud || null,
+      poll_ms: pnlPollMs(state),
       min_sec: MIN_POLL_MS / 1000,
       max_sec: MAX_POLL_MS / 1000,
     }
   }
 
-  /** pnl.config：存 Cookie / fundKey / 刷新间隔，或 clear 清凭据（保留快照）。 */
+  /** pnl.config —— 存账本 Cookie / 组合 / 行情刷新间隔，或 clear 清凭据（**不动本地持仓**）。 */
   async function actPnlSave(args) {
     const a = (args && typeof args === 'object') ? args : {}
 
-    // clear：清 Cookie（**保留 snapshot**，最后已知盈亏不该被抹掉），不请求上游
+    // clear：清 Cookie（本地持仓与同步历史都保留 —— 它们跟凭据是两回事）
     if (a.clear === true) {
       await savePnlConfig(core, { cookie: '', fundKey: '' })
       const cleared = await loadPnlConfig(core)
-      const clearedMs = pnlPollMs(cleared)
-      schedule()
       return {
         ok: true, configured: false, valid: false, error: '', portfolios: [],
-        fundKey: '', poll_ms: clearedMs, poll_sec: clearedMs / 1000,
+        fundKey: '', poll_ms: pnlPollMs(cleared), poll_sec: pnlPollMs(cleared) / 1000,
         min_sec: MIN_POLL_MS / 1000, max_sec: MAX_POLL_MS / 1000,
       }
     }
@@ -1720,23 +2156,17 @@ function installPnl(core) {
       patch.cookie = cookie
     }
     if (typeof a.fundKey === 'string') patch.fundKey = a.fundKey.trim()
-
-    // 刷新间隔：入参是**秒**，越界夹到边界值（省得用户猜范围），非数字才报错
     if (a.pollSec !== undefined && a.pollSec !== null && a.pollSec !== '') {
       const ms = clampPollMs(a.pollSec)
       if (ms === null) throw new Error('刷新间隔请填 5–3600 之间的秒数')
       patch.pollSec = ms / 1000
     }
-
     if (Object.keys(patch).length === 0) throw new Error('没有可保存的字段')
     await savePnlConfig(core, patch)
 
-    // 存了 Cookie 就当场校验：客户端一次调用即可显示「已保存 / Cookie 无效」
+    // 存了 Cookie 就当场校验：一次调用即可显示「已保存 / Cookie 无效」
     const verify = patch.cookie ? await verifyCookie(core, patch.cookie) : null
     const saved = await loadPnlConfig(core)
-    const effective = pnlPollMs(saved)
-    core.pnl.pollMs = effective
-    schedule()
     return {
       ok: true,
       configured: typeof saved.cookie === 'string' && saved.cookie.length > 0,
@@ -1746,15 +2176,17 @@ function installPnl(core) {
         return { fund_key: p.fund_key, name: p.manualname || p.brokername || p.fund_key }
       }) : [],
       fundKey: typeof saved.fundKey === 'string' ? saved.fundKey : '',
-      // 回传生效值（可能被夹过），界面据此回填，避免「填了 1 秒却还是 5 秒」的困惑
-      poll_ms: effective,
-      poll_sec: effective / 1000,
+      poll_ms: pnlPollMs(saved),
+      poll_sec: pnlPollMs(saved) / 1000,
       min_sec: MIN_POLL_MS / 1000,
       max_sec: MAX_POLL_MS / 1000,
     }
   }
 
-  core.actPnlGet = actPnlGet
+  core.actPositionsGet = actPositionsGet
+  core.actPositionsSave = actPositionsSave
+  core.actPositionsRemove = actPositionsRemove
+  core.actPositionsSync = actPositionsSync
   core.actPnlVerify = actPnlVerify
   core.actPnlSave = actPnlSave
 }
@@ -2265,8 +2697,14 @@ function installActions(core) {
     'watchlist.pull': core.actWatchlistPull,
     'login.status': core.actLoginStatus, 'login.save': core.actLoginSave, 'login.logout': core.actLoginLogout,
     'ui.get': core.actUiGet, 'ui.set': core.actUiSet,
-    // 今日盈亏（同花顺投资账本）：宿主侧实现在 lib/pnl/，与旧插件 dsh-ths-pnl 共用状态文件
-    'pnl.get': core.actPnlGet, 'pnl.verify': core.actPnlVerify, 'pnl.config': core.actPnlSave,
+    // 持仓 + 今日盈亏：**本地持仓 × 雪球行情**现算（宿主侧实现在 lib/pnl/），不需要账本凭据。
+    // 账本只在 positions.sync（用户刻意点击的导入/校对）里出现。
+    'positions.get': core.actPositionsGet,
+    'positions.save': core.actPositionsSave,
+    'positions.remove': core.actPositionsRemove,
+    'positions.sync': core.actPositionsSync,
+    // 账本凭据（Cookie / 组合 / 行情刷新间隔）：只服务 positions.sync
+    'pnl.verify': core.actPnlVerify, 'pnl.config': core.actPnlSave,
     // 持久化价格提醒：events 只由 alerts.ack 显式确认时删除
     'alerts.get': core.actAlertsGet, 'alerts.set': core.actAlertsSet,
     'alerts.remove': core.actAlertsRemove, 'alerts.ack': core.actAlertsAck,
@@ -2606,7 +3044,7 @@ function createXqCore(ctx, config) {
     stateBasePromise: null,
     // 今日盈亏状态目录的沙箱可写性探测（与 stateBasePromise 独立：目录不同、时机不同）
     pnlBasePromise: null,
-    // 今日盈亏：installPnl 挂的 { snapshot, pollMs }；null = 尚未安装
+    // 持仓 + 今日盈亏：installPnl 挂的 { view, inflight }（本地持仓 × 行情现算的缓存）；null = 尚未安装
     pnl: null,
     // 价格提醒：installAlerts 挂载持久化 store 与加载单飞 Promise
     alertStore: null,
@@ -2629,7 +3067,7 @@ function createXqCore(ctx, config) {
   installLogin(core)
   installWatchlist(core)
   installUiState(core)
-  // 今日盈亏：必须在 installActions 之前（dispatch 表构造时按值捕获 core.actPnlGet 等）
+  // 持仓/盈亏：必须在 installActions 之前（dispatch 表构造时按值捕获 core.actPositionsGet 等）
   installPnl(core)
   installApi(core)
   installAlerts(core)

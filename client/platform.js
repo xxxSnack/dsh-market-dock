@@ -23,8 +23,13 @@ export const A_LOGIN_SAVE = 'login.save'
 export const A_LOGIN_LOGOUT = 'login.logout'
 export const A_FINANCE = 'finance'
 export const A_KOL = 'kol'
-// 今日盈亏（同花顺投资账本）：读快照 / 校验 Cookie / 写配置。宿主实现见 lib/pnl/。
-export const A_PNL_GET = 'pnl.get'
+// 持仓 + 今日盈亏：本地持仓 × 雪球行情（宿主现算），不需要账本凭据。宿主实现见 lib/pnl/。
+export const A_POSITIONS_GET = 'positions.get'
+export const A_POSITIONS_SAVE = 'positions.save'
+export const A_POSITIONS_REMOVE = 'positions.remove'
+// 从账本同步（**唯一**会请求账本的入口，只在用户刻意点击时调用）
+export const A_POSITIONS_SYNC = 'positions.sync'
+// 账本凭据（Cookie / 组合 / 行情刷新间隔）：只服务 positions.sync
 export const A_PNL_VERIFY = 'pnl.verify'
 export const A_PNL_CONFIG = 'pnl.config'
 // 价格提醒：规则与事件由宿主持久化，客户端只负责展示与调用。

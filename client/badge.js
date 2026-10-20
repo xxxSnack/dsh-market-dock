@@ -4,15 +4,31 @@
 import { el, viewport, aSession, sessionsText } from './dom.js'
 import { fmt, fmtPct, colorOf } from './format.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
+import { ensureAlertPermission } from './store/alerts-watch.js'
 import { fetchQuote, fetchWatchlist } from './store/market.js'
 import { BADGE_WATCH_LIMIT, BADGE_W_MIN, BADGE_W_MAX, BADGE_W_DEFAULT, BADGE_DRAG_THRESHOLD, EDGE_GAP, VIEWPORT_FALLBACK_W, VIEWPORT_FALLBACK_H, POLL_BADGE_MS } from './constants.js'
 
 // ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
+// 门控与 DockGate 同款：水合完成前不挂载（否则刷新瞬间会先按默认参数画一次再做布局钳制），
+// 行情隐身时直接返回 null —— 组件不挂载，它那份 POLL_BADGE_MS 轮询自然不存在。
 export function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui
-  const [top, setTop] = React.useState([])
   const [, force] = React.useState(0)
+  React.useEffect(function () {
+    // [fork-fix] 应用级水合入口：shell.overlay 全局只挂一次，不随会话切换重放旧持久化值
+    hydrateUi()
+    const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
+    return off
+  }, [])
+  if (!ui.hydrated || ui.hidden) return null
+  return el(MiniBadgeBody, null)
+}
+
+function MiniBadgeBody() {
+  const rt = getUiRuntime()
+  const ui = rt.ui
+  const [top, setTop] = React.useState([])
   const refreshSeq = React.useRef(0)
 
   React.useEffect(function () {
@@ -31,13 +47,10 @@ export function MiniBadge() {
     }
     function onVis() { refresh() }
     refresh()
-    // [fork-fix] 应用级水合入口：shell.overlay 全局只挂一次，不随会话切换重放旧持久化值
-    hydrateUi()
     const stop = rt.ctx.interval(refresh, POLL_BADGE_MS)
-    const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
     try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     return function () {
-      alive = false; if (stop) stop(); off()
+      alive = false; if (stop) stop()
       try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     }
   }, [])
@@ -195,12 +208,25 @@ export function MiniBadge() {
     onPointerUp: stopBadgeControl, onPointerCancel: stopBadgeControl,
     onClick: function (e) { stopBadgeControl(e); ui.set({ badgeCompact: !ui.badgeCompact }) }
   }, compact ? '+' : '−')
+  // 隐身：徽章自己也能关掉自己（连指数条一起），无需先展开面板。
+  // 点击时顺手请求通知权限 —— 隐身后的到价提醒依赖它，而定时器里请求常被浏览器拒绝。
+  const hideButton = el('button', {
+    key: 'hide', type: 'button', className: 'xq-badge-control',
+    title: '完全隐藏行情（面板、徽章、指数条一起关；恢复：快捷键或让 AI 打开）',
+    'aria-label': '完全隐藏行情',
+    onPointerDown: stopBadgeControl, onPointerMove: stopBadgeControl,
+    onPointerUp: stopBadgeControl, onPointerCancel: stopBadgeControl,
+    onClick: function (e) { stopBadgeControl(e); ensureAlertPermission(); ui.set({ hidden: true }) }
+  }, '⊘')
   const badgeKids = [
     el('div', { key: 'hd', className: 'xq-badge-hd' }, [
       el('span', { key: 'logo' }, [el('b', { key: 'b' }, '雪球'), 'mini']),
       el('span', { key: 'st', className: 'xq-status' + (aSession() === '盘中' ? ' xq-live' : ''), title: sessionsText() }, (function () { var s = aSession(); return s === '盘中' ? '● 盘中' : (s || '休市') })()),
       el('span', { key: 'sp', className: 'xq-spacer' }),
+      // 顺序是契约：[5d] 探针把「第一个 .xq-badge-control」当成折叠按钮，
+      // 所以折叠(−)在前、隐身(⊘)在后 —— 视觉上也是「先收小，再藏掉」。
       compactButton,
+      hideButton,
       el('span', { key: 'ct', className: 'xq-caret' }, ui.open ? '▾' : '▴')
     ])
   ]

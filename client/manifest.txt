@@ -9,6 +9,7 @@ store/ui.js
 store/market.js
 store/positions.js
 store/alerts.js
+store/alerts-watch.js
 charts/setup.js
 charts/kline.js
 charts/minute.js
@@ -27,4 +28,5 @@ badge.js
 dock.js
 ticker.js
 slots.js
+shortcuts.js
 index.js

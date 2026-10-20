@@ -25,8 +25,12 @@ export function createUiRuntime(ctx) {
   // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
   const ui = {
     open: false, tab: 'market', badgePos: null, badgeW: null, badgeCompact: false, dockH: null, hydrated: false,
+    // [fork.7] 行情隐身：true = 三个常驻入口（面板/徽章/指数条）全部不挂载，行情轮询随之停止。
+    // 放在 ui 里而不是另起一套持久化：水合、touched 守卫、落盘 debounce 全部复用现成通道。
+    hidden: false,
     // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这些标志，位置/尺寸/折叠状态补齐。
     openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, badgeCompactTouched: false, dockHTouched: false,
+    hiddenTouched: false,
     _fns: [],
     subscribe: function (fn) {
       this._fns.push(fn)
@@ -53,6 +57,7 @@ export function createUiRuntime(ctx) {
         if (k === 'badgeW') this.badgeWTouched = true
         if (k === 'badgeCompact') this.badgeCompactTouched = true
         if (k === 'dockH') this.dockHTouched = true
+        if (k === 'hidden') this.hiddenTouched = true
       }
       if (ch) {
         this.notify()
@@ -61,7 +66,7 @@ export function createUiRuntime(ctx) {
         // [fork-fix] 原来只有 open 直接落盘：位置/尺寸靠 DockPanel 的订阅间接落盘，
         // 而面板收起时 DockPanel 根本不挂载（DockGate 返回 null）→ 拖徽章永不写入。
         // 改为所有被持久化的键都直接排一次落盘，不再依赖某个组件恰好挂着。
-        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'badgeCompact' in patch || 'dockH' in patch) {
+        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'badgeCompact' in patch || 'dockH' in patch || 'hidden' in patch) {
           try { saveUi() } catch (e) { /* 初始化前忽略 */ }
         }
       }
@@ -69,7 +74,7 @@ export function createUiRuntime(ctx) {
   }
 
   const saveUi = ctx.debounce(function () {
-    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, badgeCompact: ui.badgeCompact, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
+    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, badgeCompact: ui.badgeCompact, dockH: ui.dockH, hidden: ui.hidden }).catch(function () { /* 忽略 */ })
   }, SAVE_UI_DEBOUNCE_MS)
 
   uiRuntime = {
@@ -121,7 +126,29 @@ export function hydrateUi() {
     if (d && typeof d.badgeCompact === 'boolean' && !ui.badgeCompactTouched) {
       ui.set({ badgeCompact: d.badgeCompact })
     }
+    // 隐身开关：必须在 hydrated 之前落定 —— 三个入口组件都等 hydrated 才渲染，
+    // 否则刷新瞬间会先画出行情再消失（徽章一挂载就 fetchWatchlist、指数条一挂载就 fetchIndices）。
+    if (d && typeof d.hidden === 'boolean' && !ui.hiddenTouched) {
+      ui.set({ hidden: d.hidden })
+    }
     ui.set({ hydrated: true })
   }).catch(function () { ui.set({ hydrated: true }) })
   return rt.hydratePromise
+}
+
+// ---------- 行情隐身（三个入口的唯一开关通道）----------
+// 只改 ui.hidden：不动 open（恢复时保持用户原来的面板开合状态），不动 tab。
+// ui.set 里 'hidden' 已在落盘条件内，所以这里不需要额外 saveUi。
+export function setUiHidden(hidden) {
+  const rt = getUiRuntime()
+  if (!rt) return false
+  rt.ui.set({ hidden: !!hidden })
+  return !!hidden
+}
+
+// 快捷键与徽章按钮共用：语义是「拨一下」而不是「设成某个值」。
+export function toggleUiHidden() {
+  const rt = getUiRuntime()
+  if (!rt) return false
+  return setUiHidden(!rt.ui.hidden)
 }

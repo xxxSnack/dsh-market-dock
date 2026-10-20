@@ -10,7 +10,7 @@ http.js           # classifyError + curl / ensureCookie / getJSON（含重试链
 state.js          # 状态文件落点：稳定目录优先、工作区回退、旧路径回读（装到 core）
 login.js          # 可选登录：Cookie 解析/落盘/云端自选读写与迁移（装到 core）
 watchlist.js      # 本地自选表 + 云端为准的后台自动同步（装到 core）
-ui-state.js       # UI 状态（tab/open/dockH/badgeW/badgePos）持久化（装到 core）
+ui-state.js       # UI 状态（tab/open/hidden/dockH/badgeW/badgePos）持久化（装到 core）
 pnl/constants.js  # 持仓/盈亏：账本端点/UA/轮询钳制/状态文件名
 pnl/session.js    # 持仓/盈亏：A股交易时段纯函数（边界 09:30/13:00/15:00、下次间隔）
 pnl/http.js       # 持仓/盈亏：Cookie 规整/字段锚定解析 + 带状态码的 curl 请求
@@ -27,7 +27,8 @@ tools/search.js   # xueqiu_search spec 工厂
 tools/hot.js      # xueqiu_hot spec 工厂
 tools/news.js     # xueqiu_news spec 工厂
 tools/kol.js      # xueqiu_kol spec 工厂
-tools/index.js    # 6 个 spec 的汇总（顺序即注册顺序）
+tools/display.js  # xueqiu_display spec 工厂（行情隐身开关）
+tools/index.js    # 7 个 spec 的汇总（顺序即注册顺序）
 register.js       # 双路径注册：harness RPC/工具 与 webServer 路由/tools 服务
 core.js           # createXqCore(ctx)：共享状态 + 按序调用各 install*
 index.js          # 入口：apply 薄壳 + export default（构建器的入口模块）

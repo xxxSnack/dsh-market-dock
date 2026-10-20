@@ -56,7 +56,7 @@ const EXPECTED_SLOTS = [
 
 /** 允许 flush effect 的组件（白名单）：这些组件的 effect 只做 fetch + ctx.interval + 订阅，安全。
  *  KLineChart/MinuteChart 的 effect 会去建 canvas 图表，无 DOM/canvas 实现，一律跳过。 */
-const FLUSHABLE = new Set(['DockGate', 'DockPanel', 'XueqiuPanel', 'MiniBadge', 'Ticker'])
+const FLUSHABLE = new Set(['DockGate', 'DockPanel', 'XueqiuPanel', 'MiniBadge', 'MiniBadgeBody', 'Ticker', 'TickerBody'])
 
 const MAX_NODES = 20000
 const MAX_DEPTH = 80
@@ -435,13 +435,27 @@ function createSlots() {
   return { slots, injects, registers }
 }
 
-function createCtx({ slots, timerLog, touchLog }) {
+function createCtx({ slots, timerLog, touchLog, shortcuts }) {
   const base = {
     get(name) {
       touchLog.push('get(' + name + ')')
       if (name === 'slots') return slots
       if (name === 'timer') return { interval: base.interval, timeout: base.setTimeout }
       return undefined
+    },
+    // cordis 的按依赖注入：真实 dsh 里 apply 会用它拿 shortcuts 之类「可能不存在」的服务。
+    // 替身同样只在服务登记时才把它挂到 scoped ctx 上，让「服务缺失 → 静默降级」也能被测到。
+    inject(names, cb) {
+      const list = Array.isArray(names) ? names.slice() : [names]
+      touchLog.push('inject(' + list.join('+') + ')')
+      const scoped = Object.create(base)
+      if (list.indexOf('shortcuts') >= 0 && shortcuts) scoped.shortcuts = shortcuts
+      return cb(scoped)
+    },
+    timeout(fn, ms) {
+      touchLog.push('timeout(' + ms + ')')
+      timerLog.push({ kind: 'timeout', ms })
+      return function stop() {}
     },
     interval(fn, ms) {
       touchLog.push('interval(' + ms + ')')
@@ -479,7 +493,7 @@ function createSandbox(dom, fetchImpl) {
   const logs = []
   const sandbox = {}
   const timerLog = []
-  const record = { timerLog, logs, fetchCalls: [], loadCalls: [] }
+  const record = { timerLog, logs, fetchCalls: [], loadCalls: [], notifications: [] }
 
   sandbox.console = {
     log: (...a) => logs.push(a.map(String).join(' ')),
@@ -508,6 +522,14 @@ function createSandbox(dom, fetchImpl) {
   sandbox.matchMedia = () => ({ matches: false, media: '', addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} })
 
   sandbox.navigator = { userAgent: 'dsh-xueqiu-debug/smoke', language: 'zh-CN', platform: 'smoke', clipboard: { writeText: () => Promise.resolve() } }
+  // 系统通知替身：只记条数/正文，绝不出网。[5f] 用它证明「历史事件静默、新事件弹一次」。
+  sandbox.Notification = class {
+    constructor(title, options) {
+      record.notifications.push({ title: String(title), body: String((options && options.body) || ''), tag: String((options && options.tag) || '') })
+    }
+  }
+  sandbox.Notification.permission = 'granted'
+  sandbox.Notification.requestPermission = () => Promise.resolve('granted')
   sandbox.location = { href: 'http://127.0.0.1/', origin: 'http://127.0.0.1', pathname: '/', search: '', hash: '' }
   const storage = { getItem: () => null, setItem() {}, removeItem() {}, clear() {}, key: () => null, length: 0 }
   sandbox.localStorage = storage
@@ -559,9 +581,24 @@ function makeFetch(responder) {
   }
 }
 
+// 提醒事件脚本游标：见 alerts.get 分支（首轮历史 → 之后多一条新事件）。
+let alertReads = 0
 function safeResponder(url, body) {
   const action = body && body.action
-  if (action === 'ui.get') return { ok: true, data: { tab: 'market', open: true, badgePos: null, badgeW: null, badgeCompact: false, dockH: null } }
+  if (action === 'ui.get') return { ok: true, data: { tab: 'market', open: true, hidden: false, badgePos: null, badgeW: null, badgeCompact: false, dockH: null } }
+  // 提醒通知器在 apply 就会读一次（应用级、与面板挂载无关）：默认空规则，不产生任何上游请求。
+  // 事件脚本：第一次返回两条「历史」事件（验证首轮静默、不为旧事件刷屏），之后多一条新事件
+  // （面板挂载时 kick 一次 → 只弹这一条，且只弹一次）。
+  if (action === 'alerts.get') {
+    alertReads += 1
+    const history = [
+      { id: 'e1', symbol: 'SH600519', name: '贵州茅台', current: 1600, target: 1650, direction: 'above', at: '2026-10-19T01:00:00.000Z' },
+      { id: 'e2', symbol: 'SZ300750', name: '宁德时代', current: 200, target: 190, direction: 'below', at: '2026-10-19T02:00:00.000Z' },
+    ]
+    const fresh = { id: 'e3', symbol: 'SH601318', name: '中国平安', current: 52.5, target: 52, direction: 'above', at: '2026-10-19T03:00:00.000Z' }
+    if (alertReads === 1) return { ok: true, data: { rules: [], events: history } }
+    return { ok: true, data: { rules: [], events: history.concat([fresh]) } }
+  }
   if (action === 'watchlist.get') return { ok: true, data: { symbols: ['SH600519', 'SZ300750'] } }
   if (action === 'quote') return { ok: true, data: { status: 5, list: [{ symbol: 'SH000001', name: '上证指数', current: 3210.55, percent: 0.42 }] } }
   if (action === 'hot') return { ok: true, data: { market: 'cn', list: [] } }
@@ -604,7 +641,7 @@ function fingerprintBundle() {
 }
 
 /** 装载一次 bundle：真跑顶层 + factory + 空跑 apply，返回所有可断言的面。 */
-function boot(label, { withSlots = true } = {}) {
+function boot(label, { withSlots = true, shortcutConflict = false } = {}) {
   let code
   try {
     code = readFileSync(BUNDLE_PATH, 'utf8')
@@ -663,7 +700,22 @@ function boot(label, { withSlots = true } = {}) {
   out.injects = slotsBag.injects
   out.registers = slotsBag.registers
 
-  const ctx = createCtx({ slots: out.slots, timerLog: record.timerLog, touchLog: out.ctxTouches })
+  // 快捷键服务替身：记下注册的 command，供 [4b] 断言「隐身开关被注册成可改键的应用命令」。
+  const shortcutCommands = []
+  out.shortcuts = {
+    commands: shortcutCommands,
+    failWithDefaults: false,
+    register(command) {
+      if (this.failWithDefaults && command && Object.keys(command.defaults || {}).length) throw new Error('默认键位与既有命令冲突')
+      shortcutCommands.push(command)
+      return function dispose() {}
+    },
+  }
+
+  // 冲突场景：[5f-2] 用它验证「默认键位撞车 → 退化成未绑定再注册」。
+  out.shortcuts.failWithDefaults = shortcutConflict
+
+  const ctx = createCtx({ slots: out.slots, timerLog: record.timerLog, touchLog: out.ctxTouches, shortcuts: out.shortcuts })
   out.styleBefore = styleTags(dom).length
   try {
     if (out.plugin && typeof out.plugin.apply === 'function') out.plugin.apply(ctx)
@@ -833,7 +885,10 @@ check('4 个 toolview 的 key 集合精确', () => {
   eqJson(keys.slice().sort(), ['xueqiu_hot', 'xueqiu_kline', 'xueqiu_news', 'xueqiu_quote'], 'toolview keys')
   return '[' + keys.join(', ') + ']'
 })
-check('apply 期间未发出任何请求（fetch 0 次）', () => eq(main.record.fetchCalls.length, 0, 'fetch 次数'))
+check('apply 期间只发一次 alerts.get（提醒通知器启动），没有任何行情请求', () => {
+  const actions = main.record.fetchCalls.map((c) => c.action)
+  eqJson(actions, ['alerts.get'], 'apply 期间的 action 序列')
+})
 check('apply 只向 ctx 取 slots（未取别的服务）', () => {
   const gets = main.ctxTouches.filter((t) => t.startsWith('get('))
   eqJson(gets, ['get(slots)'], 'ctx.get 调用')
@@ -888,11 +943,48 @@ check('toolview 退化输入不抛错：运行中 / 不可读 / 空列表', () =
   const noProps = render(main, SLOT_NEWS, {}).tree
   ok(textHas(noProps, '查询中'), '无 props 应显示「查询中…」，实际：' + treeText(noProps))
 })
-// 徽标新契约：只保留标题栏 + 自选行情网格；红框指数区域（.xq-idxgrid）已从徽标移除，
-// 指数展示属于面板 / 底部指数条（.xq-ticker）职责。空数据静态渲染还没有 .xq-wgrid 可挂
+// 三个常驻入口（面板 / 徽章 / 指数条）现在都是「门控 + 实体」两段式：
+// 门控只在水合完成后才挂实体（这样刷新瞬间不会先画一帧行情再消失，隐身在首屏就生效）。
+// 所以下面三条先断言「未水合时三处都是 null」，徽标结构留到水合之后再验。
+check('conversation.composer.dock 指数条未水合时返回 null', () => {
+  const { tree } = render(main, SLOT_TICKER, undefined)
+  eq(tree, null, 'Ticker 门控未水合时返回 null')
+})
+check('conversation.input.dock 面板未水合时返回 null', () => {
+  const { tree } = render(main, SLOT_PANEL, undefined)
+  eq(tree, null, 'ui.hydrated/open 未就绪时 DockGate 应返回 null')
+})
+check('shell.overlay 徽标未水合时返回 null', () => {
+  const { tree } = render(main, SLOT_BADGE, undefined)
+  eq(tree, null, 'MiniBadge 门控未水合时返回 null')
+})
+check('未水合期间只有提醒通知器那一次 alerts.get（没有任何行情请求）', () => {
+  const actions = main.record.fetchCalls.map((c) => c.action)
+  eqJson(actions, ['alerts.get'], '未水合期间的 action 序列')
+})
+
+// 水合：flush 徽标门控的 effect（hydrateUi → ui.get），之后三处入口才会挂实体。
+const hydrate = await (async () => {
+  try {
+    const gate = render(main, SLOT_BADGE, undefined)
+    const flush = flushEffects(main, gate.effects)
+    if (flush.errors.length) return { error: new Error('MiniBadge 门控 effect flush 抛错：' + flush.errors.join(' | ')) }
+    await settle(8)
+    const hydratedRender = render(main, SLOT_BADGE, undefined)
+    const flush2 = flushEffects(main, hydratedRender.effects)
+    await settle(8)
+    return { gate, flush, flush2 }
+  } catch (err) { return { error: err } }
+})()
+const hydratedTree = () => {
+  if (hydrate.error) throw hydrate.error
+  return render(main, SLOT_BADGE, undefined).tree
+}
+// 徽标新契约：标题栏 + 自选行情网格 + 隐身/折叠两个控制按钮；红框指数区域（.xq-idxgrid）已移除，
+// 指数展示属于面板 / 底部指数条（.xq-ticker）职责。空数据渲染还没有 .xq-wgrid 可挂
 // （自选行情由 effect 异步加载），数据链路（effect → 假响应 → 复渲染）由 [5e] 单独验证。
 check('shell.overlay 徽标渲染出 .xq-badge 结构（不再渲染指数网格）', () => {
-  const { tree } = render(main, SLOT_BADGE, undefined)
+  const tree = hydratedTree()
   ok(tree, 'MiniBadge 返回了 null')
   ok(hasClass(tree, 'xq-badge'), '缺 .xq-badge')
   ok(hasClass(tree, 'xq-badge-grip'), '缺 .xq-badge-grip（调宽手柄）')
@@ -900,16 +992,8 @@ check('shell.overlay 徽标渲染出 .xq-badge 结构（不再渲染指数网格
   ok(!hasClass(tree, 'xq-idxgrid'), '徽标不应渲染 .xq-idxgrid（指数区域已移除）')
   ok(textHas(tree, '雪球'), '徽标缺「雪球」字样')
   ok(textHas(tree, '⤡'), '徽标缺手柄字符')
+  ok(textHas(tree, '⊘'), '徽标缺隐身按钮（⊘）')
 })
-check('conversation.composer.dock 指数条空数据时安全返回 null', () => {
-  const { tree } = render(main, SLOT_TICKER, undefined)
-  eq(tree, null, '空指数时 Ticker 应返回 null')
-})
-check('conversation.input.dock 面板未水合时返回 null', () => {
-  const { tree } = render(main, SLOT_PANEL, undefined)
-  eq(tree, null, 'ui.hydrated/open 未就绪时 DockGate 应返回 null')
-})
-check('静态渲染全程未发请求（fetch 仍为 0 次）', () => eq(main.record.fetchCalls.length, 0, 'fetch 次数'))
 
 // ---------------------------------------------------------------- 5. 水合后的面板渲染
 section('[5] 水合后面板渲染（flush effect → 数据加载 → 复渲染）')
@@ -1606,6 +1690,98 @@ check('徽标一次刷新只发自选与报价请求（watchlist.get / quote）�
   eqJson([...new Set(calls.map((c) => c.action))].sort(), ['quote', 'watchlist.get'], '徽标 effect 期间的 action 集合')
   eq(calls.length, 2, '徽标 effect 期间的 fetch 次数（应用级水合已由 [5] DockGate 预热，这里不应再有 ui.get）')
   return '2 次调用：watchlist.get → quote'
+})
+
+// ---------------------------------------------------------------- 5f. 行情隐身
+// 一个开关关掉三处常驻入口（面板 / 徽章 / 指数条），行情轮询随之全停；
+// 恢复入口是「注册到宿主快捷键表的可改键命令」+ 「xueqiu_display 工具让 AI 拨」。
+// 价格提醒**不受影响**：通知器是应用级运行时，随 apply 启动，与面板挂载/隐身无关。
+section('[5f] 行情隐身：三处门控 + 快捷键恢复 + 提醒照常')
+const hideCmd = main.shortcuts.commands[0]
+check('快捷键服务可用时注册了 xq.toggleHidden（带 6 个平台默认键位）', () => {
+  eq(main.shortcuts.commands.length, 1, '注册的命令数量')
+  ok(hideCmd, '没有注册任何命令')
+  eq(hideCmd.id, 'xq.toggleHidden', '命令 id')
+  eqJson(Object.keys(hideCmd.defaults).sort(), ['desktop:linux', 'desktop:macos', 'desktop:windows', 'web:linux', 'web:macos', 'web:windows'], '默认键位覆盖的平台')
+  const b = hideCmd.defaults['web:windows']
+  ok(b && b.code === 'KeyX' && Array.isArray(b.modifiers) && b.modifiers.indexOf('primary') >= 0, '默认键位形状不合：' + JSON.stringify(b))
+  return JSON.stringify(b)
+})
+check('命令的 label / aliases / regions / modals 形状合规（会出现在设置→快捷键里）', () => {
+  ok(typeof hideCmd.label === 'function' && String(hideCmd.label()).length > 0, 'label 不是非空函数')
+  ok(Array.isArray(hideCmd.aliases) && hideCmd.aliases.indexOf('雪球隐身') >= 0, 'aliases 缺中文别名：' + JSON.stringify(hideCmd.aliases))
+  ok(Array.isArray(hideCmd.regions) && hideCmd.regions.indexOf('page') >= 0 && hideCmd.regions.indexOf('editable') >= 0, 'regions 必须同时放行 page/editable：' + JSON.stringify(hideCmd.regions))
+  ok(Array.isArray(hideCmd.modals) && hideCmd.modals.length === 0, 'modals 应为空数组：' + JSON.stringify(hideCmd.modals))
+  return hideCmd.label()
+})
+// [5d] 最后一步把面板关掉了（它验的是徽章背景开合）。[5f] 需要面板可见才能看头部按钮，
+// 所以用同一个入口把它点开：徽章背景点击 = 开合大面板（这条行为在 [5d] 里已经断言过）。
+function ensurePanelOpen() {
+  if (render(main, SLOT_PANEL, undefined).tree) return true
+  const tree = render(main, SLOT_BADGE, undefined).tree
+  const root = treeHosts(tree || { kind: 'empty', children: [] }).find((h) => classOf(h).split(/\s+/).includes('xq-badge'))
+  if (!root) throw new Error('徽章未挂载，无法用它打开面板')
+  let captured = false
+  const currentTarget = {
+    style: {}, offsetWidth: 320, offsetHeight: 80,
+    setPointerCapture() { captured = true }, hasPointerCapture() { return captured }, releasePointerCapture() { captured = false },
+  }
+  const target = { closest: () => null }
+  const ev = () => ({ target, currentTarget, pointerType: 'mouse', button: 0, clientX: 20, clientY: 20, pointerId: 97 })
+  root.props.onPointerDown(ev())
+  root.props.onPointerUp(ev())
+  return Boolean(render(main, SLOT_PANEL, undefined).tree)
+}
+check('面板头部有「隐身」按钮，且 title 说清后果（连徽章/指数条一起关）', () => {
+  ok(ensurePanelOpen(), '面板打不开，找不到头部按钮')
+  const tree = render(main, SLOT_PANEL, undefined).tree
+  const btn = treeHosts(tree).find((h) => treeText(h) === '隐身')
+  ok(btn, '面板头部缺「隐身」按钮')
+  ok(/完全隐藏行情/.test(String((btn.props && btn.props.title) || '')), '按钮 title 未说明会隐藏什么：' + String(btn.props && btn.props.title))
+  return 'title=' + String(btn.props.title).slice(0, 24) + '…'
+})
+check('命令 run() 把三处入口一起关掉（不是只关面板）', () => {
+  const res = hideCmd.resolve({ region: 'page', modal: null, target: null })
+  eq(res.status, 'handled', 'resolve 状态')
+  eq(typeof res.run, 'function', 'run 可调用')
+  res.run()
+  eq(render(main, SLOT_PANEL, undefined).tree, null, '面板应返回 null')
+  eq(render(main, SLOT_BADGE, undefined).tree, null, '徽章应返回 null')
+  eq(render(main, SLOT_TICKER, undefined).tree, null, '指数条应返回 null')
+  return '三处入口均为 null'
+})
+check('隐身期间渲染三处入口不发任何请求（门控在挂实体之前就返回）', () => {
+  const before = main.record.fetchCalls.length
+  render(main, SLOT_PANEL, undefined)
+  render(main, SLOT_BADGE, undefined)
+  render(main, SLOT_TICKER, undefined)
+  eq(main.record.fetchCalls.length, before, '隐身后的 fetch 次数增量')
+  return '0 次新增请求'
+})
+check('再拨一次即恢复（同一个命令双向开关，且不动 ui.open）', () => {
+  hideCmd.resolve({ region: 'editable', modal: null, target: null }).run()
+  ok(render(main, SLOT_BADGE, undefined).tree, '恢复后徽章仍是 null')
+  ok(render(main, SLOT_PANEL, undefined).tree, '恢复后面板仍是 null（隐身不应顺带改 open）')
+  return '徽章/面板已恢复'
+})
+check('提醒通知器：历史事件静默，只有新事件弹一次通知', () => {
+  const list = main.record.notifications
+  eq(list.length, 1, '通知条数（两条历史事件应静默，新事件只弹一次）共 ' + list.length + ' 条')
+  ok(list[0].body.indexOf('中国平安') >= 0, '通知正文应是新事件而非历史事件：' + list[0].body)
+  ok(list[0].tag === 'xq-alert-e3', '通知 tag 应按事件 id 去重：' + list[0].tag)
+  return list[0].title + ' / ' + list[0].body
+})
+
+// 默认键位与其它插件撞车时：register 会抛，installShortcuts 必须降级成「未绑定」再注册一次，
+// 命令仍然出现在快捷键表里等用户指派 —— 比彻底没有恢复入口好。
+section('[5f-2] 快捷键默认键位冲突 → 降级为未绑定')
+const conflictBoot = boot('shortcut-conflict', { shortcutConflict: true })
+check('冲突时不抛错、命令照样注册（defaults 为空）', () => {
+  ok(!conflictBoot.applyError, 'apply 抛错：' + ((conflictBoot.applyError && conflictBoot.applyError.message) || ''))
+  eq(conflictBoot.shortcuts.commands.length, 1, '注册的命令数量')
+  eqJson(Object.keys(conflictBoot.shortcuts.commands[0].defaults), [], '降级后的默认键位数')
+  eq(conflictBoot.shortcuts.commands[0].id, 'xq.toggleHidden', '命令 id')
+  return '未绑定 xq.toggleHidden'
 })
 
 // ---------------------------------------------------------------- 6. slots 缺失时的降级

@@ -81,7 +81,7 @@ section = '[1] 未配置 → 默认值（向后兼容）'
   await rpc({ action: 'ui.set', args: { tab: 'hot' } })
   const dir = join(HOME, 'dsh-xueqiu')
   check('状态目录 = $DSH_HOME/dsh-xueqiu（沿用上游，存量数据可继承）', readFileSync(join(dir, '.xueqiu-ui-state.json'), 'utf8').includes('hot'))
-  check('工具照常注册 6 个', tools.length === 6)
+  check('工具照常注册 7 个', tools.length === 7)
 }
 
 // [2] 配置生效

@@ -13,11 +13,11 @@
  *   2) 两条互斥的环境路径各跑一遍 apply：
  *        · 静态安装（无 globalThis.harness）
  *            ctx.inject(['webServer'], cb) → webServer.register({ kind:'prefix', path:'/xq-rpc', handler })
- *            ctx.inject(['tools'],     cb) → tools.register(spec) × 6
+ *            ctx.inject(['tools'],     cb) → tools.register(spec) × 7
  *        · 动态运行时（注入假 globalThis.harness）
  *            harness.handle('xq.call', fn)
- *            harness.registerTool(ctx, harness.defineTool(spec)) × 6
- *   3) 6 个 Agent 工具的注册名 / JSON Schema 根 / output / execute(null) 兜底
+ *            harness.registerTool(ctx, harness.defineTool(spec)) × 7
+ *   3) 7 个 Agent 工具的注册名 / JSON Schema 根 / output / execute(null) 兜底
  *   4) RPC 契约：通道名 xq.call；/xq-rpc 的回环 Host 栅栏、Origin 同源栅栏、
  *      未知 action、ui.get / ui.set / debug / watchlist.get 的响应包络
  *   5) 今日盈亏 RPC（pnl.get / pnl.verify / pnl.config）：未配置不发请求、
@@ -338,15 +338,15 @@ console.log('  被测源码    : ' + path.join(PLUGIN_DIR, 'src', 'index.js'))
 const mod = await import(pathToFileURL(path.join(PLUGIN_DIR, 'src', 'index.js')).href)
 const plugin = mod.default
 
-const EXPECTED_TOOLS = ['xueqiu_quote', 'xueqiu_kline', 'xueqiu_search', 'xueqiu_hot', 'xueqiu_news', 'xueqiu_kol']
+const EXPECTED_TOOLS = ['xueqiu_quote', 'xueqiu_kline', 'xueqiu_search', 'xueqiu_hot', 'xueqiu_news', 'xueqiu_kol', 'xueqiu_display']
 const EXPECTED_WATCHLIST = ['SH600519', 'SZ300750', 'SZ002594', 'SH601318', '00700', 'AAPL']
 const HOST = { host: '127.0.0.1:3080' }
 const SAME_ORIGIN = { host: '127.0.0.1:3080', origin: 'http://127.0.0.1:3080' }
 
 function checkToolSpecs(label, specs) {
-  check(label + '：恰好注册 6 个工具', specs.length === 6, '实际 ' + specs.length)
+  check(label + '：恰好注册 7 个工具', specs.length === 7, '实际 ' + specs.length)
   const names = specs.map((s) => (s && s.name) || null)
-  check(label + '：name 精确等于 6 个契约名（含注册顺序）', sameJson(names, EXPECTED_TOOLS), JSON.stringify(names))
+  check(label + '：name 精确等于 7 个契约名（含注册顺序）', sameJson(names, EXPECTED_TOOLS), JSON.stringify(names))
   const bad = []
   for (const s of specs) {
     if (!s || typeof s !== 'object') {
@@ -437,8 +437,8 @@ try {
   check('harness.handle 恰好注册一个通道', hrec.handles.length === 1, '实际 ' + hrec.handles.length)
   check('通道名精确等于 xq.call', hrec.handles[0] && hrec.handles[0].channel === 'xq.call', hrec.handles[0] && String(hrec.handles[0].channel))
   check('通道值是可调用函数（RPC 入口）', Boolean(hrec.handles[0]) && typeof hrec.handles[0].fn === 'function')
-  check('harness.registerTool 调用 6 次', hrec.registered.length === 6, '实际 ' + hrec.registered.length)
-  check('每个 spec 都先过 harness.defineTool', hrec.defined.length === 6, '实际 ' + hrec.defined.length)
+  check('harness.registerTool 调用 7 次', hrec.registered.length === 7, '实际 ' + hrec.registered.length)
+  check('每个 spec 都先过 harness.defineTool', hrec.defined.length === 7, '实际 ' + hrec.defined.length)
   checkToolSpecs('动态 harness.registerTool', hrec.registered.map((r) => r.spec))
   check('动态路径不注册 webServer 路由（两路径互斥）', dyn.rec.routes.length === 0, '实际 ' + dyn.rec.routes.length)
   check('动态路径不使用 ctx.inject（两路径互斥）', dyn.rec.injectNames.length === 0, JSON.stringify(dyn.rec.injectNames))
@@ -539,6 +539,14 @@ try {
   const uiAfter = jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.get' }))
   check('ui.set → ui.get 往返（含徽章折叠状态）', Boolean(uiAfter && uiAfter.data) && uiAfter.data.tab === 'news' && uiAfter.data.dockH === 400 && uiAfter.data.badgeCompact === true, JSON.stringify(uiAfter && uiAfter.data))
 
+  // 行情隐身开关（FORK-NOTES §11）：宿主只负责存取，缺省必须是 false ——
+  // 老状态文件里没有这个键，读成 true 会让所有人升级后瞬间「行情消失」。
+  check('ui.get 带 hidden 且默认 false', Boolean(uiAfter && uiAfter.data) && uiAfter.data.hidden === false, JSON.stringify(uiAfter && uiAfter.data && uiAfter.data.hidden))
+  const hiddenSet = jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.set', args: { hidden: true } }))
+  check('ui.set {hidden:true} → ok:true', Boolean(hiddenSet && hiddenSet.ok === true), JSON.stringify(hiddenSet))
+  const hiddenAfter = jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.get' }))
+  check('ui.set {hidden:true} → ui.get 往返', Boolean(hiddenAfter && hiddenAfter.data) && hiddenAfter.data.hidden === true, JSON.stringify(hiddenAfter && hiddenAfter.data))
+
   const uiStatePath = path.join(STATE_DIR, '.xueqiu-ui-state.json')
   check('状态文件写在假 $DSH_HOME/dsh-xueqiu 下', fs.existsSync(uiStatePath), uiStatePath)
   if (fs.existsSync(uiStatePath)) {
@@ -549,7 +557,12 @@ try {
       saved = null
     }
     check('落盘内容与 ui.set 一致（含 badgeCompact）', Boolean(saved) && saved.tab === 'news' && saved.dockH === 400 && saved.badgeCompact === true, JSON.stringify(saved))
+    // hidden 必须真的写进磁盘（刷新页面后仍隐身），而不是只活在内存里
+    check('hidden 落盘为 true（刷新后仍然隐身）', Boolean(saved) && saved.hidden === true, JSON.stringify(saved))
   }
+  const unhide = jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.set', args: { hidden: false } }))
+  const unhidden = jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.get' }))
+  check('ui.set {hidden:false} 能复位（false 不会被当成「未传」吞掉）', Boolean(unhide && unhide.ok === true) && Boolean(unhidden && unhidden.data) && unhidden.data.hidden === false, JSON.stringify(unhidden && unhidden.data))
   check('稳定目录探测文件 .write-probe 存在（未走工作区回退）', fs.existsSync(path.join(STATE_DIR, '.write-probe')))
   check('假工作区目录内没有 .xueqiu-* 文件（回退路径未启用）', listStateFiles(WORK_DIR).length === 0, JSON.stringify(listStateFiles(WORK_DIR)))
 
@@ -576,6 +589,17 @@ try {
     check('[' + name + '] execute(null) 返回空结果且不发网络', err === null && out === expected, err ? String(err.message) : String(out))
   }
   check('以上空入参调用零 shell 调用（证明未触网）', stat.rec.shellRun.length === 0, JSON.stringify(stat.rec.shellRun))
+
+  // xueqiu_display：不传参数 = 只读（不改状态、不触网），传 hidden 才拨开关。
+  const displaySpec = specByName['xueqiu_display']
+  const readBack = await displaySpec.execute(null)
+  const readJson = JSON.parse(readBack)
+  check('xueqiu_display 空参数 → 只读（changed:false + hidden 布尔）', readJson.changed === false && typeof readJson.hidden === 'boolean', readBack)
+  await displaySpec.execute({ hidden: true })
+  check('xueqiu_display {hidden:true} → ui.get 立刻反映', jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.get' })).data.hidden === true)
+  const back = JSON.parse(await displaySpec.execute({ hidden: false }))
+  check('xueqiu_display {hidden:false} → 拨回来（changed:true）', back.changed === true && back.hidden === false && jsonOf(await rpc(SAME_ORIGIN, { action: 'ui.get' })).data.hidden === false, JSON.stringify(back))
+  check('xueqiu_display 全程不碰行情接口（零 shell 调用）', stat.rec.shellRun.length === 0, JSON.stringify(stat.rec.shellRun))
 
   for (const s of stat.rec.toolSpecs) {
     let err = null

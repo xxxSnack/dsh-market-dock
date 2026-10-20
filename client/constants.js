@@ -62,7 +62,15 @@ export const POLL_DOCK_SESSION_MS = 60000    // 面板头部交易时段文案�
 // 今日盈亏（本地持仓 × 行情）：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
 export const POSITIONS_POLL_FALLBACK_MS = 30000
 export const ALERT_POLL_MS = 30000
+// 没有提醒规则时的空转节奏：行情隐身/面板收起后提醒轮询依然常驻，不能按 30 秒空转。
+// 5 分钟一次本地文件读（宿主的 alerts.get 只读 .xueqiu-alerts.json，不出网），
+// 同时保留「在别处新增了规则，这个页面也能自己发现」的能力。
+export const ALERT_IDLE_POLL_MS = 300000
 export const ALERT_NOTICE_LIMIT = 20       // 首次加载仅展示有限待确认事件，避免旧事件撑爆面板
+
+// ---- 行情隐身（FORK-NOTES §11）----
+// 快捷键命令 id：注册到宿主快捷键服务，出现在 设置 → 通用 → 快捷键 里（可看键帽、可改键）。
+export const XQ_SHORTCUT_TOGGLE_HIDDEN = 'xq.toggleHidden'
 
 // ---- 槽位 id 与 order（7 个注册逐一对应，注册顺序见 slots.js）----
 export const SLOT_TOOLVIEW = 'tool.call.toolview'

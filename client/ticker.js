@@ -4,7 +4,7 @@
 // 与头部 chip 共用同一个 PnlChip（也就共用同一个轮询器，见 store/positions.js 的引用计数）。
 import { el } from './dom.js'
 import { fmt, fmtPct, colorOf } from './format.js'
-import { getUiRuntime } from './store/ui.js'
+import { getUiRuntime, hydrateUi } from './store/ui.js'
 import { fetchIndices } from './store/market.js'
 import { PnlChip, usePnlState } from './panel/pnl.js'
 import { POLL_TICKER_MS } from './constants.js'
@@ -97,7 +97,23 @@ function ownLine(node) {
 }
 
 // ---------- 底部指数条（会话页，输入框下方氛围行） ----------
+// 门控：水合完成前不挂载（否则刷新瞬间会先按默认参数请求一次指数），行情隐身时返回 null。
+// 注意这个 null 不是「不显示」而是「不存在」—— usePnlState 的订阅也随之消失，
+// 持仓/盈亏那条轮询器的 refs 归零、定时器停掉，这才是「零请求」的来源。
 export function Ticker() {
+  const rt = getUiRuntime()
+  const ui = rt.ui
+  const [, force] = React.useState(0)
+  React.useEffect(function () {
+    hydrateUi()
+    const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
+    return off
+  }, [])
+  if (!ui.hydrated || ui.hidden) return null
+  return el(TickerBody, null)
+}
+
+function TickerBody() {
   const rt = getUiRuntime()
   const ui = rt.ui
   const [indices, setIndices] = React.useState([])

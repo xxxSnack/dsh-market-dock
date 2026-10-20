@@ -863,7 +863,11 @@ function installWatchlist(core) {
   core.actWatchlistRemove = actWatchlistRemove
 }
 
-// UI 状态持久化（tab/open/dockH/badgeW/badgePos/badgeCompact）与它的读写动作。字段语义与钳制逐字保留。
+// UI 状态持久化（tab/open/hidden/dockH/badgeW/badgePos/badgeCompact）与它的读写动作。字段语义与钳制逐字保留。
+//
+// hidden 是「行情隐身」开关（见 FORK-NOTES §11）：唯一一个**不是布局**的字段，
+// 它决定三个常驻入口（输入框上方面板 / 悬浮徽章 / 底部指数条）是否挂载。
+// 宿主只负责存取，不做任何行情调度判断 —— 客户端不挂载组件，轮询自然不起。
 
 function installUiState(core) {
   const ctx = core.ctx
@@ -904,6 +908,8 @@ function installUiState(core) {
       tab: (typeof s.tab === 'string' && validTabs.indexOf(s.tab) >= 0) ? s.tab : 'market',
       // v1.22.8 引入回归：open 字段曾被上一行的行尾注释吞掉，导致客户端刷新后不恢复面板开合状态
       open: s.open !== false,
+      // 隐身开关：缺省必须是 false（老状态文件里没有这个键 → 一切照旧，不能变成隐身）
+      hidden: s.hidden === true,
       dockH: (s.dockH !== undefined && isFinite(hNum) && hNum >= 160 && hNum <= 1200) ? hNum : null,
       badgeW: (s.badgeW !== undefined && isFinite(Number(s.badgeW)) && Number(s.badgeW) >= 120 && Number(s.badgeW) <= 480) ? Number(s.badgeW) : null,
       badgeCompact: s.badgeCompact === true,
@@ -917,6 +923,8 @@ function installUiState(core) {
     if (args.tab !== undefined) s.tab = String(args.tab)
     if (args.open !== undefined) s.open = !!args.open
     if (args.badgeCompact !== undefined) s.badgeCompact = !!args.badgeCompact
+    // 逐字段白名单：新增字段必须显式登记，否则客户端 ui.set 会「点了没反应也不报错」。
+    if (args.hidden !== undefined) s.hidden = !!args.hidden
     if (args.badgePos && typeof args.badgePos === 'object' && isFinite(Number(args.badgePos.x)) && isFinite(Number(args.badgePos.y))) {
       s.badgePos = { x: Number(args.badgePos.x), y: Number(args.badgePos.y) }
     }
@@ -2927,7 +2935,44 @@ function makeKolTool(core) {
   }
 }
 
-// 6 个 Agent 工具 spec 的汇总。顺序即注册顺序，是既有习惯的一部分，不要调整。
+
+// 「行情隐身」开关的 Agent 面：用户说「把行情关掉」/「把行情打开」时，模型能直接拨这个开关。
+// 只读写 UI 状态，不碰行情、不碰持仓、不碰价格提醒 —— 提醒的判定在宿主 watcher 里，隐身期间照常跑。
+function makeDisplayTool(core) {
+  return {
+    name: 'xueqiu_display',
+    description: '读取或切换「雪球行情」的显示开关（隐身）。\n\n何时使用：用户说"把行情关掉/隐个身/别让我看涨跌/行情太吵/关掉那个指数条"→ hidden=true；说"把行情打开/显示出来/恢复行情/我回来了"→ hidden=false；只问"行情开关现在是什么状态"→ 不带参数调用即可。\n\nhidden=true 的效果：输入框上方的行情面板、右下角悬浮徽章、输入框下方的指数条全部不渲染，行情轮询随之停止（零请求、零占屏）。**价格提醒不受影响**：宿主侧 watcher 照常判定，到价依然会发系统通知。\n\n恢复方式：再调一次本工具（hidden=false），或用户按已注册的快捷键（可在 设置 → 通用 → 快捷键 里查看/改键）。\n\n不带 hidden 参数时只读当前状态，不改变任何东西。',
+    parameters: {
+      type: 'object',
+      properties: {
+        hidden: { type: 'boolean', description: 'true=完全隐藏行情界面；false=恢复显示；省略=只读当前状态' }
+      },
+      // 显式空数组：省略参数就是「只读」这条语义要能被 schema 表达（工具层不接受 undefined required）
+      required: [],
+      additionalProperties: true
+    },
+    output: xqToolOutput(),
+    timeoutMs: 10000,
+    async execute(args) {
+      const want = args && args.hidden
+      if (typeof want !== 'boolean') {
+        const cur = await core.actUiGet({})
+        return JSON.stringify({ hidden: !!(cur && cur.hidden === true), changed: false })
+      }
+      await core.actUiSet({ hidden: want })
+      return JSON.stringify({
+        hidden: want,
+        changed: true,
+        note: want
+          ? '行情界面已隐藏，行情轮询已停止；价格提醒仍然生效（到价会发系统通知）'
+          : '行情界面已恢复显示'
+      })
+    }
+  }
+}
+
+// 7 个 Agent 工具 spec 的汇总。顺序即注册顺序，是既有习惯的一部分，不要调整
+// （新增的 xueqiu_display 追加在末尾：前 6 个的注册顺序在位，不影响任何按序断言的历史语义）。
 
 
 function makeAgentTools(core) {
@@ -2937,7 +2982,8 @@ function makeAgentTools(core) {
     makeSearchTool(core),
     makeHotTool(core),
     makeNewsTool(core),
-    makeKolTool(core)
+    makeKolTool(core),
+    makeDisplayTool(core)
   ]
 }
 

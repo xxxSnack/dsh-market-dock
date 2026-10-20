@@ -109,7 +109,15 @@ const POLL_DOCK_SESSION_MS = 60000    // 面板头部交易时段文案重算
 // 今日盈亏（本地持仓 × 行情）：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
 const POSITIONS_POLL_FALLBACK_MS = 30000
 const ALERT_POLL_MS = 30000
+// 没有提醒规则时的空转节奏：行情隐身/面板收起后提醒轮询依然常驻，不能按 30 秒空转。
+// 5 分钟一次本地文件读（宿主的 alerts.get 只读 .xueqiu-alerts.json，不出网），
+// 同时保留「在别处新增了规则，这个页面也能自己发现」的能力。
+const ALERT_IDLE_POLL_MS = 300000
 const ALERT_NOTICE_LIMIT = 20       // 首次加载仅展示有限待确认事件，避免旧事件撑爆面板
+
+// ---- 行情隐身（FORK-NOTES §11）----
+// 快捷键命令 id：注册到宿主快捷键服务，出现在 设置 → 通用 → 快捷键 里（可看键帽、可改键）。
+const XQ_SHORTCUT_TOGGLE_HIDDEN = 'xq.toggleHidden'
 
 // ---- 槽位 id 与 order（7 个注册逐一对应，注册顺序见 slots.js）----
 const SLOT_TOOLVIEW = 'tool.call.toolview'
@@ -300,8 +308,12 @@ function createUiRuntime(ctx) {
   // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
   const ui = {
     open: false, tab: 'market', badgePos: null, badgeW: null, badgeCompact: false, dockH: null, hydrated: false,
+    // [fork.7] 行情隐身：true = 三个常驻入口（面板/徽章/指数条）全部不挂载，行情轮询随之停止。
+    // 放在 ui 里而不是另起一套持久化：水合、touched 守卫、落盘 debounce 全部复用现成通道。
+    hidden: false,
     // [fork-fix] 已交互过的字段不被迟到的水合回滚。open/tab 原本就有这些标志，位置/尺寸/折叠状态补齐。
     openTouched: false, tabTouched: false, badgePosTouched: false, badgeWTouched: false, badgeCompactTouched: false, dockHTouched: false,
+    hiddenTouched: false,
     _fns: [],
     subscribe: function (fn) {
       this._fns.push(fn)
@@ -328,6 +340,7 @@ function createUiRuntime(ctx) {
         if (k === 'badgeW') this.badgeWTouched = true
         if (k === 'badgeCompact') this.badgeCompactTouched = true
         if (k === 'dockH') this.dockHTouched = true
+        if (k === 'hidden') this.hiddenTouched = true
       }
       if (ch) {
         this.notify()
@@ -336,7 +349,7 @@ function createUiRuntime(ctx) {
         // [fork-fix] 原来只有 open 直接落盘：位置/尺寸靠 DockPanel 的订阅间接落盘，
         // 而面板收起时 DockPanel 根本不挂载（DockGate 返回 null）→ 拖徽章永不写入。
         // 改为所有被持久化的键都直接排一次落盘，不再依赖某个组件恰好挂着。
-        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'badgeCompact' in patch || 'dockH' in patch) {
+        if ('open' in patch || 'badgePos' in patch || 'badgeW' in patch || 'badgeCompact' in patch || 'dockH' in patch || 'hidden' in patch) {
           try { saveUi() } catch (e) { /* 初始化前忽略 */ }
         }
       }
@@ -344,7 +357,7 @@ function createUiRuntime(ctx) {
   }
 
   const saveUi = ctx.debounce(function () {
-    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, badgeCompact: ui.badgeCompact, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
+    call(A_UI_SET, { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, badgeCompact: ui.badgeCompact, dockH: ui.dockH, hidden: ui.hidden }).catch(function () { /* 忽略 */ })
   }, SAVE_UI_DEBOUNCE_MS)
 
   uiRuntime = {
@@ -396,9 +409,31 @@ function hydrateUi() {
     if (d && typeof d.badgeCompact === 'boolean' && !ui.badgeCompactTouched) {
       ui.set({ badgeCompact: d.badgeCompact })
     }
+    // 隐身开关：必须在 hydrated 之前落定 —— 三个入口组件都等 hydrated 才渲染，
+    // 否则刷新瞬间会先画出行情再消失（徽章一挂载就 fetchWatchlist、指数条一挂载就 fetchIndices）。
+    if (d && typeof d.hidden === 'boolean' && !ui.hiddenTouched) {
+      ui.set({ hidden: d.hidden })
+    }
     ui.set({ hydrated: true })
   }).catch(function () { ui.set({ hydrated: true }) })
   return rt.hydratePromise
+}
+
+// ---------- 行情隐身（三个入口的唯一开关通道）----------
+// 只改 ui.hidden：不动 open（恢复时保持用户原来的面板开合状态），不动 tab。
+// ui.set 里 'hidden' 已在落盘条件内，所以这里不需要额外 saveUi。
+function setUiHidden(hidden) {
+  const rt = getUiRuntime()
+  if (!rt) return false
+  rt.ui.set({ hidden: !!hidden })
+  return !!hidden
+}
+
+// 快捷键与徽章按钮共用：语义是「拨一下」而不是「设成某个值」。
+function toggleUiHidden() {
+  const rt = getUiRuntime()
+  if (!rt) return false
+  return setUiHidden(!rt.ui.hidden)
 }
 
 // 行情取数函数：本期只放各组件共用的**纯取数**封装（不引入共享 store、不做缓存/合并请求）。
@@ -631,6 +666,186 @@ function saveAlert(symbol, target, direction, enabled) {
 }
 function removeAlert(symbol) { return call(A_ALERTS_REMOVE, { symbol: symbol }) }
 function ackAlerts(ids) { return call(A_ALERTS_ACK, { ids: ids }) }
+
+// 价格提醒的浏览器侧通知器（**应用级**运行时）：把宿主新产生的提醒事件弹成系统通知。
+//
+// ── 为什么必须提到应用级（FORK-NOTES §11）────────────────────────────────────
+// 宿主的 lib/alerts.js watcher 负责「是否穿越阈值 + 事件持久化」，它跟页面显示完全无关，一直在跑；
+// 浏览器这一侧原来只做两件事：读事件、弹 Notification —— 而这两件事写死在 XueqiuPanel 的
+// refreshAlerts 里。于是「面板收起」= 通知静默。行情隐身功能要求「不显示行情，但到价还要提醒我」，
+// 这条老耦合必须拆掉：通知器跟 ui.hidden / 面板挂载都无关，只跟页面在不在有关。
+//
+// ── 语义 ───────────────────────────────────────────────────────────────────
+//   · 首轮静默：宿主 events 是持久化历史，页面加载时不能为旧事件刷屏（第一轮只建立基线）。
+//   · 之后每出现一个新事件 id 就弹一次；面板的「页面内通知区」由 panel/index.js 订阅同一份快照渲染。
+//   · 空转退避：没有规则时按 ALERT_IDLE_POLL_MS（5 分钟）读一次本地文件，既不空转也不错过
+//     「在别处新增了规则」；有规则时回到 ALERT_POLL_MS（30 秒，与改造前一致）。
+
+let alertsWatchRuntime = null
+
+function getAlertsWatchRuntime() { return alertsWatchRuntime }
+
+// 事件身份：宿主 id 优先，缺失时退化到内容签名（与改造前 panel 内实现逐字一致）。
+function alertEventId(e) {
+  if (!e) return ''
+  return String(e.id != null ? e.id : (e.event_id != null ? e.event_id : [e.symbol, e.target, e.direction, e.triggered_at || e.created_at || e.time].join('|')))
+}
+
+// 在用户手势里请求一次通知权限（隐身按钮点击时调用）：权限弹窗挂在定时器里常被浏览器直接拒绝。
+function ensureAlertPermission() {
+  const rt = alertsWatchRuntime
+  if (rt) rt.ensurePermission()
+}
+
+function createAlertsWatchRuntime(ctx) {
+  const listeners = []
+  // event id → true：既当「首轮基线」也当「已弹过通知」的账本（同一集合，语义天然一致）
+  const known = Object.create(null)
+  let baselined = false
+  let timer = null
+  let inflight = null
+
+  // 定时器句柄归一化：ctx.timeout 可能返回 stop 函数，也可能返回带 dispose() 的对象。
+  function disposer(handle) {
+    if (!handle) return null
+    if (typeof handle === 'function') return handle
+    if (typeof handle.dispose === 'function') return function () { handle.dispose() }
+    return null
+  }
+
+  const rt = {
+    ctx: ctx,
+    state: { rules: [], events: [], loaded: false },
+    active: false,
+
+    getState: function () { return rt.state },
+
+    // 订阅即补发：订阅者（面板）晚于首次取数挂载时要能立刻拿到当前快照，否则那一段会空着。
+    subscribe: function (fn) {
+      listeners.push(fn)
+      if (rt.state.loaded) { try { fn(rt.state, []) } catch (e) { /* 单个订阅者抛错不影响其他 */ } }
+      return function () {
+        const i = listeners.indexOf(fn)
+        if (i !== -1) listeners.splice(i, 1)
+      }
+    },
+
+    refresh: function () {
+      if (inflight) return inflight
+      const p = fetchAlerts().then(function (data) {
+        const rules = (data && Array.isArray(data.rules)) ? data.rules : []
+        const events = (data && Array.isArray(data.events)) ? data.events : []
+        const fresh = []
+        if (!baselined) {
+          // 首轮（含页面刷新后的首次）：只建立基线，不为历史事件弹通知。
+          baselined = true
+          for (let i = 0; i < events.length; i++) known[alertEventId(events[i])] = true
+        } else {
+          for (let i = 0; i < events.length; i++) {
+            const id = alertEventId(events[i])
+            if (known[id]) continue
+            known[id] = true
+            fresh.push(events[i])
+          }
+        }
+        rt.state = { rules: rules, events: events, loaded: true }
+        inflight = null
+        const fns = listeners.slice()
+        for (let i = 0; i < fns.length; i++) {
+          try { fns[i](rt.state, fresh) } catch (e) { /* 单个订阅者抛错不影响其他 */ }
+        }
+        if (fresh.length) fire(fresh)
+        return rt.state
+      }).catch(function () {
+        // 读失败不是致命错误：保留上一份快照，节奏由 cycle 决定下一步（不阻断后续轮询）。
+        inflight = null
+        return rt.state
+      })
+      inflight = p
+      return p
+    },
+
+    // 规则被增删改之后立刻核对一次（不用等下一个 tick，也不必自己维护一份基线）。
+    kick: function () {
+      if (!rt.active) return Promise.resolve(rt.state)
+      if (timer) { try { timer() } catch (e) { /* ignore */ } timer = null }
+      return rt.refresh()
+    },
+
+    ensurePermission: function () {
+      try {
+        if (typeof window === 'undefined' || !window.Notification) return
+        if (window.Notification.permission !== 'default') return
+        if (typeof window.Notification.requestPermission !== 'function') return
+        window.Notification.requestPermission().catch(function () { /* 用户拒绝/浏览器不支持：静默 */ })
+      } catch (e) { /* ignore */ }
+    },
+
+    start: function () {
+      if (rt.active) return
+      rt.active = true
+      bindVisibility()
+      cycle()
+    },
+
+    stop: function () {
+      rt.active = false
+      unbindVisibility()
+      if (timer) { try { timer() } catch (e) { /* ignore */ } timer = null }
+    }
+  }
+
+  function fire(events) {
+    try {
+      if (typeof window === 'undefined' || !window.Notification) return
+      const title = '雪球价格提醒'
+      const show = function (e) {
+        const text = (e.name || e.symbol || '标的') + ' ' + (e.direction === 'below' ? '≤' : '≥') + ' ' + (e.target == null ? '' : e.target) + (e.current == null ? '' : '，现价 ' + e.current)
+        return new window.Notification(title, { body: text, tag: 'xq-alert-' + alertEventId(e) })
+      }
+      if (window.Notification.permission === 'granted') {
+        for (let i = 0; i < events.length; i++) { try { show(events[i]) } catch (e) { /* ignore */ } }
+      } else if (window.Notification.permission === 'default' && typeof window.Notification.requestPermission === 'function') {
+        window.Notification.requestPermission().then(function (permission) {
+          if (permission !== 'granted') return
+          for (let i = 0; i < events.length; i++) { try { show(events[i]) } catch (e) { /* ignore */ } }
+        }).catch(function () { /* ignore */ })
+      }
+    } catch (e) { /* 浏览器权限/实现异常静默：页面内通知区仍然会列出事件 */ }
+  }
+
+  function arm(ms) {
+    if (timer) { try { timer() } catch (e) { /* ignore */ } timer = null }
+    timer = disposer(ctx.timeout(cycle, ms))
+  }
+
+  // 一次「取数 → 按规则数量重排」。取数失败时 state.loaded 仍是上次的值：
+  // 从没读成功过就按 30 秒快速重试，读成功过就照规则数量决定节奏。
+  function cycle() {
+    if (!rt.active) return
+    rt.refresh().then(function (state) {
+      if (!rt.active) return
+      if (!state.loaded) { arm(ALERT_POLL_MS); return }
+      arm(state.rules.length ? ALERT_POLL_MS : ALERT_IDLE_POLL_MS)
+    })
+  }
+
+  // 页面从后台回来时立刻补一次：后台标签页的定时器会被钳制，错过的那段时间要在这里追上。
+  function onVisibility() {
+    if (!rt.active) return
+    if (timer) { try { timer() } catch (e) { /* ignore */ } timer = null }
+    cycle()
+  }
+  function bindVisibility() {
+    try { if (typeof document !== 'undefined' && document.addEventListener) document.addEventListener('visibilitychange', onVisibility) } catch (e) { /* ignore */ }
+  }
+  function unbindVisibility() {
+    try { if (typeof document !== 'undefined' && document.removeEventListener) document.removeEventListener('visibilitychange', onVisibility) } catch (e) { /* ignore */ }
+  }
+
+  alertsWatchRuntime = rt
+  return rt
+}
 
 // 图表引擎：KLineChart v10（canvas）。初始化 / 主题同步 / 尺寸自适应 / 销毁 与具体图表无关的部分都在这里。
 
@@ -2171,68 +2386,38 @@ function XueqiuPanel() {
   const [alertDrafts, setAlertDrafts] = React.useState({})
   const [alertBusy, setAlertBusy] = React.useState({})
   const [ackBusy, setAckBusy] = React.useState(false)   // 确认 RPC 在途：只用于按钮态，判定重入用 ref
-  const alertSeq = React.useRef(0)
-  const alertKnown = React.useRef(null)
-  const alertNotified = React.useRef({})
+  const noticeSeeded = React.useRef(false)
   const ackPending = React.useRef(false)
   const tab = ui.tab
   function setTab(t) { ui.set({ tab: t }) }
-
-  function alertEventId(e) {
-    if (!e) return ''
-    return String(e.id != null ? e.id : (e.event_id != null ? e.event_id : [e.symbol, e.target, e.direction, e.triggered_at || e.created_at || e.time].join('|')))
+  // 规则变更后立刻核对一次：提醒轮询本身归应用级 alerts-watch 运行时，面板只订阅它的快照。
+  function kickAlerts() {
+    const rt = getAlertsWatchRuntime()
+    if (rt) rt.kick()
   }
-  function showAlertNotification(e) {
-    try {
-      if (typeof window === 'undefined' || !window.Notification) return
-      const title = '雪球价格提醒'
-      const text = (e.name || e.symbol || '标的') + ' ' + (e.direction === 'below' ? '≤' : '≥') + ' ' + (e.target == null ? '' : e.target) + (e.current == null ? '' : '，现价 ' + e.current)
-      if (window.Notification.permission === 'granted') new window.Notification(title, { body: text, tag: 'xq-alert-' + alertEventId(e) })
-      else if (window.Notification.permission === 'default' && window.Notification.requestPermission) {
-        window.Notification.requestPermission().then(function (permission) {
-          if (permission === 'granted') { try { new window.Notification(title, { body: text, tag: 'xq-alert-' + alertEventId(e) }) } catch (ignore) {} }
-        }).catch(function () {})
-      }
-    } catch (ignore) { /* 浏览器权限/实现异常静默回退到页面提示 */ }
-  }
-  function refreshAlerts() {
-    const my = ++alertSeq.current
-    return fetchAlerts().then(function (data) {
-      if (alertSeq.current !== my) return
-      const rules = (data && Array.isArray(data.rules) ? data.rules : [])
-      const events = (data && Array.isArray(data.events) ? data.events : [])
-      const oldKnown = alertKnown.current
-      const initial = oldKnown === null
-      const fresh = initial ? [] : events.filter(function (e) { return !oldKnown[alertEventId(e)] })
-      const known = oldKnown || {}
-      events.forEach(function (e) { known[alertEventId(e)] = true })
-      alertKnown.current = known
-      setAlertRules(rules)
-      setAlertEvents(events)
-      // 首轮（含面板重挂后重新挂载）建立 alertKnown 基线：宿主的 events 是持久化的历史事件，
-      // 不能当成新事件弹浏览器通知，否则每次打开面板都会为旧事件刷屏；真正的新事件只会出现在
-      // 基线之后的轮询里（含可见性变化补拉、手动刷新）。
-      // 但「不弹通知」不等于「不可见」：alertEvents 只进 state、不直接渲染，历史未确认事件若也不进
-      // alertNotice 就没有任何 ack 入口。所以首轮静默（不调 showAlertNotification）把最近
-      // ALERT_NOTICE_LIMIT 条放进页面通知区：取尾部与宿主保留新事件的约定一致（host 侧
-      // store.events 超出 ALERT_MAX_EVENTS 时 slice(-ALERT_MAX_EVENTS)，events 为时间升序），
-      // 也避免陈年旧事件撑爆面板；确认掉展示的这批后重挂面板即可看到更早的一批，不会被永久藏住。
-      // 追加时按 alertEventId 去重，不重复堆叠。
-      const notice = initial ? events.slice(-ALERT_NOTICE_LIMIT) : fresh
-      if (notice.length) {
-        if (!initial) {
-          notice.forEach(function (e) {
-            const id = alertEventId(e)
-            if (!alertNotified.current[id]) { alertNotified.current[id] = true; showAlertNotification(e) }
-          })
-        }
-        setAlertNotice(function (prev) {
-          const prior = prev || []
-          return prior.concat(notice.filter(function (e) { return !prior.some(function (x) { return alertEventId(x) === alertEventId(e) }) }))
-        })
-      }
-      return data
-    }).catch(function () { /* 提醒失败不影响行情 */ })
+  // 快照落点：rules/events 直接上屏；fresh 是新事件（= 该弹通知的那批，通知已由运行时发出）。
+  // 面板这里只负责把它们追加到「页面内通知区」—— 那是 ack 的入口，不显示就等于永远确认不掉。
+  function applyAlerts(state, fresh) {
+    const rules = (state && Array.isArray(state.rules)) ? state.rules : []
+    const events = (state && Array.isArray(state.events)) ? state.events : []
+    setAlertRules(rules)
+    setAlertEvents(events)
+    // 首份快照只把最近 ALERT_NOTICE_LIMIT 条未确认事件放进通知区（与宿主保留新事件的约定一致：
+    // 超出 ALERT_MAX_EVENTS 时 slice(-N)，events 时间升序），避免陈年旧事件撑爆面板；
+    // 确认掉这批后重开面板即可看到更早的一批，不会被永久藏住。
+    if (!noticeSeeded.current) {
+      noticeSeeded.current = true
+      if (events.length) setAlertNotice(events.slice(-ALERT_NOTICE_LIMIT))
+      return
+    }
+    if (!fresh || !fresh.length) return
+    setAlertNotice(function (prev) {
+      const prior = prev || []
+      return prior.concat(fresh.filter(function (e) {
+        const id = alertEventId(e)
+        return !prior.some(function (x) { return alertEventId(x) === id })
+      }))
+    })
   }
   function setAlert(symbol, rawTarget, direction, enabled) {
     const target = Number(rawTarget)
@@ -2243,6 +2428,7 @@ function XueqiuPanel() {
     setAlertBusy(function (b) { return Object.assign({}, b, { [symbol]: true }) })
     saveAlert(symbol, target, direction, enabled !== false).then(function (data) {
       setAlertRules((data && data.rules) || [])
+      kickAlerts()   // 运行时的规则快照/节奏跟着改：新增规则后要从 5 分钟空闲节奏回到 30 秒
       setErr('')
     }).catch(function (e) {
       setErr(String((e && e.message) || e))
@@ -2252,6 +2438,7 @@ function XueqiuPanel() {
     setAlertBusy(function (b) { return Object.assign({}, b, { [symbol]: true }) })
     removeAlert(symbol).then(function (data) {
       setAlertRules((data && data.rules) || [])
+      kickAlerts()   // 删掉最后一条后运行时停表；删掉一条也要让节奏/基线跟宿主对齐
       setErr('')
     }).catch(function (e) {
       setErr(String((e && e.message) || e))
@@ -2267,13 +2454,14 @@ function XueqiuPanel() {
     const acked = {}
     ids.forEach(function (id) { acked[String(id)] = true })
     // 先等 RPC 成功再动本地状态：原来先乐观删除，ack RPC 一失败宿主仍记录着事件，
-    // 但事件已被 alertKnown 认作「已知」，下轮轮询既不会再通知也不会把它放回通知区，
+    // 但事件已被本地「已知」集合认作已处理，下轮既不会再通知也不会把它放回通知区，
     // 表现为「点了确认却没确认掉，而且再也看不见了」。失败时保留事件并报错，可直接重试。
     ackAlerts(ids).then(function (data) {
       const remaining = (data && Array.isArray(data.events)) ? data.events : null
       if (remaining) setAlertEvents(remaining)   // 宿主回传剩余事件，直接以它为准
       else setAlertEvents(function (prev) { return (prev || []).filter(function (e) { return !acked[alertEventId(e)] }) })
       setAlertNotice(function (prev) { return (prev || []).filter(function (e) { return !acked[alertEventId(e)] }) })
+      kickAlerts()   // 让运行时的快照与宿主一致（否则它的 events 里还留着已被确认掉的那几条）
       setErr('')
     }).catch(function (e) {
       setErr('确认提醒失败：' + String((e && e.message) || e))
@@ -2369,19 +2557,17 @@ function XueqiuPanel() {
     refreshMarket().then(function () { return refreshContent() })
       .then(function () { setLoading(false) })
       .catch(function () { setLoading(false) })
-    refreshAlerts()
     return function () { /* 一次性 */ }
   }, [])
 
   React.useEffect(function () {
-    // 宿主事件已持久化，后台页也要轮询；回前台时立即补拉一次。
-    const stop = rt.ctx.interval(function () { refreshAlerts() }, ALERT_POLL_MS)
-    function onVis() { refreshAlerts() }
-    try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-    return function () {
-      if (stop) stop()
-      try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-    }
+    // 提醒轮询归应用级 alerts-watch 运行时（它与面板挂载、与行情隐身都无关，见 store/alerts-watch.js）；
+    // 面板只订阅快照。打开面板时顺手 kick 一次，避免看到上一次 tick 的旧列表。
+    const watch = getAlertsWatchRuntime()
+    if (!watch) return function () { }
+    const off = watch.subscribe(applyAlerts)
+    watch.kick()
+    return off
   }, [])
 
   React.useEffect(function () {
@@ -2709,11 +2895,26 @@ function XueqiuPanel() {
 // 悬停弹层已砍掉：速览靠拉宽徽章，完整功能点徽章开面板。
 
 // ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
+// 门控与 DockGate 同款：水合完成前不挂载（否则刷新瞬间会先按默认参数画一次再做布局钳制），
+// 行情隐身时直接返回 null —— 组件不挂载，它那份 POLL_BADGE_MS 轮询自然不存在。
 function MiniBadge() {
   const rt = getUiRuntime()
   const ui = rt.ui
-  const [top, setTop] = React.useState([])
   const [, force] = React.useState(0)
+  React.useEffect(function () {
+    // [fork-fix] 应用级水合入口：shell.overlay 全局只挂一次，不随会话切换重放旧持久化值
+    hydrateUi()
+    const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
+    return off
+  }, [])
+  if (!ui.hydrated || ui.hidden) return null
+  return el(MiniBadgeBody, null)
+}
+
+function MiniBadgeBody() {
+  const rt = getUiRuntime()
+  const ui = rt.ui
+  const [top, setTop] = React.useState([])
   const refreshSeq = React.useRef(0)
 
   React.useEffect(function () {
@@ -2732,13 +2933,10 @@ function MiniBadge() {
     }
     function onVis() { refresh() }
     refresh()
-    // [fork-fix] 应用级水合入口：shell.overlay 全局只挂一次，不随会话切换重放旧持久化值
-    hydrateUi()
     const stop = rt.ctx.interval(refresh, POLL_BADGE_MS)
-    const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
     try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     return function () {
-      alive = false; if (stop) stop(); off()
+      alive = false; if (stop) stop()
       try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     }
   }, [])
@@ -2896,12 +3094,25 @@ function MiniBadge() {
     onPointerUp: stopBadgeControl, onPointerCancel: stopBadgeControl,
     onClick: function (e) { stopBadgeControl(e); ui.set({ badgeCompact: !ui.badgeCompact }) }
   }, compact ? '+' : '−')
+  // 隐身：徽章自己也能关掉自己（连指数条一起），无需先展开面板。
+  // 点击时顺手请求通知权限 —— 隐身后的到价提醒依赖它，而定时器里请求常被浏览器拒绝。
+  const hideButton = el('button', {
+    key: 'hide', type: 'button', className: 'xq-badge-control',
+    title: '完全隐藏行情（面板、徽章、指数条一起关；恢复：快捷键或让 AI 打开）',
+    'aria-label': '完全隐藏行情',
+    onPointerDown: stopBadgeControl, onPointerMove: stopBadgeControl,
+    onPointerUp: stopBadgeControl, onPointerCancel: stopBadgeControl,
+    onClick: function (e) { stopBadgeControl(e); ensureAlertPermission(); ui.set({ hidden: true }) }
+  }, '⊘')
   const badgeKids = [
     el('div', { key: 'hd', className: 'xq-badge-hd' }, [
       el('span', { key: 'logo' }, [el('b', { key: 'b' }, '雪球'), 'mini']),
       el('span', { key: 'st', className: 'xq-status' + (aSession() === '盘中' ? ' xq-live' : ''), title: sessionsText() }, (function () { var s = aSession(); return s === '盘中' ? '● 盘中' : (s || '休市') })()),
       el('span', { key: 'sp', className: 'xq-spacer' }),
+      // 顺序是契约：[5d] 探针把「第一个 .xq-badge-control」当成折叠按钮，
+      // 所以折叠(−)在前、隐身(⊘)在后 —— 视觉上也是「先收小，再藏掉」。
       compactButton,
+      hideButton,
       el('span', { key: 'ct', className: 'xq-caret' }, ui.open ? '▾' : '▴')
     ])
   ]
@@ -2924,7 +3135,7 @@ function MiniBadge() {
 
 // 嵌入式主面板（conversation.input.dock）：输入框上方一整行。
 // ---------- 嵌入式主面板（conversation.input.dock）：输入框上方一整行 ----------
-// DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 时渲染 null。
+// DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 或 hidden=true 时渲染 null。
 // 不能把开关写在槽位 render 闭包里——槽位函数不会因 ui 变化而重新执行。
 
 function DockGate() {
@@ -2936,7 +3147,8 @@ function DockGate() {
     const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
     return off
   }, [])
-  if (!ui.hydrated || !ui.open) return null
+  // hidden = 行情隐身：面板/徽章/指数条三个入口一起卸载，行情轮询随之全停（FORK-NOTES §11）。
+  if (!ui.hydrated || !ui.open || ui.hidden) return null
   return el(DockPanel, null)
 }
 
@@ -3003,6 +3215,12 @@ function DockPanel() {
       el(PnlChip, { key: 'pnl' }),
       el('span', { key: 'hint', className: 'xq-update' }, '已嵌入输入框上方 · Esc 收起'),
       el('span', { key: 'sp', className: 'xq-spacer' }),
+      // 隐身：一个按钮把三个常驻入口一起关掉（不是收起 —— 收起只关面板，徽章和指数条还在）。
+      // 顺带在用户手势里请求一次通知权限（定时器里请求常被浏览器直接拒绝），保证隐身期间到价还能提醒。
+      el('button', {
+        key: 'hide', className: 'xq-btn-mini', title: '完全隐藏行情：面板、徽章、指数条一起消失，行情请求随之停止（价格提醒仍然生效）。恢复：Ctrl/⌘+Alt+Shift+X（可在 设置→通用→快捷键 改键），或对 AI 说「把行情打开」',
+        onClick: function () { ensureAlertPermission(); ui.set({ hidden: true }) }
+      }, '隐身'),
       el('button', { key: 'min', className: 'xq-btn-mini', title: '收起（点右下角徽章重新打开）', onClick: function () { ui.set({ open: false }) } }, '收起 —')
     ]),
     el('div', { key: 'body', className: 'xq-dock-body', style: bodyStyle }, [
@@ -3109,7 +3327,23 @@ function ownLine(node) {
 }
 
 // ---------- 底部指数条（会话页，输入框下方氛围行） ----------
+// 门控：水合完成前不挂载（否则刷新瞬间会先按默认参数请求一次指数），行情隐身时返回 null。
+// 注意这个 null 不是「不显示」而是「不存在」—— usePnlState 的订阅也随之消失，
+// 持仓/盈亏那条轮询器的 refs 归零、定时器停掉，这才是「零请求」的来源。
 function Ticker() {
+  const rt = getUiRuntime()
+  const ui = rt.ui
+  const [, force] = React.useState(0)
+  React.useEffect(function () {
+    hydrateUi()
+    const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
+    return off
+  }, [])
+  if (!ui.hydrated || ui.hidden) return null
+  return el(TickerBody, null)
+}
+
+function TickerBody() {
   const rt = getUiRuntime()
   const ui = rt.ui
   const [indices, setIndices] = React.useState([])
@@ -3180,7 +3414,63 @@ function installSlots(ctx) {
   }
 }
 
-// 入口：apply 薄壳（插样式 → 建运行时 → 装槽位）+ 默认导出。
+// 应用级快捷键：行情「隐身」的恢复入口之一（另一个是 xueqiu_display 工具，让 AI 拨开关）。
+//
+// 为什么用宿主的快捷键服务而不是自己监听 keydown：
+//   · 命令会出现在 设置 → 通用 → 快捷键 里 —— 用户能看见键帽、能改键，也能在撞键时自己换一个；
+//   · 宿主统一处理焦点区域/输入框/弹窗的仲裁，不会在终端、输入框里误触发；
+//   · 隐身之后屏幕上什么都没有，这条「看不见但要记得住」的入口必须是可发现、可改的。
+//
+// 降级链：shortcuts 服务不存在 → 什么都不做（仍可让 AI 打开）；
+//        默认键位与既有命令冲突导致 register 抛错 → 退化为「未绑定」再注册一次，
+//        命令照样出现在快捷键表里等用户指派，比彻底没有入口好。
+
+// primary = macOS 上的 ⌘ / 其它平台的 Ctrl。三修饰键 + X：正常输入与常见全局快捷键都不会占用。
+const BINDING_PROFILES = ['web:windows', 'web:macos', 'web:linux', 'desktop:windows', 'desktop:macos', 'desktop:linux']
+
+function binding() { return { code: 'KeyX', modifiers: ['primary', 'alt', 'shift'] } }
+
+function makeCommand(withDefaults) {
+  const defaults = {}
+  if (withDefaults) for (let i = 0; i < BINDING_PROFILES.length; i++) defaults[BINDING_PROFILES[i]] = binding()
+  return {
+    id: XQ_SHORTCUT_TOGGLE_HIDDEN,
+    label: function () { return '雪球行情：显示 / 隐身' },
+    aliases: ['xueqiu hidden', '雪球隐身', '行情隐身', '隐藏行情'],
+    defaults: defaults,
+    // editable 也要放行：用户可能正停在输入框里想「把行情关掉」，此时 region='editable'。
+    regions: ['page', 'editable'],
+    modals: [],
+    resolve: function () {
+      return { status: 'handled', run: function () { toggleUiHidden() } }
+    }
+  }
+}
+
+function registerCommand(shortcuts) {
+  try {
+    return shortcuts.register(makeCommand(true))
+  } catch (e) {
+    try {
+      return shortcuts.register(makeCommand(false))
+    } catch (e2) {
+      return function () {}
+    }
+  }
+}
+
+function installShortcuts(ctx) {
+  try {
+    if (typeof ctx.inject !== 'function') return
+    ctx.inject(['shortcuts'], function (scoped) {
+      const shortcuts = scoped && scoped.shortcuts
+      if (!shortcuts || typeof shortcuts.register !== 'function') return
+      scoped.effect(function () { return registerCommand(shortcuts) })
+    })
+  } catch (e) { /* 宿主没有快捷键服务：隐身仍可经 xueqiu_display 工具恢复 */ }
+}
+
+// 入口：apply 薄壳（插样式 → 建运行时 → 装槽位/快捷键）+ 默认导出。
 // 样式在 apply 开头只插一次；ui store / saveUi / hydratePromise / 拖拽引用等「每次 apply 一份」
 // 的状态由 createUiRuntime 重建（见 store/ui.js 的运行时持有者说明）。
 
@@ -3478,7 +3768,12 @@ const xqClientPlugin = {
     // 持仓/盈亏的唯一数据源：只建运行时、不取数，首个订阅者（chip / tab / 指数条）挂载时才启动轮询。
     // 它现在读的是「本地持仓 × 雪球行情」的宿主现算视图 —— 账本凭据坏了也不影响实时数字。
     createPositionsRuntime(ctx)
+    // 价格提醒的系统通知器：**应用级、随 apply 启动**，与面板挂载和行情隐身都无关
+    // （宿主侧 watcher 独立判定阈值，这里只负责把新事件弹成通知）。见 store/alerts-watch.js。
+    createAlertsWatchRuntime(ctx).start()
     installSlots(ctx)
+    // 行情隐身的恢复入口：快捷键（设置里可改键）。没有这个服务时仍可让 AI 用 xueqiu_display 打开。
+    installShortcuts(ctx)
   }
 }
 

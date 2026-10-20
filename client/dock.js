@@ -1,9 +1,10 @@
 // 嵌入式主面板（conversation.input.dock）：输入框上方一整行。
 // ---------- 嵌入式主面板（conversation.input.dock）：输入框上方一整行 ----------
-// DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 时渲染 null。
+// DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 或 hidden=true 时渲染 null。
 // 不能把开关写在槽位 render 闭包里——槽位函数不会因 ui 变化而重新执行。
 import { el, viewport, sessionsText } from './dom.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
+import { ensureAlertPermission } from './store/alerts-watch.js'
 import { XueqiuPanel } from './panel/index.js'
 import { PnlChip } from './panel/pnl.js'
 import { DOCK_H_MIN, DOCK_H_MAX, DOCK_H_VP_RATIO, DOCK_H_DEFAULT_RATIO, DOCK_H_FALLBACK, VIEWPORT_FALLBACK_H, POLL_DOCK_SESSION_MS } from './constants.js'
@@ -17,7 +18,8 @@ export function DockGate() {
     const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
     return off
   }, [])
-  if (!ui.hydrated || !ui.open) return null
+  // hidden = 行情隐身：面板/徽章/指数条三个入口一起卸载，行情轮询随之全停（FORK-NOTES §11）。
+  if (!ui.hydrated || !ui.open || ui.hidden) return null
   return el(DockPanel, null)
 }
 
@@ -84,6 +86,12 @@ export function DockPanel() {
       el(PnlChip, { key: 'pnl' }),
       el('span', { key: 'hint', className: 'xq-update' }, '已嵌入输入框上方 · Esc 收起'),
       el('span', { key: 'sp', className: 'xq-spacer' }),
+      // 隐身：一个按钮把三个常驻入口一起关掉（不是收起 —— 收起只关面板，徽章和指数条还在）。
+      // 顺带在用户手势里请求一次通知权限（定时器里请求常被浏览器直接拒绝），保证隐身期间到价还能提醒。
+      el('button', {
+        key: 'hide', className: 'xq-btn-mini', title: '完全隐藏行情：面板、徽章、指数条一起消失，行情请求随之停止（价格提醒仍然生效）。恢复：Ctrl/⌘+Alt+Shift+X（可在 设置→通用→快捷键 改键），或对 AI 说「把行情打开」',
+        onClick: function () { ensureAlertPermission(); ui.set({ hidden: true }) }
+      }, '隐身'),
       el('button', { key: 'min', className: 'xq-btn-mini', title: '收起（点右下角徽章重新打开）', onClick: function () { ui.set({ open: false }) } }, '收起 —')
     ]),
     el('div', { key: 'body', className: 'xq-dock-body', style: bodyStyle }, [

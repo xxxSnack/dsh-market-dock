@@ -214,3 +214,7 @@ Changes relative to upstream 1.22.15:
 
 - **1.0.0** — renamed to `dsh-market-dock` and published: local holdings with live-computed P&L (ledger downgraded to a one-off import), price alerts promoted to a host-level runtime, a hide switch with three restore paths (bottom-left pill, rebindable shortcut, agent tool), DSH 0.2 `shell` service compatibility, and input hardening for watchlist and ledger form values.
 - Upstream 1.22.x release notes live in the upstream repo; implementation details and trade-offs are in [FORK-NOTES.md](./FORK-NOTES.md).
+
+---
+
+⭐ **If this plugin is useful to you, a Star would be appreciated** — it genuinely helps a lot; issues and feature requests are welcome too.

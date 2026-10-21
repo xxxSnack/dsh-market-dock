@@ -757,6 +757,21 @@ function installLogin(core) {
 function installWatchlist(core) {
   const ctx = core.ctx
 
+  // 状态文件和云端响应都属于外部输入。统一收敛到与 watchlist.add 相同的
+  // 代码格式、去重和数量上限，避免坏数据让后续每一轮行情刷新都携带无效标的。
+  function normalizeSymbols(list) {
+    const out = []
+    const seen = Object.create(null)
+    const arr = Array.isArray(list) ? list : []
+    for (let i = 0; i < arr.length && out.length < 200; i++) {
+      const symbol = String(arr[i] == null ? '' : arr[i]).trim()
+      if (!/^[A-Za-z0-9_.]+$/.test(symbol) || seen[symbol]) continue
+      seen[symbol] = true
+      out.push(symbol)
+    }
+    return out
+  }
+
   // ---- watchlist ----
   async function loadWatchlist() {
     if (core.watchlist) return core.watchlist
@@ -770,7 +785,8 @@ function installWatchlist(core) {
         const text = await core.stateRead('.xueqiu-watchlist.json', fs, root)
         const parsed = text == null ? null : JSON.parse(text)
         if (parsed && Array.isArray(parsed.symbols) && parsed.symbols.length) {
-          core.watchlist = { symbols: parsed.symbols.slice(0, 200), lastSyncAt: Number(parsed.lastSyncAt) || 0 }
+          const symbols = normalizeSymbols(parsed.symbols)
+          if (symbols.length) core.watchlist = { symbols: symbols, lastSyncAt: Number(parsed.lastSyncAt) || 0 }
         }
       } catch (e) { /* 首次运行或无写权限时使用默认列表 */ }
     }
@@ -818,7 +834,7 @@ function installWatchlist(core) {
       const cur = wl.symbols
       const changed = cur.length !== cloud.symbols.length || cloud.symbols.some(function (s, i) { return cur[i] !== s })
       if (changed) {
-        core.watchlist = { symbols: cloud.symbols.slice(0, 200), lastSyncAt: Date.now() }
+        core.watchlist = { symbols: normalizeSymbols(cloud.symbols), lastSyncAt: Date.now() }
       } else {
         wl.lastSyncAt = Date.now()
         core.watchlist = wl
@@ -1330,9 +1346,14 @@ function pnlUserId(cookie) {
   return cookieField(normalizeCookie(cookie), 'userid') || ''
 }
 
+function formValue(value) {
+  return encodeURIComponent(String(value == null ? '' : value))
+}
+
 /** account_list 的请求体（旧插件逐字）。 */
 function accountPayload(userId) {
-  return 'terminal=1&version=0.0.0&userid=' + userId + '&user_id=' + userId
+  const id = formValue(userId)
+  return 'terminal=1&version=0.0.0&userid=' + id + '&user_id=' + id
 }
 
 /** 从最后一个采样点里探出金额字段。 */
@@ -1367,7 +1388,7 @@ const listPortfolios = async function (core, cookie) {
 const collectPnl = async function (core, cookie, fundKey) {
   const userId = pnlUserId(cookie)
   const payload = accountPayload(userId)
-    + '&manual_id=&fundid=&fund_key=' + String(fundKey ?? '') + '&rzrq_fund_key=&custid='
+    + '&manual_id=&fundid=&fund_key=' + formValue(fundKey) + '&rzrq_fund_key=&custid='
   const r = await postPnlForm(core, PNL_URL, payload, cookie)
   if (!r.ok) {
     return { pnl_yk: 0, pnl_pct: 0, error: r.error, token_expired: r.tokenExpired, blocked: r.blocked, yk_field: '' }

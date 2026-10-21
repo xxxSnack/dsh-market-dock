@@ -21,12 +21,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OWNER/dsh-market-dock.git"
+    "url": "git+https://github.com/xxxSnack/dsh-market-dock.git"
   },
   "bugs": {
-    "url": "https://github.com/OWNER/dsh-market-dock/issues"
+    "url": "https://github.com/xxxSnack/dsh-market-dock/issues"
   },
-  "homepage": "https://github.com/OWNER/dsh-market-dock#readme",
+  "homepage": "https://github.com/xxxSnack/dsh-market-dock#readme",
   "type": "module",
   "main": "src/index.js",
   "exports": {

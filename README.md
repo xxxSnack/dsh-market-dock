@@ -49,8 +49,8 @@
 ### 方式一：作为 bundle 插件（推荐）
 
 ```bash
-# GitHub 源（<OWNER> 换成仓库所有者的 GitHub 用户名）
-dsh plugin --profile web add github:<OWNER>/dsh-market-dock
+# GitHub 源
+dsh plugin --profile web add github:xxxSnack/dsh-market-dock
 
 # 或本地目录（开发 / 自用最省事）
 dsh plugin --profile web add /abs/path/to/dsh-market-dock

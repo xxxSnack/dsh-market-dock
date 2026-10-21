@@ -49,8 +49,8 @@
 ### Option 1: install as a bundle plugin (recommended)
 
 ```bash
-# from GitHub (<OWNER> = the GitHub user that owns this repo)
-dsh plugin --profile web add github:<OWNER>/dsh-market-dock
+# from GitHub
+dsh plugin --profile web add github:xxxSnack/dsh-market-dock
 
 # or from a local directory (easiest for development)
 dsh plugin --profile web add /abs/path/to/dsh-market-dock

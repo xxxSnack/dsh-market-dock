@@ -1,16 +1,16 @@
-# dsh-xueqiu-debug — 本地 fork 说明
+# dsh-market-dock —— 维护说明（衍生自 dsh-xueqiu）
 
-本目录是 `dsh-xueqiu` 的本地 fork，用于摆脱上游发布节奏（`npm i dsh-xueqiu@latest` 之类
-不会覆盖这里），并承载本地改动。
+本项目是 `dsh-xueqiu@1.22.15` 的衍生版本，包名 `dsh-market-dock`，版本 `1.0.0`，公开维护：
+发布节奏独立于上游（`npm i dsh-xueqiu@latest` 之类不会覆盖这里），改动都在本仓库内演进。
 
 - 上游：`dsh-xueqiu@1.22.15`（https://github.com/wanderer-yk/dsh-xueqiu ，MIT）
-- 本 fork 包名：`dsh-xueqiu-debug`，版本 `1.22.15-fork.2`
-- cordis 插件 id：`xueqiu` → `xueqiu-debug`
+- 本项目包名：`dsh-market-dock`，版本 `1.0.0`
+- cordis 插件 id：`xueqiu` → `market-dock`
 - 槽位实例 id：`xueqiu-panel` / `xueqiu-badge` / `xueqiu-ticker`
-  → `xueqiu-debug-panel` / `xueqiu-debug-badge` / `xueqiu-debug-ticker`
+  → `market-dock-panel` / `market-dock-badge` / `market-dock-ticker`
 - Agent 侧工具名**保持** `xueqiu_quote` / `xueqiu_kline` / `xueqiu_hot` / `xueqiu_news` /
   `xueqiu_search` / `xueqiu_kol`（提示词与工具调用都按这些名字走，改名会破坏既有习惯）。
-  代价：不能与上游 `dsh-xueqiu` 同时启用（会重复注册同名工具），本 fork 是**替代**上游。
+  代价：不能与上游 `dsh-xueqiu` 同时启用（会重复注册同名工具），本项目是**替代**上游。
 - 状态目录默认仍是 `$DSH_HOME/dsh-xueqiu/`（存量自选/Cookie/界面位置无缝继承；
   可用插件配置 `stateDir` 改成别的目录与上游彻底隔离，见 §4）。
 - 已并入 `dsh-ths-pnl` 的「今日盈亏」：面板头部常驻 chip + 第 5 个「盈亏」tab，
@@ -24,7 +24,7 @@
 
 上游用 `scripts/gen-static.py` 从 `dynamic/` 生成 `src/`，但**该生成器没有随 npm 包发布**，
 于是历史上每次改动都要在 `dynamic/` 与 `src/` 两侧手工同步（下面 §6 的两个 bug 都源于这种不同步）。
-本 fork 把关系彻底反转：
+本项目把关系彻底反转：
 
 ```
 手写源（唯一事实来源）                    构建产物（勿手改）
@@ -178,10 +178,10 @@ npm run verify       # verify-bundle（bundle 契约）+ verify-install（安装
 
 ```yaml
 - insert:
-    - id: xueqiu-debug
-      name: 'dsh-xueqiu-debug'
+    - id: market-dock
+      name: 'dsh-market-dock'
       config:
-        stateDir: dsh-xueqiu-debug          # 与上游/旧数据彻底隔离（切换后不会自动迁移旧数据）
+        stateDir: dsh-market-dock          # 与上游/旧数据彻底隔离（切换后不会自动迁移旧数据）
         watchlist: [SH600519, 00700, AAPL]  # 无状态文件时的默认自选表
 ```
 
@@ -233,7 +233,7 @@ effect 挂载时就注册了，而配置是异步到达的，要正确支持需�
 ### 5.2 客户端 bundle 注册 id 没跟着改名，插件整块加载失败
 
 **症状**：改名后 HARNESS 面板报
-`bundle … loaded without registering "dsh-xueqiu-debug" via __ModuleLoader__.load`，
+`bundle … loaded without registering "dsh-market-dock" via __ModuleLoader__.load`，
 插件面板/徽标/行情界面全部不出现（宿主侧 Agent 工具不受影响）。
 
 **根因**：`gen-static.py` 把**包名**写进两处字面量 —— `__ModuleLoader__.load({ id })` 与
@@ -359,11 +359,11 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
 
 ## 7. 安装
 
-`C:\Users\海尔\.dsh\profiles\web\package.json`：
-- `dependencies`：`"dsh-xueqiu": "^1.22.15"` → `"dsh-xueqiu-debug": "link:D:/project/financial_analysis/plugins/dsh-xueqiu-debug"`
-- `dsh.profile.bundles`：`"dsh-xueqiu"` → `"dsh-xueqiu-debug"`
+`~/.dsh/profiles/web/package.json`：
+- `dependencies`：`"dsh-xueqiu": "^1.22.15"` → `"dsh-market-dock": "link:/abs/path/to/plugins/dsh-market-dock"`（`link:` 必须是绝对路径）
+- `dsh.profile.bundles`：`"dsh-xueqiu"` → `"dsh-market-dock"`
 
-并把 `node_modules/dsh-xueqiu-debug` 指到本目录（与 `dsh-ths-pnl` 同款 symlink）。
+并把 `node_modules/dsh-market-dock` 指到本目录（与 `dsh-ths-pnl` 同款 symlink）。
 **改了宿主侧（`lib/`）要重启 `dsh web`；只改客户端（`client/`）刷新页面即可**
 （未跑 `pnpm run dev:web` 时客户端 bundle 不会自动热更）。
 
@@ -449,7 +449,7 @@ content = renderTab(TAB_CTX[tabKey]())   // 旧写法：renderTab = XQ_TABS[tabK
 
 `dsh-ths-pnl` 是**普通本地目录，不是 submodule**，摘除完全可逆：
 
-1. 编辑 `C:\Users\海尔\.dsh\profiles\web\package.json`，从 `dsh.profile.bundles` 里删掉 `"dsh-ths-pnl"` 一行
+1. 编辑 `~/.dsh/profiles/web/package.json`，从 `dsh.profile.bundles` 里删掉 `"dsh-ths-pnl"` 一行
    （可选：同时删掉 `dependencies` 里的 `"dsh-ths-pnl": "link:..."`）。
 2. 重启 `dsh web`、刷新页面。新的「盈亏」tab 应显示与旧角标相同的数值。
 3. 回滚就是把这行加回去（`$DSH_HOME/dsh-ths-pnl/` 里的 Cookie 与快照全程未被改动）。

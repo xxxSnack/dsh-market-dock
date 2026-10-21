@@ -2,7 +2,7 @@
 /**
  * 价格提醒宿主侧 watcher —— 回归测试（零依赖，只用 Node 内置模块）。
  *
- *   cd plugins/dsh-xueqiu-debug && node test/alerts-watcher.mjs
+ *   cd plugins/dsh-market-dock && node test/alerts-watcher.mjs
  *
  * 锁住两条曾经出错的行为（方案3 宿主侧持续轮询）：
  *

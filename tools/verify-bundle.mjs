@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
-const PKG = 'dsh-xueqiu-debug'
+const PKG = 'dsh-market-dock'
 /** 平台 seed 字面量：由 dsh 启动清单 __DSH_BOOT__.staticModules 提供。 */
 const SEED_WORDS = new Set(['react', 'react-dom', 'react/jsx-runtime'])
 

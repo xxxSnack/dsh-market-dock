@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * tools/build.mjs — dsh-xueqiu-debug 的唯一构建入口（零依赖，纯 Node）
+ * tools/build.mjs — dsh-market-dock 的唯一构建入口（零依赖，纯 Node）
  *
  * 背景：上游用 `scripts/gen-static.py` 从 `dynamic/` 生成 `src/`，但该生成器**没有随 npm 包发布**，
  * 于是历史上每次改动都要在 `dynamic/` 与 `src/` 两侧手工同步（见 FORK-NOTES.md）——这是本 fork
@@ -51,7 +51,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const PKG = 'dsh-xueqiu-debug'
+const PKG = 'dsh-market-dock'
 const GEN_HEAD = '// 由 tools/build.mjs 从 {src} 生成 —— 勿手改；改源后运行 node tools/build.mjs'
 
 // ── 小工具 ────────────────────────────────────────────────────────────────

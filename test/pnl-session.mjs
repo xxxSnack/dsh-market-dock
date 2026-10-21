@@ -2,7 +2,7 @@
 /**
  * 今日盈亏（同花顺投资账本）宿主侧纯函数回归测试 —— 零依赖，只用 Node 内建模块。
  *
- *   cd plugins/dsh-xueqiu-debug && node test/pnl-session.mjs
+ *   cd plugins/dsh-market-dock && node test/pnl-session.mjs
  *
  * 断言合并自旧插件 plugins/dsh-ths-pnl/tests/session.test.mjs + interval.test.mjs：
  *   · 时段划分（含 09:30 / 11:30 / 13:00 / 15:00 四个边界与周末）

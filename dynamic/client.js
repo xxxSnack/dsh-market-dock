@@ -79,10 +79,10 @@ const SLOT_INPUT_DOCK = 'conversation.input.dock'
 const SLOT_OVERLAY = 'shell.overlay'
 const SLOT_COMPOSER_DOCK = 'conversation.composer.dock'
 const TOOLVIEW_KEYS = { quote: 'xueqiu_quote', kline: 'xueqiu_kline', hot: 'xueqiu_hot', news: 'xueqiu_news' }
-const PANEL_ID = 'xueqiu-debug-panel'
+const PANEL_ID = 'market-dock-panel'
 const PANEL_ORDER = 30
-const BADGE_ID = 'xueqiu-debug-badge'
-const TICKER_ID = 'xueqiu-debug-ticker'
+const BADGE_ID = 'market-dock-badge'
+const TICKER_ID = 'market-dock-ticker'
 const TICKER_ORDER = 1
 
 // 纯格式化：数字 / 百分比 / 大数 / 成交量 / 时间 / 涨跌配色。全部无副作用、无外部依赖。

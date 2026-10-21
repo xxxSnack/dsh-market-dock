@@ -3,7 +3,7 @@
 // 形态契约见 tools/verify-bundle.mjs：注册 id 必须是包名、require 只许 react 系 seed、
 // <style> 必须带 data-plugin=包名（loader 按它认领/回收样式）。
 window.__ModuleLoader__.load({
-  id: 'dsh-xueqiu-debug',
+  id: 'dsh-market-dock',
   factory: function (require) {
     var module = { exports: {} }
     var exports = module.exports
@@ -14,7 +14,7 @@ window.__ModuleLoader__.load({
     function insertStyle (css) {
       if (typeof document === 'undefined' || !document.head) return
       _styleTag = document.createElement('style')
-      _styleTag.setAttribute('data-plugin', 'dsh-xueqiu-debug')
+      _styleTag.setAttribute('data-plugin', 'dsh-market-dock')
       _styleTag.textContent = css
       document.head.appendChild(_styleTag)
     }
@@ -125,10 +125,10 @@ const SLOT_INPUT_DOCK = 'conversation.input.dock'
 const SLOT_OVERLAY = 'shell.overlay'
 const SLOT_COMPOSER_DOCK = 'conversation.composer.dock'
 const TOOLVIEW_KEYS = { quote: 'xueqiu_quote', kline: 'xueqiu_kline', hot: 'xueqiu_hot', news: 'xueqiu_news' }
-const PANEL_ID = 'xueqiu-debug-panel'
+const PANEL_ID = 'market-dock-panel'
 const PANEL_ORDER = 30
-const BADGE_ID = 'xueqiu-debug-badge'
-const TICKER_ID = 'xueqiu-debug-ticker'
+const BADGE_ID = 'market-dock-badge'
+const TICKER_ID = 'market-dock-ticker'
 const TICKER_ORDER = 1
 
 // 纯格式化：数字 / 百分比 / 大数 / 成交量 / 时间 / 涨跌配色。全部无副作用、无外部依赖。

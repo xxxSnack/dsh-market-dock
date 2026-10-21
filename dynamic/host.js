@@ -41,16 +41,16 @@ const ALERT_MAX_NAME_LEN = 160
 //
 // 配置从哪里来：DSH 的 bundle layer 可以在 cordis.patch.yml 里给插件节点写 config，例如
 //     - insert:
-//         - id: xueqiu-debug
-//           name: 'dsh-xueqiu-debug'
+//         - id: market-dock
+//           name: 'dsh-market-dock'
 //           config:
-//             stateDir: dsh-xueqiu-debug      # 与上游/旧数据彻底隔离
+//             stateDir: dsh-market-dock      # 与上游 dsh-xueqiu 的数据彻底隔离
 //             watchlist: [SH600519, 00700]
 // 未写 config 时用下面的默认值（= 重构前的硬编码值）。
 
 
 // 状态目录名：$DSH_HOME/<stateDir>/。默认沿用上游的 dsh-xueqiu（存量自选/Cookie/界面位置无缝继承）。
-// 想与上游彻底隔离就配成 dsh-xueqiu-debug —— 注意切换后不会自动迁移旧数据。
+// 想与上游彻底隔离就配成 dsh-market-dock —— 注意切换后不会自动迁移旧数据。
 const DEFAULT_STATE_DIR = 'dsh-xueqiu'
 
 // 今日盈亏（同花顺投资账本）的状态目录名：$DSH_HOME/<pnlStateDir>/。
@@ -2710,7 +2710,7 @@ function installAlerts(core) {
       stopTimer()
       // cleanup 只停止当前 timer；wake 的 finally 看到 schedulerAlive=false 后不会重新挂起。
     }
-  }, 'xueqiu-debug: 价格提醒 watcher')
+  }, 'market-dock: 价格提醒 watcher')
 }
 
 // RPC dispatch 表 + handleCall 包络（sanitize 后回 { ok, data } / { ok:false, error }）。

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// 校验 dsh-xueqiu-debug 是否已被 DSH web profile 正确接管。
+// 校验 dsh-market-dock 是否已被 DSH web profile 正确接管。
 // 用法：node tools/verify-install.mjs [profileName]   （默认 web）
 // 只读，不修改任何东西。退出码非 0 表示存在问题。
 import { readFileSync, existsSync, lstatSync, readlinkSync, realpathSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { createRequire } from 'node:module'
 
-const PKG = 'dsh-xueqiu-debug'
+const PKG = 'dsh-market-dock'
 const UPSTREAM = 'dsh-xueqiu'
 const profileName = process.argv[2] || 'web'
 
@@ -85,8 +85,8 @@ if (pkgJsonPath) {
     if (!existsSync(patchPath)) bad(`patch 文件不存在：${patchPath}`)
     else {
       const y = readFileSync(patchPath, 'utf8')
-      if (y.includes('id: xueqiu-debug')) ok('cordis.patch.yml 的 id 是 xueqiu-debug')
-      else bad('cordis.patch.yml 的 id 不是 xueqiu-debug')
+      if (y.includes('id: market-dock')) ok('cordis.patch.yml 的 id 是 market-dock')
+      else bad('cordis.patch.yml 的 id 不是 market-dock')
       if (y.includes(PKG)) ok(`cordis.patch.yml 引用了 ${PKG}`)
       else bad(`cordis.patch.yml 未引用 ${PKG}`)
     }
@@ -144,4 +144,4 @@ if (problems.length) {
   console.log(`\n${problems.length} 项问题需要处理。`)
   process.exit(1)
 }
-console.log('\n全部检查通过：DSH web profile 已由 dsh-xueqiu-debug 接管。重启 dsh web 并刷新页面生效。')
+console.log('\n全部检查通过：DSH web profile 已由 dsh-market-dock 接管。重启 dsh web 并刷新页面生效。')

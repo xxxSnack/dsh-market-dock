@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * dsh-xueqiu-debug 客户端 bundle 冒烟测试（零依赖，只用 Node 内置模块 + node:vm）
+ * dsh-market-dock 客户端 bundle 冒烟测试（零依赖，只用 Node 内置模块 + node:vm）
  *
  * 背景：src/client/index.js 是由 scripts/gen-static.py 从 dynamic/client.js 生成的
  * **静态 client bundle**（classic script，注册进 window.__ModuleLoader__）。该文件即将被
  * 大规模拆分重构，但对外契约必须逐字节不变。所以本测试只断言「对外契约」，不碰内部结构：
  *
- *   1. 注册契约：__ModuleLoader__ 恰好一个条目，id 精确等于包名 dsh-xueqiu-debug；
+ *   1. 注册契约：__ModuleLoader__ 恰好一个条目，id 精确等于包名 dsh-market-dock；
  *   2. 依赖纯度：factory 内 require(...) 只能命中平台 seed 字面量（react 等）；
  *   3. 导出形态：factory(require) 返回（或 .default）是带 apply 的 cordis 插件对象；
  *   4. 槽位契约：真跑 plugin.apply(ctx)，断言恰好 7 次 slots.inject + 7 次 slots.register，
@@ -38,7 +38,7 @@ import vm from 'node:vm'
 // ---------------------------------------------------------------- 常量与路径
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BUNDLE_PATH = join(HERE, '..', 'src', 'client', 'index.js')
-const PKG = 'dsh-xueqiu-debug'
+const PKG = 'dsh-market-dock'
 
 /** 平台 seed 字面量：由 dsh 启动清单 __DSH_BOOT__.staticModules 提供，bundle 只许 require 这些。 */
 const SEED_WORDS = new Set(['react', 'react-dom', 'react/jsx-runtime'])
@@ -49,9 +49,9 @@ const EXPECTED_SLOTS = [
   { inject: 'tool.call.toolview', options: { name: 'tool.call.toolview', key: 'xueqiu_kline' } },
   { inject: 'tool.call.toolview', options: { name: 'tool.call.toolview', key: 'xueqiu_hot' } },
   { inject: 'tool.call.toolview', options: { name: 'tool.call.toolview', key: 'xueqiu_news' } },
-  { inject: 'conversation.input.dock', options: { name: 'conversation.input.dock', id: 'xueqiu-debug-panel', order: 30 } },
-  { inject: 'shell.overlay', options: { name: 'shell.overlay', id: 'xueqiu-debug-badge' } },
-  { inject: 'conversation.composer.dock', options: { name: 'conversation.composer.dock', id: 'xueqiu-debug-ticker', order: 1 } },
+  { inject: 'conversation.input.dock', options: { name: 'conversation.input.dock', id: 'market-dock-panel', order: 30 } },
+  { inject: 'shell.overlay', options: { name: 'shell.overlay', id: 'market-dock-badge' } },
+  { inject: 'conversation.composer.dock', options: { name: 'conversation.composer.dock', id: 'market-dock-ticker', order: 1 } },
 ]
 
 /** 允许 flush effect 的组件（白名单）：这些组件的 effect 只做 fetch + ctx.interval + 订阅，安全。
@@ -521,7 +521,7 @@ function createSandbox(dom, fetchImpl) {
   sandbox.getComputedStyle = () => ({ getPropertyValue: () => '' })
   sandbox.matchMedia = () => ({ matches: false, media: '', addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} })
 
-  sandbox.navigator = { userAgent: 'dsh-xueqiu-debug/smoke', language: 'zh-CN', platform: 'smoke', clipboard: { writeText: () => Promise.resolve() } }
+  sandbox.navigator = { userAgent: 'dsh-market-dock/smoke', language: 'zh-CN', platform: 'smoke', clipboard: { writeText: () => Promise.resolve() } }
   // 系统通知替身：只记条数/正文，绝不出网。[5f] 用它证明「历史事件静默、新事件弹一次」。
   sandbox.Notification = class {
     constructor(title, options) {
@@ -794,7 +794,7 @@ const NEWS_BLOCK = toolBlock({
 })
 
 // ================================================================ 主流程
-console.log('dsh-xueqiu-debug 客户端 bundle 冒烟测试')
+console.log('dsh-market-dock 客户端 bundle 冒烟测试')
 console.log('bundle: ' + BUNDLE_PATH)
 let fingerprint
 try {

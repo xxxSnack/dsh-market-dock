@@ -87,11 +87,11 @@ section = '[1] 未配置 → 默认值（向后兼容）'
 // [2] 配置生效
 section = '[2] 配置 → 生效'
 {
-  const { rpc } = await boot({ stateDir: 'dsh-xueqiu-debug', watchlist: ['SH600519', '00700', 'AAPL'] })
+  const { rpc } = await boot({ stateDir: 'dsh-market-dock', watchlist: ['SH600519', '00700', 'AAPL'] })
   const wl = await rpc({ action: 'watchlist.get' })
   check('配置的自选表生效', wl.ok && JSON.stringify(wl.data.symbols) === JSON.stringify(['SH600519', '00700', 'AAPL']), JSON.stringify(wl.data && wl.data.symbols))
   await rpc({ action: 'ui.set', args: { tab: 'search' } })
-  const p = join(HOME, 'dsh-xueqiu-debug', '.xueqiu-ui-state.json')
+  const p = join(HOME, 'dsh-market-dock', '.xueqiu-ui-state.json')
   check('配置的状态目录生效（与上游目录隔离）', readFileSync(p, 'utf8').includes('search'))
 }
 

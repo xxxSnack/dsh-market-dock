@@ -2,7 +2,7 @@
 /**
  * 持久化价格提醒（lib/alerts.js）聚焦回归测试 —— 零依赖，进程内跑完。
  *
- *   cd plugins/dsh-xueqiu-debug && node test/alerts.mjs
+ *   cd plugins/dsh-market-dock && node test/alerts.mjs
  *
  * 背景：提醒功能（方案3）此前零测试覆盖。这里锁四条最容易翻车的行为契约：
  *

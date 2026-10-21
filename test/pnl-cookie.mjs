@@ -2,7 +2,7 @@
 /**
  * 今日盈亏（同花顺投资账本）宿主侧 Cookie / curl 管道回归测试 —— 零依赖，进程内跑完。
  *
- *   cd plugins/dsh-xueqiu-debug && node test/pnl-cookie.mjs
+ *   cd plugins/dsh-market-dock && node test/pnl-cookie.mjs
  *
  * 断言合并自旧插件 plugins/dsh-ths-pnl/tests/cookie-helpers.test.mjs，并补上宿主侧
  * 新增的一条关键链路：**curl 必须能取回 HTTP 状态码**（旧实现用 fetch 的 res.status，

@@ -1,7 +1,8 @@
-# dsh-xueqiu-debug bundle layer: 雪球 mini 行情面板（本地 fork）
+# dsh-market-dock bundle layer: 雪球 mini 行情面板
 # 由 profile 的 dsh.profile.bundles 引入后，本 patch 作为独立 layer 叠加到 bundle 栈上。
-# 上游包名为 dsh-xueqiu；本 fork 改名 dsh-xueqiu-debug 以便与上游隔离。
+# id 与包名一致（market-dock / dsh-market-dock），便于在 profile 配置里按名字引用；
+# 与上游 dsh-xueqiu 是**替代**关系（工具名同为 xueqiu_*），不要同时启用。
 
 - insert:
-    - id: xueqiu-debug
-      name: 'dsh-xueqiu-debug'
+    - id: market-dock
+      name: 'dsh-market-dock'

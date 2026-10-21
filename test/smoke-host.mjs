@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * dsh-xueqiu-debug 宿主侧冒烟测试 —— 零依赖，只用 Node 内置模块。
+ * dsh-market-dock 宿主侧冒烟测试 —— 零依赖，只用 Node 内置模块。
  *
- *   cd plugins/dsh-xueqiu-debug && node test/smoke-host.mjs
+ *   cd plugins/dsh-market-dock && node test/smoke-host.mjs
  *
  * 退出码：0 = 全部通过；非 0 = 有断言失败。输出风格 `  ✓ ...` / `  ✗ ...` + 末尾汇总。
  *
@@ -330,7 +330,7 @@ fs.mkdirSync(WORK_DIR, { recursive: true })
 process.env.DSH_HOME = SMOKE_HOME
 process.chdir(WORK_DIR)
 
-console.log('dsh-xueqiu-debug 宿主冒烟测试')
+console.log('dsh-market-dock 宿主冒烟测试')
 console.log('  假 DSH_HOME : ' + SMOKE_HOME)
 console.log('  假工作目录  : ' + WORK_DIR)
 console.log('  被测源码    : ' + path.join(PLUGIN_DIR, 'src', 'index.js'))

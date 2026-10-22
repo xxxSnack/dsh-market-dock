@@ -44,6 +44,20 @@
 
 ---
 
+## Screenshots
+
+**Mini quote badge** — draggable, collapsible to a single line; the `⊘` on the right is the "hide the market" switch, `−` collapses it, and both position and size are remembered.
+
+![Mini quote badge](assets/1.png)
+
+**Holdings and P&L** — positions are the local source of truth (add/edit/delete freely); day P&L, position P&L and market value are computed from live quotes, never written to disk and never dependent on the ledger.
+
+![Holdings and P&L](assets/2.png)
+
+> Symbols and amounts in these screenshots have been pixelated.
+
+---
+
 ## Installation
 
 ### Option 1: install as a bundle plugin (recommended)

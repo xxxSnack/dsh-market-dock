@@ -1,0 +1,10 @@
+# 中间产物与本地临时文件
+tmp/
+
+# 依赖
+node_modules/
+
+# 编辑器 / 系统垃圾
+Thumbs.db
+.DS_Store
+*.bak-*

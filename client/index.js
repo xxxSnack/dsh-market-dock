@@ -2,6 +2,7 @@
 // 样式在 apply 开头只插一次；ui store / saveUi / hydratePromise / 拖拽引用等「每次 apply 一份」
 // 的状态由 createUiRuntime 重建（见 store/ui.js 的运行时持有者说明）。
 import { createUiRuntime } from './store/ui.js'
+import { createMarketRuntime } from './store/market.js'
 import { createPositionsRuntime } from './store/positions.js'
 import { createAlertsWatchRuntime } from './store/alerts-watch.js'
 import { installSlots } from './slots.js'
@@ -12,6 +13,9 @@ const xqClientPlugin = {
   apply(ctx) {
     // #include-styles ./styles.css
     createUiRuntime(ctx)
+    // 页面内共享行情运行时：面板/徽章/指数条各订阅自己的代码集合与周期，同一 symbol 只取一次。
+    // 宿主侧还有按 symbol 的跨组件/跨页面缓存（lib/quotes.js），两层合起来才是完整的共享行情。
+    createMarketRuntime(ctx)
     // 持仓/盈亏的唯一数据源：只建运行时、不取数，首个订阅者（chip / tab / 指数条）挂载时才启动轮询。
     // 它现在读的是「本地持仓 × 雪球行情」的宿主现算视图 —— 账本凭据坏了也不影响实时数字。
     createPositionsRuntime(ctx)

@@ -600,7 +600,28 @@ function safeResponder(url, body) {
     return { ok: true, data: { rules: [], events: history.concat([fresh]) } }
   }
   if (action === 'watchlist.get') return { ok: true, data: { symbols: ['SH600519', 'SZ300750'] } }
-  if (action === 'quote') return { ok: true, data: { status: 5, list: [{ symbol: 'SH000001', name: '上证指数', current: 3210.55, percent: 0.42 }] } }
+  // 行情按**请求的代码**回数据（与真实 batch/quote 同形）。改造前这里固定回一条 SH000001，
+  // 共享行情运行时按 symbol 组装快照后会让「请求了自选却拿回指数」这种假数据渲染不出来 ——
+  // 假响应也该遵守「你请求什么就返回什么」的契约。
+  if (action === 'quote') {
+    const raw = (body.args && body.args.symbols) || []
+    const asked = (Array.isArray(raw) ? raw : String(raw).split(',')).map((s) => String(s).trim()).filter(Boolean)
+    const names = {
+      SH000001: '上证指数', SZ399001: '深证成指', SZ399006: '创业板指', SH000688: '科创50',
+      SH600519: '贵州茅台', SZ300750: '宁德时代', SH601318: '中国平安',
+    }
+    // 价格必须**按代码固定**：改成按下标（100+i）会让同一只股票在不同批次里拿到不同价，
+    // 断言就跟着「谁先请求」漂移 —— 共享缓存之后同一 symbol 的价只能有一个。
+    const prices = { SH000001: 3210.55, SZ399001: 10455.2, SZ399006: 2120.88, SH000688: 988.4, SH600519: 104, SZ300750: 238.4, SH601318: 52.5 }
+    const list = asked.map((sym) => ({
+      symbol: sym,
+      name: names[sym] || sym,
+      current: prices[sym] !== undefined ? prices[sym] : 100,
+      percent: 0.42,
+      volume: 1000000,
+    }))
+    return { ok: true, data: { status: 5, list: list } }
+  }
   if (action === 'hot') return { ok: true, data: { market: 'cn', list: [] } }
   if (action === 'news') return { ok: true, data: { items: [] } }
   if (action === 'login.status') return { ok: true, data: { loggedIn: false } }
@@ -1106,10 +1127,13 @@ check('盈亏轮询在页面恢复前台时立即重取', () => {
   return 'visibilitychange → 取消旧 timer → cycle()'
 })
 check('行情请求有序列防护，旧响应不会覆盖新数据', () => {
-  for (const token of ['marketSeq.current', 'refreshSeq.current', 'requestSeq.current']) {
+  // 面板/徽标/指数条各自的 requestSeq 已收敛到页面内共享行情运行时（store/market.js），
+  // 判定粒度是**逐 symbol**（全局序号会把晚到的、互不相交的请求整批丢掉），组件不再各记一份。
+  for (const token of ['reqSeq', 'prev.seq > my', '逐 symbol']) {
     ok(clientSource.includes(token), '产物里缺少 ' + token)
   }
-  return '面板 / 徽标 / 底部指数条均有 request sequence'
+  ok(!clientSource.includes('marketSeq.current'), '面板仍在自己维护 marketSeq（应与运行时统一）')
+  return '共享运行时逐 symbol 迟到判定（面板 / 徽标 / 底部指数条共用一份）'
 })
 check('详情页驻留期间持续刷新报价/分时', () => {
   ok(clientSource.includes('详情驻留期间也要更新报价/分时'), '缺详情驻留刷新说明')
@@ -1423,9 +1447,13 @@ check('「持仓」tab 由独立组件 ' + where('PositionsTab') + ' 挂载（ho
     ok(textHas(tree, '贵州茅台'), '缺持仓名称')
     // 工具行：持仓现在是「本地可编辑数据 + 手动同步」，所以是添加/同步/刷新三个入口
     ok(textHas(tree, '添加持仓'), '缺「＋ 添加持仓」按钮')
-    ok(textHas(tree, '从账本同步'), '缺「从账本同步」按钮（唯一会打账本的入口）')
+    ok(textHas(tree, '账本同步'), '缺「账本同步」按钮（唯一会打账本的入口）')
     ok(textHas(tree, '刷新行情'), '缺「刷新行情」按钮')
-    ok(textHas(tree, '编辑') && textHas(tree, '删除'), '每行缺「编辑 / 删除」操作')
+    // 行操作：编辑常驻；删除收进「更多」菜单（避免每行两个破坏性按钮抢行情本身）
+    ok(textHas(tree, '编辑'), '每行缺「编辑」操作')
+    const menuBtn = treeHosts(tree).find((h) => String((h.props && h.props['aria-label']) || '') === '更多操作')
+    ok(menuBtn, '每行缺「更多操作」菜单入口')
+    ok(menuBtn.props['aria-expanded'] === 'false', '菜单入口缺 aria-expanded 初始状态')
     // 合计四格：全是本地持仓 × 行情能算出来的量，不再依赖账本的资产口径（总资产/可用资金）
     ok(textHas(tree, '今日盈亏') && textHas(tree, '持仓市值') && textHas(tree, '持仓成本'), '缺合计四格标签')
     ok(textHas(tree, '139,831.60'), '持仓市值合计 = Σ现值 139,831.60；实际 = ' + JSON.stringify(treeText(tree).slice(0, 200)))
@@ -1543,14 +1571,18 @@ check('指数条里的盈亏 chip 由独立组件 PnlChip 挂载（hooks 不落�
   ok(ticker.length > 0, '指数条渲染里没有 Ticker 的 hook 记录')
   return 'PnlChip ' + chip[0].count + ' 个 hook（' + where('PnlChip') + '），Ticker ' + ticker[0].count + ' 个（' + where('Ticker') + '）'
 })
-check('指数条只发一次指数请求（action=quote），没有额外网络调用', () => {
+check('指数条不再自建 index 请求，只消费共享行情运行时（无额外接口）', () => {
   if (!tickerProbe || tickerProbe.error) throw new Error('前置失败：' + ((tickerProbe && tickerProbe.error && tickerProbe.error.message) || '未产出结果'))
   ok(tickerProbe.flush.errors.length === 0, '指数条 effect flush 抛错：' + tickerProbe.flush.errors.join(' | '))
   const calls = tickerProbe.calls
-  eqJson([...new Set(calls.map((c) => c.url))], ['/xq-rpc'], '指数条期间的 fetch URL 集合')
-  eqJson([...new Set(calls.map((c) => c.action))], ['quote'], '指数条期间的 action 集合')
-  eq(calls.length, 1, '指数条期间的 fetch 次数（不应触发 pnl.get / 其它接口）')
-  return '1 次 quote'
+  for (const c of calls) {
+    ok(c.url === '/xq-rpc', '指数条期间出现非 RPC 请求：' + c.url)
+    ok(c.action === 'quote', '指数条期间出现无关 action：' + c.action)
+  }
+  // 共享运行时在前面已取过指数 → 这里可以 0 次新请求（这正是「同一 symbol 只取一次」）；
+  // 若确实发了，也只允许一次 quote，且绝不能触发 pnl.get / watchlist.get 等无关接口。
+  ok(calls.length <= 1, '指数条期间的 fetch 次数应为 0 或 1（共享运行时命中快照），实际 ' + calls.length)
+  return calls.length === 0 ? '0 次新请求（复用共享快照）' : '1 次 quote'
 })
 
 // ---------------------------------------------------------------- 5d. 悬浮徽章折叠与指针事件隔离
@@ -1676,20 +1708,24 @@ check('自选项渲染出名称/现价/涨跌幅（价格结构来自假报价�
   ok(classCount(badgeGridProbe.second.tree, 'xq-witem') >= 1, '.xq-wgrid 里没有自选项（.xq-witem），实际文本：' + treeText(badgeGridProbe.second.tree).slice(0, 120))
   const item = treeHosts(badgeGridProbe.second.tree).find((h) => classOf(h).split(/\s+/).includes('xq-witem'))
   ok(item, '找不到 .xq-witem 自选项')
-  for (const needle of ['上证指数', '3210.55', '+0.42%']) {
+  for (const needle of ['贵州茅台', '104.00', '+0.42%']) {
     ok(textHas(item, needle), '自选项文本缺 ' + JSON.stringify(needle) + '（实际：' + treeText(item) + '）')
   }
   ok(hasClass(item, 'xq-badge-val'), '自选项缺 .xq-badge-val（现价/涨跌值）')
   ok(hasClass(item, 'xq-up'), '正涨幅没有着色类 .xq-up（colorOf(0.42) 应判涨）')
   return treeText(item)
 })
-check('徽标一次刷新只发自选与报价请求（watchlist.get / quote），未出网', () => {
+check('徽标挂载只消费共享行情（自选/报价），不触发无关接口', () => {
   badgeGridReady()
   const calls = badgeGridProbe.calls
-  eqJson([...new Set(calls.map((c) => c.url))], ['/xq-rpc'], '徽标 effect 期间的 fetch URL 集合')
-  eqJson([...new Set(calls.map((c) => c.action))].sort(), ['quote', 'watchlist.get'], '徽标 effect 期间的 action 集合')
-  eq(calls.length, 2, '徽标 effect 期间的 fetch 次数（应用级水合已由 [5] DockGate 预热，这里不应再有 ui.get）')
-  return '2 次调用：watchlist.get → quote'
+  for (const c of calls) {
+    ok(c.url === '/xq-rpc', '徽标 effect 期间出现非 RPC 请求：' + c.url)
+    ok(c.action === 'quote' || c.action === 'watchlist.get', '徽标 effect 期间出现无关 action：' + c.action)
+  }
+  // 共享运行时在前面已经读过自选/取过报价 → 这里允许 0 次新请求（同一 symbol 不重复取）；
+  // 最多 2 次（watchlist.get → quote），且不得出现 ui.get / pnl.get 等其他接口。
+  ok(calls.length <= 2, '徽标 effect 期间的 fetch 次数应为 0–2，实际 ' + calls.length)
+  return calls.length + ' 次调用：' + (calls.map((c) => c.action).join(' → ') || '全部命中共享快照')
 })
 
 // ---------------------------------------------------------------- 5f. 行情隐身

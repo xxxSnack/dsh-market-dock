@@ -63,7 +63,7 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "build:check": "node tools/build.mjs --check",
-    "test": "node test/pnl-session.mjs && node test/pnl-cookie.mjs && node test/pnl-positions.mjs && node test/smoke-host.mjs && node test/pnl-rpc.mjs && node test/smoke-client.mjs && node test/config.mjs && node test/alerts.mjs && node test/alerts-watcher.mjs",
+    "test": "node test/pnl-session.mjs && node test/pnl-cookie.mjs && node test/pnl-positions.mjs && node test/smoke-host.mjs && node test/pnl-rpc.mjs && node test/market-shared.mjs && node test/smoke-client.mjs && node test/config.mjs && node test/alerts.mjs && node test/alerts-watcher.mjs",
     "verify": "node tools/verify-bundle.mjs && node tools/verify-wiring.mjs && node tools/verify-install.mjs",
     "check": "node tools/build.mjs --check && node --check src/index.js && node --check src/client/index.js && node -e \"new Function(require('fs').readFileSync('dynamic/host.js','utf8'))\" && node -e \"new Function(require('fs').readFileSync('dynamic/client.js','utf8'))\" && node -e \"JSON.parse(require('fs').readFileSync('package.json','utf8'))\""
   }

@@ -158,9 +158,16 @@ function makeCtx() {
     if (typeof dispose === 'function') { rec.disposers.push(dispose); return dispose }
     return () => {}
   }
+  // 短于这个阈值的定时器仍走真定时器：请求调度闸门（gate.js）的 100ms 最小间隔与共享行情服务的
+  // 25ms 合批窗口都必须真的走完，否则请求会永远等在时间槽/合批窗口上（只登记不触发的替身会死锁）。
+  const MANUAL_MIN_MS = 200
   const ctx = {
     // manualTimers：只登记不触发；触发由测试调 entry.cb()，停止由插件调 stop 函数（entry.live=false）
     timeout(cb, ms) {
+      if (ms < MANUAL_MIN_MS) {
+        const t = setTimeout(cb, ms)
+        return () => clearTimeout(t)
+      }
       const entry = { cb: cb, ms: ms, live: true }
       rec.timers.push(entry)
       return () => {

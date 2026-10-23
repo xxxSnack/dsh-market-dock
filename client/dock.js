@@ -2,7 +2,7 @@
 // ---------- 嵌入式主面板（conversation.input.dock）：输入框上方一整行 ----------
 // DockGate 常驻挂载：负责 hydrate + 订阅 ui，open=false 或 hidden=true 时渲染 null。
 // 不能把开关写在槽位 render 闭包里——槽位函数不会因 ui 变化而重新执行。
-import { el, viewport, sessionsText } from './dom.js'
+import { el, viewport, sessionsText, aSession } from './dom.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
 import { ensureAlertPermission } from './store/alerts-watch.js'
 import { XueqiuPanel } from './panel/index.js'
@@ -79,20 +79,25 @@ export function DockPanel() {
     return DOCK_H_FALLBACK
   }
   const bodyStyle = ui.dockH ? { height: ui.dockH + 'px' } : null
+  // 第一层只放全局状态与显示控制（品牌 / 交易时段 / 今日盈亏 / 隐身 / 收起）；
+  // 页面导航与数据操作（tab / 账户 / 刷新）在第二层，由面板里的 .xq-nav 承担。
+  const aState = aSession()
   return el('div', { className: 'xq-dock' }, [
     el('div', { key: 'head', className: 'xq-dock-head' }, [
       el('span', { key: 'logo', className: 'xq-logo' }, [el('b', { key: 'b' }, '雪球'), ' mini']),
-      el('span', { key: 'st', className: 'xq-status', title: 'A股/港股/美股交易时段（本地时区推算，不含节假日）' }, sessionsText() || '行情面板'),
+      el('span', { key: 'st', className: 'xq-status xq-status-long' + (aState === '盘中' ? ' xq-live' : ''), title: 'A股/港股/美股交易时段（本地时区推算，不含节假日）' }, sessionsText() || '行情面板'),
+      el('span', { key: 'st2', className: 'xq-status xq-status-short' + (aState === '盘中' ? ' xq-live' : ''), title: sessionsText() || '行情面板' }, aState ? ('A股' + aState) : '行情'),
       el(PnlChip, { key: 'pnl' }),
-      el('span', { key: 'hint', className: 'xq-update' }, '已嵌入输入框上方 · Esc 收起'),
       el('span', { key: 'sp', className: 'xq-spacer' }),
       // 隐身：一个按钮把三个常驻入口一起关掉（不是收起 —— 收起只关面板，徽章和指数条还在）。
       // 顺带在用户手势里请求一次通知权限（定时器里请求常被浏览器直接拒绝），保证隐身期间到价还能提醒。
       el('button', {
         key: 'hide', className: 'xq-btn-mini', title: '完全隐藏行情：面板、徽章、指数条一起消失，行情请求随之停止（价格提醒仍然生效）。恢复：Ctrl/⌘+Alt+Shift+X（可在 设置→通用→快捷键 改键），或对 AI 说「把行情打开」',
+        'aria-label': '完全隐藏行情',
         onClick: function () { ensureAlertPermission(); ui.set({ hidden: true }) }
       }, '隐身'),
-      el('button', { key: 'min', className: 'xq-btn-mini', title: '收起（点右下角徽章重新打开）', onClick: function () { ui.set({ open: false }) } }, '收起 —')
+      // Esc 提示挪到收起按钮的 tooltip（不再常驻占一行说明）
+      el('button', { key: 'min', className: 'xq-btn-mini xq-icon-btn', title: '收起面板（Esc；点右下角徽章重新打开）', 'aria-label': '收起行情面板', onClick: function () { ui.set({ open: false }) } }, '✕')
     ]),
     el('div', { key: 'body', className: 'xq-dock-body', style: bodyStyle }, [
       el(XueqiuPanel, { key: 'panel' })

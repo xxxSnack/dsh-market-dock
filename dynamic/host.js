@@ -22,6 +22,18 @@ const GATE_TIMEOUT_MS = 30000
 // ---- TTL 缓存容量上限 ----
 const CACHE_MAX_KEYS = 200
 
+// ---- 共享行情服务（lib/quotes.js）：按 symbol 缓存 + 短窗口合批 ----
+// 普通读取的新鲜度沿用改造前 batch/quote 的 10 秒 TTL；只为缺失/过期的代码出网。
+const QUOTE_TTL_MS = 10000
+// 合批短窗口：同一窗口内到达的调用求并集。交互新增等待只允许这一个窗口。
+const QUOTE_BATCH_WINDOW_MS = 25
+// 单批上限沿用持仓路径已验证的 20 只，不向上游发未经验证的 200 只单批请求。
+const QUOTE_BATCH_MAX = 20
+// 缓存条目上限（AI 可以查任意代码，不能不设上限）
+const QUOTE_CACHE_MAX = 1000
+// 上游遗漏（无效/退市/被上游丢掉）的代码的短期记录，不超过行情 TTL
+const QUOTE_MISS_TTL_MS = 10000
+
 // ---- 云端自选后台同步节流窗口 ----
 const SYNC_INTERVAL_MS = 10 * 60 * 1000
 
@@ -231,6 +243,15 @@ function installCache(core) {
 }
 
 // 请求调度闸门：并发上限 + 最小间隔 + 看门狗。调度状态挂在 core 上（debug RPC 会读）。
+//
+// 启动时间槽（2026-10 修复）：原实现让每个任务各自 `await delay(lastStart + MIN_GAP - now)` 再写
+// lastStart —— 两个任务会读到同一个 lastStart、等同一时刻、同时启动，实测相邻启动间隔 [0,109,0]ms。
+// 现在改由**单一链条**依次发放时间槽：计算 wait 与写 lastStart 在同一段串行代码里，不存在并发读旧值
+// 的窗口。等待只序列化「启动时刻」，启动后仍按 MAX_CONCURRENCY 并行执行。
+//
+// 超时语义：看门狗只负责让调用方结束、把槽位还回去 —— 它**不**等于底层 curl 被取消（shell 层没有
+// 取消能力）。因此超时后再拿到槽位的任务直接放弃执行（不再发起真实外呼），已发出的请求迟到返回时
+// 也不会回填缓存（getJSON 的缓存写入挂在 gate 的 rejected promise 上，不会执行）。
 
 
 function installGate(core) {
@@ -239,12 +260,10 @@ function installGate(core) {
   core.lastStart = 0
   core.waiters = []
 
-  function delay(ms) { return new Promise(function (r) { ctx.timeout(r, ms) }) }
+  // 启动时间槽的唯一发放者（所有任务排在这一条链上）
+  let startChain = Promise.resolve()
 
-  function release() {
-    core.running--
-    pump()
-  }
+  function delay(ms) { return new Promise(function (r) { ctx.timeout(r, ms) }) }
 
   function pump() {
     while (core.running < MAX_CONCURRENCY && core.waiters.length) {
@@ -254,30 +273,50 @@ function installGate(core) {
     }
   }
 
+  // 原子预订一个启动时间槽：链上串行计算「距上一次启动还差多少」，等完立刻写 lastStart。
+  function takeStartSlot() {
+    const p = startChain.then(function () {
+      const wait = core.lastStart + MIN_GAP_MS - Date.now()
+      if (wait > 0) return delay(wait)
+      return null
+    }).then(function () {
+      core.lastStart = Date.now()
+    })
+    startChain = p.then(function () {}, function () { /* 上一槽失败不阻塞后续发放 */ })
+    return p
+  }
+
   function gate(fn) {
     return new Promise(function (resolve, reject) {
       core.waiters.push(async function () {
         let released = false
+        let settled = false
+        let timedOut = false
+        let watchdog = null
         function rel() {
           if (released) return
           released = true
           core.running--
           pump()
         }
-        let settled = false
-        let watchdog = null
-        function settle(fnName, arg) {
+        function settle(kind, arg) {
           if (settled) return
           settled = true
-          if (watchdog) { try { watchdog() } catch (e) { /* ignore */ } }
-          if (fnName === 'resolve') resolve(arg)
+          if (watchdog) { try { watchdog() } catch (e) { /* ignore */ } watchdog = null }
+          if (kind === 'resolve') resolve(arg)
           else reject(arg)
         }
-        try { watchdog = ctx.timeout(function () { rel(); settle('reject', new Error('[timeout] 请求超时(' + GATE_TIMEOUT_MS + 'ms)，已释放调度槽')) }, GATE_TIMEOUT_MS) } catch (e) { /* ignore */ }
         try {
-          const wait = core.lastStart + MIN_GAP_MS - Date.now()
-          if (wait > 0) await delay(wait)
-          core.lastStart = Date.now()
+          watchdog = ctx.timeout(function () {
+            timedOut = true
+            rel()
+            settle('reject', new Error('[timeout] 请求超时(' + GATE_TIMEOUT_MS + 'ms)，已释放调度槽'))
+          }, GATE_TIMEOUT_MS)
+        } catch (e) { /* 无 timer 服务时退化为无看门狗 */ }
+        try {
+          await takeStartSlot()
+          // 已经判定超时的任务不再发起真实外呼（重置计时也不会让它重新变有效）
+          if (timedOut) return
           settle('resolve', await fn())
         } catch (e) {
           settle('reject', e)
@@ -442,22 +481,344 @@ function installHttp(core) {
       return attempt(depth + 1)
     }
 
-    const hit = core.cacheGet(url, ttl)
+    // bypass：调用方（共享行情服务）自己管理缓存与在途去重，要求底层必须真的出网。
+    // 不能因为 URL TTL 又取回旧响应，也不能把本应独立的两次真实请求合并成一次。
+    const bypass = opts.bypass === true
+    const hit = bypass ? undefined : core.cacheGet(url, ttl)
     if (hit !== undefined) return Promise.resolve(hit)
-    const pending = core.inflight.get(url)
+    const pending = bypass ? undefined : core.inflight.get(url)
     if (pending) return pending
     const p = core.gate(function () { return attempt(0) }).then(function (data) {
-      if (ttl > 0) core.cachePut(url, data)
+      if (ttl > 0 && !bypass) core.cachePut(url, data)
       return data
     })
-    p.then(function () { core.inflight.delete(url) }, function () { core.inflight.delete(url) })
-    core.inflight.set(url, p)
+    if (!bypass) {
+      p.then(function () { core.inflight.delete(url) }, function () { core.inflight.delete(url) })
+      core.inflight.set(url, p)
+    }
     return p
   }
 
   core.ensureCookie = ensureCookie
   core.curl = curl
   core.getJSON = getJSON
+}
+
+// 宿主共享行情服务：按 symbol 缓存 + 短窗口合批 + per-symbol 在途共享。
+//
+// 为什么要有这一层（而不是继续靠 lib/http.js 的 URL 缓存）：http 的 TTL/在途去重是按**完整 URL**
+// 做的，`[A,B]` 与 `[B,C]` 这种「重叠但不是同一个集合」的请求完全无法复用 —— 面板、徽章、指数条、
+// 持仓、提醒各刷各的，同一只股票每分钟被取很多次。这里以 symbol 为单位记账：
+//
+//   · 普通读取命中 symbol 缓存（10s 新鲜度）→ 不出网；
+//   · 同窗口（QUOTE_BATCH_WINDOW_MS）内的多个调用求并集，按 20 只一批出网；
+//   · 每个 symbol 有自己在途 Promise，多组重叠请求复用同一份工作；
+//   · 各调用方只拿到自己请求的标的，并按自己的顺序组装（status 也按自己的原始顺序取首项）。
+//
+// force 语义（提醒 / 用户点刷新）：跳过调用**开始前**已完成的缓存，但允许共享同窗口或已经启动的
+// 真实上游请求（与改造前「在途可复用」一致）；出网时绕开 http 的 URL 缓存，去重由本服务管理。
+// force 完成后同一批结果会写回 symbol 缓存，普通读者随后也能拿到它。
+//
+// 失败语义：一批失败只让**受影响调用**失败；已有成功缓存不清空、也不刷新时间。
+// 上游遗漏（无效/退市代码）不能伪造成成功报价，但调用必须结束 —— 记一条 ≤行情 TTL 的遗漏记录，
+// 非 force 读取在有效期内直接当「无行情」，force 不受它限制。
+
+
+const QUOTE_SYMBOL_RE = /^[A-Za-z0-9_.]+$/
+
+/** 单个代码的规整：trim + 大写 + 白名单校验。不认的返回空串。 */
+function quoteSymbol(value) {
+  const raw = String(value == null ? '' : value).trim().toUpperCase()
+  return raw && QUOTE_SYMBOL_RE.test(raw) ? raw : ''
+}
+
+/** 调用方代码表 → 去重保序的合法代码；max>0 时截断。 */
+function uniqueQuoteSymbols(list, max) {
+  const out = []
+  const seen = Object.create(null)
+  const arr = Array.isArray(list) ? list : []
+  const cap = max > 0 ? max : 0
+  for (let i = 0; i < arr.length; i++) {
+    const sym = quoteSymbol(arr[i])
+    if (!sym || seen[sym]) continue
+    seen[sym] = true
+    out.push(sym)
+    if (cap && out.length >= cap) break
+  }
+  return out
+}
+
+function installQuotes(core) {
+  const ctx = core.ctx
+
+  // symbol -> { quote, marketStatus, fetchedAt, generation }
+  const cache = new Map()
+  // symbol -> { promise, generation, symbols }
+  const inflight = new Map()
+  // symbol -> { at, generation }（上游没返回的代码；短期记录，避免每轮都为一个坏代码出网）
+  const missed = new Map()
+
+  let generation = 1
+  let queue = []            // 等待本轮合批的调用
+  let windowScheduled = false
+  let windowStop = null
+
+  // 内存计数器：不落盘、不含 Cookie/token，只通过 debug action 提供聚合值。
+  const stats = {
+    calls: 0,              // fetchQuotes 调用次数（客户端 RPC 侧口径）
+    symbolRequests: 0,     // 调用方请求的标的总数（去重后）
+    cacheHits: 0,          // 命中已完成缓存
+    missedHits: 0,         // 命中遗漏记录
+    inflightShared: 0,     // 复用了别人的在途请求
+    upstreamBatches: 0,    // 真正发出的上游行情批次数
+    upstreamSymbols: 0,    // 真正发给上游的标的数
+    failures: 0,           // 失败的批次数
+    forceCalls: 0,         // 其中 force 调用次数
+    generations: 0         // 内部 generation 切换次数（登录/退出）
+  }
+
+  function nowMs() { return Date.now() }
+  function freshOf(entry, at) {
+    return !!entry && entry.generation === generation && (at - entry.fetchedAt) < QUOTE_TTL_MS
+  }
+
+  function clearWindow() {
+    if (windowStop) {
+      try { windowStop() } catch (e) { /* 已停止 */ }
+      windowStop = null
+    }
+    windowScheduled = false
+  }
+
+  function trimCache() {
+    if (cache.size <= QUOTE_CACHE_MAX) return
+    const at = nowMs()
+    // 先清长期不活跃的条目（24h），再按 fetchedAt 最旧逐个淘汰
+    for (const pair of Array.from(cache.entries())) {
+      if (at - pair[1].fetchedAt > 86400000) cache.delete(pair[0])
+    }
+    while (cache.size > QUOTE_CACHE_MAX) {
+      let oldestKey = null
+      let oldestAt = Infinity
+      for (const pair of cache) {
+        if (pair[1].fetchedAt < oldestAt) { oldestAt = pair[1].fetchedAt; oldestKey = pair[0] }
+      }
+      if (oldestKey == null) break
+      cache.delete(oldestKey)
+    }
+  }
+
+  function releaseInflight(symbols, holder) {
+    for (let i = 0; i < symbols.length; i++) {
+      if (inflight.get(symbols[i]) === holder) inflight.delete(symbols[i])
+    }
+  }
+
+  // 发出一批（≤QUOTE_BATCH_MAX）真实上游请求，并把结果按 symbol 落到缓存 / 遗漏记录。
+  // 返回 Map<symbol, {quote, marketStatus}>，只含本批真实拿到的标的。
+  function startFetch(symbols) {
+    const gen = generation
+    stats.upstreamBatches++
+    stats.upstreamSymbols += symbols.length
+    const promise = core.getJSON('/v5/stock/batch/quote.json', { symbol: symbols.join(',') }, { ttl: 0, bypass: true })
+      .then(function (data) {
+        const items = (data && data.data && data.data.items) || []
+        const got = new Map()
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i] || {}
+          const q = pickQuote(it.quote)
+          const sym = q ? quoteSymbol(q.symbol) : ''
+          if (!sym) continue
+          got.set(sym, { quote: q, marketStatus: nz(it.market ? it.market.status_id : null) })
+        }
+        // 旧 generation（期间登录/退出过）的响应一律不回填当前缓存
+        if (gen === generation) {
+          const at = nowMs()
+          for (let i = 0; i < symbols.length; i++) {
+            const sym = symbols[i]
+            const hit = got.get(sym)
+            if (hit) {
+              cache.set(sym, { quote: hit.quote, marketStatus: hit.marketStatus, fetchedAt: at, generation: gen })
+              missed.delete(sym)
+            } else {
+              missed.set(sym, { at: at, generation: gen })
+            }
+          }
+          trimCache()
+        }
+        return got
+      }, function (error) {
+        stats.failures++
+        throw error
+      })
+    const holder = { promise: promise, generation: gen, symbols: symbols }
+    for (let i = 0; i < symbols.length; i++) inflight.set(symbols[i], holder)
+    promise.then(function () { releaseInflight(symbols, holder) }, function () { releaseInflight(symbols, holder) })
+    return holder
+  }
+
+  // 把一个调用者依赖的在途工作收齐，再按它自己的代码顺序组装 { status, list }。
+  function settleWaiter(waiter) {
+    const waits = []
+    const seen = Object.create(null)
+    for (let i = 0; i < waiter.slots.length; i++) {
+      const slot = waiter.slots[i]
+      const holder = slot.kind === 'fetch' ? inflight.get(slot.symbol)
+        : slot.kind === 'promise' ? slot.holder : null
+      if (!holder || seen[slot.symbol]) continue
+      seen[slot.symbol] = true
+      waits.push(holder.promise)
+    }
+    Promise.all(waits).then(function (groups) {
+      const bySymbol = Object.create(null)
+      for (let i = 0; i < groups.length; i++) {
+        const got = groups[i]
+        if (!got || typeof got.forEach !== 'function') continue
+        got.forEach(function (value, key) { bySymbol[key] = value })
+      }
+      const at = nowMs()
+      const list = []
+      const missing = []
+      let status = null
+      let statusTaken = false
+      for (let i = 0; i < waiter.symbols.length; i++) {
+        const sym = waiter.symbols[i]
+        let hit = bySymbol[sym]
+        if (!hit) {
+          // 只认「刚刚写进来的新鲜缓存」：遗漏记录与过期值都不冒充成功报价
+          const entry = cache.get(sym)
+          if (freshOf(entry, at)) hit = { quote: entry.quote, marketStatus: entry.marketStatus }
+        }
+        if (hit && hit.quote) {
+          list.push(hit.quote)
+          // status 只由「调用方原始有效顺序里的首个有报价标的」决定，不因合批/排序改变
+          if (!statusTaken) { statusTaken = true; status = nz(hit.marketStatus) }
+        } else {
+          missing.push(sym)
+        }
+      }
+      waiter.resolve({ status: status, list: list, symbols: waiter.symbols, missing: missing, force: waiter.force, receivedAt: at })
+    }, function (error) {
+      waiter.reject(error)
+    })
+  }
+
+  // 本轮合批：把队列里所有调用者的需求求并集，只为「缺失/过期」的代码出网。
+  function flush() {
+    clearWindow()
+    if (!queue.length) return
+    const waiters = queue
+    queue = []
+    const need = []
+    const needSeen = Object.create(null)
+    const at = nowMs()
+
+    for (let i = 0; i < waiters.length; i++) {
+      const w = waiters[i]
+      w.slots = []
+      for (let j = 0; j < w.symbols.length; j++) {
+        const sym = w.symbols[j]
+        const entry = cache.get(sym)
+        if (!w.force && freshOf(entry, at)) { stats.cacheHits++; w.slots.push({ symbol: sym, kind: 'cache' }); continue }
+        const holder = inflight.get(sym)
+        if (holder && holder.generation === generation) {
+          stats.inflightShared++
+          w.slots.push({ symbol: sym, kind: 'promise', holder: holder })
+          continue
+        }
+        if (!w.force) {
+          const miss = missed.get(sym)
+          if (miss && miss.generation === generation && (at - miss.at) < QUOTE_MISS_TTL_MS) {
+            stats.missedHits++
+            w.slots.push({ symbol: sym, kind: 'miss' })
+            continue
+          }
+        }
+        if (!needSeen[sym]) { needSeen[sym] = true; need.push(sym) }
+        w.slots.push({ symbol: sym, kind: 'fetch' })
+      }
+    }
+
+    // 单批上限沿用持仓路径已验证的 20 只，不向上游发未经验证的大批量请求
+    for (let i = 0; i < need.length; i += QUOTE_BATCH_MAX) {
+      startFetch(need.slice(i, i + QUOTE_BATCH_MAX))
+    }
+    for (let i = 0; i < waiters.length; i++) settleWaiter(waiters[i])
+  }
+
+  function enqueue(waiter) {
+    queue.push(waiter)
+    if (windowScheduled) return
+    windowScheduled = true
+    let stop = null
+    try {
+      stop = ctx.timeout(function () { windowStop = null; flush() }, QUOTE_BATCH_WINDOW_MS)
+    } catch (e) { stop = null }
+    windowStop = typeof stop === 'function' ? stop : null
+    if (!windowStop) {
+      // 宿主 timeout 不可用（返回空/抛错）时不能把调用挂死：退化为微任务合批，同一 tick 仍会合并。
+      windowScheduled = true
+      Promise.resolve().then(function () { if (queue.length) flush() })
+    }
+  }
+
+  /**
+   * 取行情。返回 { status, list, symbols, missing, force, receivedAt }。
+   * @param {string[]} symbols 调用方代码表（原样，可含重复/非法项）
+   * @param {{force?:boolean}} [opts]
+   */
+  function fetchQuotes(symbols, opts) {
+    const list = uniqueQuoteSymbols(symbols, 0)
+    const force = !!(opts && opts.force)
+    stats.calls++
+    stats.symbolRequests += list.length
+    if (force) stats.forceCalls++
+    if (!list.length) return Promise.resolve({ status: null, list: [], symbols: [], missing: [], force: force, receivedAt: nowMs() })
+    // 快路径：全部命中已完成的缓存时不排合批窗口（常规读取不该多等一个窗口）
+    if (!force) {
+      const at = nowMs()
+      const hitList = []
+      let status = null
+      let statusTaken = false
+      let allFresh = true
+      for (let i = 0; i < list.length; i++) {
+        const entry = cache.get(list[i])
+        if (!freshOf(entry, at)) { allFresh = false; break }
+        hitList.push(entry.quote)
+        if (!statusTaken) { statusTaken = true; status = nz(entry.marketStatus) }
+      }
+      if (allFresh) {
+        stats.cacheHits++
+        return Promise.resolve({ status: status, list: hitList, symbols: list, missing: [], force: false, receivedAt: at })
+      }
+    }
+    return new Promise(function (resolve, reject) {
+      enqueue({ symbols: list, force: force, resolve: resolve, reject: reject, slots: null })
+    })
+  }
+
+  // 登录/退出/换 Cookie：换 generation。旧 generation 的在途响应不会回填当前缓存。
+  function invalidate() {
+    generation++
+    stats.generations++
+    cache.clear()
+    missed.clear()
+    for (const pair of Array.from(inflight.entries())) {
+      if (pair[1].generation !== generation) inflight.delete(pair[0])
+    }
+  }
+
+  function snapshot() {
+    return {
+      calls: stats.calls, symbolRequests: stats.symbolRequests, cacheHits: stats.cacheHits,
+      missedHits: stats.missedHits, inflightShared: stats.inflightShared,
+      upstreamBatches: stats.upstreamBatches, upstreamSymbols: stats.upstreamSymbols,
+      failures: stats.failures, forceCalls: stats.forceCalls, generations: stats.generations,
+      cacheSize: cache.size, inflightSize: inflight.size, missedSize: missed.size
+    }
+  }
+
+  core.quotes = { fetchQuotes: fetchQuotes, invalidate: invalidate, stats: snapshot, generation: function () { return generation } }
 }
 
 // 状态文件落点：稳定目录（$DSH_HOME/dsh-xueqiu）优先，工作区回退。读/写/旧路径回读都在这里。
@@ -712,6 +1073,8 @@ function installLogin(core) {
     if (cls) throw new Error('Cookie 校验失败 [' + cls.code + ']: ' + cls.desc + '（请确认浏览器处于登录状态后重新复制）')
     core.login = { cookie: cookie, uid: uid, screenName: screenName, savedAt: Date.now() }
     core.cloudPid = null
+    // 身份变了：共享行情服务换 generation，旧身份下的在途响应不得回填当前缓存
+    if (core.quotes) core.quotes.invalidate()
     await saveLogin()
     // 登录成功即强制同步一次云端自选（云端为准镜像；失败不阻塞登录）
     let symbols = null
@@ -725,6 +1088,8 @@ function installLogin(core) {
   async function actLoginLogout() {
     core.login = null
     core.cloudPid = null
+    // 退出登录同样换 generation：匿名回读不得复用登录态下取到的行情
+    if (core.quotes) core.quotes.invalidate()
     await saveLogin()   // 写入 {} 清空
     return { loggedIn: false }
   }
@@ -1830,15 +2195,20 @@ function pnlPollMs(state) {
   return ms === null ? DEFAULT_POLL_MS : ms
 }
 
-/** 批量取行情 → { SYMBOL: quote }。失败/无行情给空表（逐行留 null，不把整次视图判失败）。 */
+/**
+ * 批量取行情 → { SYMBOL: quote }。失败/无行情给空表（逐行留 null，不把整次视图判失败）。
+ *
+ * 走宿主的共享行情服务（lib/quotes.js）：同一批标的可能与面板/徽章/提醒的重叠，服务按 symbol
+ * 复用缓存与在途请求。这里仍按 20 只分块调用 —— 一块失败只影响这一块的标的，与改造前一致。
+ */
 async function quoteMap(core, symbols, force) {
   const by = Object.create(null)
   const list = Array.isArray(symbols) ? symbols : []
-  if (!list.length || typeof core.actQuote !== 'function') return by
+  if (!list.length) return by
   for (let i = 0; i < list.length; i += 20) {
     try {
-      // force=false 时命中雪球侧 10 秒 TTL 缓存：面板其它 tab 也在刷同一批标的，能省就省。
-      const res = await core.actQuote({ symbols: list.slice(i, i + 20), force: force === true })
+      // force=false 时命中行情服务的 10 秒缓存：面板其它组件也在刷同一批标的，能省就省。
+      const res = await core.quotes.fetchQuotes(list.slice(i, i + 20), { force: force === true })
       const items = (res && Array.isArray(res.list)) ? res.list : []
       for (const q of items) {
         if (q && q.symbol) by[String(q.symbol).toUpperCase()] = q
@@ -1947,26 +2317,39 @@ async function buildView(core, opts) {
 }
 
 function installPnl(core) {
-  // 一次视图的内存缓存 + 单飞，避免同一时刻两处调用各拉一遍行情
-  core.pnl = { view: null, inflight: null }
+  // 一次视图的内存缓存 + 单飞，避免同一时刻两处调用各拉一遍行情。
+  // revision：持仓数据每次成功修改 +1；编辑前启动的视图/单飞一律作废，不能回填到修改后的界面。
+  core.pnl = { view: null, inflight: null, revision: 0 }
+
+  /** 编辑落盘后：让编辑前的视图与在途结果失效（这是「保存返回旧持仓视图」的根因）。 */
+  function invalidateView() {
+    core.pnl.revision++
+    core.pnl.inflight = null
+    return core.pnl.revision
+  }
 
   async function getView(opts) {
-    if (core.pnl.inflight) return core.pnl.inflight
-    let task = null
-    task = buildView(core, opts).then(function (view) {
-      core.pnl.view = view
-      if (core.pnl.inflight === task) core.pnl.inflight = null
+    const rev = core.pnl.revision
+    const cur = core.pnl.inflight
+    if (cur && cur.rev === rev) return cur.promise
+    const record = { rev: rev, promise: null }
+    record.promise = buildView(core, opts).then(function (view) {
+      // 兼容方式加字段：客户端据此丢弃「编辑前发出、编辑后才到」的旧刷新
+      view.revision = rev
+      if (core.pnl.revision === rev) core.pnl.view = view
+      if (core.pnl.inflight === record) core.pnl.inflight = null
       return view
     }, function (e) {
-      if (core.pnl.inflight === task) core.pnl.inflight = null
+      if (core.pnl.inflight === record) core.pnl.inflight = null
       throw e
     })
-    core.pnl.inflight = task
-    return task
+    core.pnl.inflight = record
+    return record.promise
   }
 
   /** 落盘一张新表并刷新视图（增删改共用）。 */
   async function persist(rows, cloud) {
+    invalidateView()
     const store = await loadPositions(core)
     await savePositions(core, {
       rows: rows,
@@ -2074,7 +2457,7 @@ function installPnl(core) {
         blocked: Boolean(res.blocked),
         blocked_until: res.blocked ? new Date(now.getTime() + BLOCKED_BACKOFF_MS).toISOString() : null,
       }
-      await persist(store.rows, cloud)
+      const failedView = await persist(store.rows, cloud)
       return {
         ok: false,
         error: res.error,
@@ -2082,7 +2465,7 @@ function installPnl(core) {
         blocked: Boolean(res.blocked),
         blocked_until: cloud.blocked_until,
         report: null,
-        view: core.pnl.view,
+        view: failedView,
       }
     }
 
@@ -2225,18 +2608,13 @@ function installPnl(core) {
 
 function installApi(core) {
   // ---- actions ----
+  // quote 委托共享行情服务（lib/quotes.js）：按 symbol 缓存/合批/在途共享都在那一层，
+  // 这里的对外形状（{status,list}）与改造前逐字一致 —— 面板、持仓、提醒、AI 工具都靠它。
   async function actQuote(args) {
-    const symbols = Array.isArray(args.symbols) ? args.symbols : [String(args.symbols || '')]
-    const list = symbols.filter(function (s) { return /^[A-Za-z0-9_.]+$/.test(s) })
-    if (!list.length) return { list: [], status: null }
-    const data = await core.getJSON('/v5/stock/batch/quote.json', { symbol: list.join(',') }, { ttl: args.force === true ? 0 : 10000 })
-    const items = (data && data.data && data.data.items) || []
-    const first = items[0]
-    const status = first && first.market ? first.market.status_id : null
-    return {
-      status: nz(status),
-      list: items.map(function (it) { return pickQuote(it.quote) }).filter(Boolean)
-    }
+    const a = (args && typeof args === 'object') ? args : {}
+    const symbols = Array.isArray(a.symbols) ? a.symbols : [String(a.symbols || '')]
+    const res = await core.quotes.fetchQuotes(symbols, { force: a.force === true })
+    return { status: res.status, list: res.list }
   }
 
   async function actQuoteDetail(args) {
@@ -2612,15 +2990,15 @@ function installAlerts(core) {
   }
 
   async function pollOnce() {
-    const wl = await core.loadWatchlist()
     const store = await loadStore()
     if (!store.rules.length) return
-    // 读取自选表并把规则标的并入批量请求，避免提醒依赖浏览器页面是否打开。
+    // 只请求规则标的：不再夹带整份自选（改造前为了「顺手刷新」把自选并进来，实际只是白白放大外呼）。
+    // force 保持既有语义：不读陈旧价格，合批窗口带来的额外等待只有约一个窗口。
     const symbols = []
-    const add = function (symbol) { if (symbol && symbols.indexOf(symbol) === -1) symbols.push(symbol) }
-    const list = wl && Array.isArray(wl.symbols) ? wl.symbols : []
-    for (let i = 0; i < list.length; i++) add(validSymbol(list[i]))
-    for (let i = 0; i < store.rules.length; i++) add(store.rules[i].symbol)
+    for (let i = 0; i < store.rules.length; i++) {
+      const sym = validSymbol(store.rules[i].symbol)
+      if (sym && symbols.indexOf(sym) === -1) symbols.push(sym)
+    }
     if (!symbols.length) return
     const quoted = await core.actQuote({ symbols: symbols, force: true })
     const items = quoted && Array.isArray(quoted.list) ? quoted.list : []
@@ -2738,7 +3116,7 @@ function installActions(core) {
     'alerts.get': core.actAlertsGet, 'alerts.set': core.actAlertsSet,
     'alerts.remove': core.actAlertsRemove, 'alerts.ack': core.actAlertsAck,
     debug: async function () {
-      return { running: core.running, waiters: core.waiters.length, inflight: Array.from(core.inflight.keys()), cacheKeys: core.cache.size, cookie: core.state.cookie ? 'set' : 'none', login: core.login ? ('uid=' + (core.login.uid || '?')) : 'anonymous' }
+      return { running: core.running, waiters: core.waiters.length, inflight: Array.from(core.inflight.keys()), cacheKeys: core.cache.size, cookie: core.state.cookie ? 'set' : 'none', login: core.login ? ('uid=' + (core.login.uid || '?')) : 'anonymous', quotes: core.quotes.stats(), quoteGeneration: core.quotes.generation(), positionsRevision: core.pnl ? core.pnl.revision : 0 }
     }
   }
 
@@ -3123,13 +3501,16 @@ function createXqCore(ctx, config) {
     waiters: [],
     // TTL 缓存与在途去重（cache.js 维护）
     cache: null,
-    inflight: null
+    inflight: null,
+    // 共享行情服务：installQuotes 挂的 { fetchQuotes, invalidate, stats }（每次 apply 一份）
+    quotes: null
   }
 
   // 安装顺序 = 依赖顺序（只为可读性；调用都发生在运行期，函数引用在 install 时建立）
   installCache(core)
   installGate(core)
   installHttp(core)
+  installQuotes(core)
   installState(core)
   installLogin(core)
   installWatchlist(core)

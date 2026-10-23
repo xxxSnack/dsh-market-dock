@@ -11,7 +11,7 @@ import { call, A_HOT, A_NEWS, A_KLINE, A_QUOTE_DETAIL, A_MINUTE, A_FINANCE, A_KO
 import { getUiRuntime } from '../store/ui.js'
 import { getPositionsRuntime } from '../store/positions.js'
 import { getAlertsWatchRuntime, alertEventId } from '../store/alerts-watch.js'
-import { fetchQuote, fetchIndices, fetchWatchlist } from '../store/market.js'
+import { getMarketRuntime } from '../store/market.js'
 import { saveAlert, removeAlert, ackAlerts } from '../store/alerts.js'
 import { LoginBox } from './login.js'
 import { MarketTab } from './market.js'
@@ -21,9 +21,20 @@ import { SearchTab } from './search.js'
 import { NewsTab } from './news.js'
 import { PnlTab } from './pnl.js'
 import { PositionsTab } from './positions.js'
-import { PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, SEARCH_STOCK_SIZE, SEARCH_POST_SIZE, POLL_MARKET_OPEN_MS, POLL_MARKET_CLOSED_MS, POLL_CONTENT_OPEN_MS, POLL_CONTENT_CLOSED_MS, ALERT_NOTICE_LIMIT } from '../constants.js'
+import { XQ_INDEX_SYMBOLS, WATCHLIST_MAX, PANEL_TABS, NEWS_PAGE_SIZE, HOT_LIST_SIZE, KLINE_PAGE_SIZE, KOL_SIZE, SEARCH_STOCK_SIZE, SEARCH_POST_SIZE, POLL_MARKET_OPEN_MS, POLL_MARKET_CLOSED_MS, POLL_CONTENT_OPEN_MS, POLL_CONTENT_CLOSED_MS, ALERT_NOTICE_LIMIT } from '../constants.js'
 
 const XQ_TABS = { market: MarketTab, hot: HotTab, search: SearchTab, news: NewsTab, pnl: PnlTab, positions: PositionsTab }
+
+/** 账户图标：静态内联 SVG（统一线宽，不引图标库；emoji 跨平台外观不一致，不用）。 */
+function accountIcon() {
+  return el('svg', {
+    key: 'i', className: 'xq-acc-icon', viewBox: '0 0 16 16', 'aria-hidden': 'true', focusable: 'false',
+    fill: 'none', stroke: 'currentColor', strokeWidth: '1.4', strokeLinecap: 'round', strokeLinejoin: 'round'
+  }, [
+    el('circle', { key: 'c', cx: '8', cy: '5.2', r: '2.6' }),
+    el('path', { key: 'p', d: 'M2.9 13.4c0-2.4 2.2-3.9 5.1-3.9s5.1 1.5 5.1 3.9' })
+  ])
+}
 
 // ---------- 面板内容（数据 + tabs + 详情） ----------
 export function XueqiuPanel() {
@@ -37,8 +48,8 @@ export function XueqiuPanel() {
   const [indices, setIndices] = React.useState([])
   const [hot, setHot] = React.useState([])
   const [hotMarket, setHotMarket] = React.useState('cn')
-  // 竞态防护：行情/热榜/搜索的响应序号（旧响应到达时序号已过期则丢弃，防慢请求覆盖新结果）
-  const marketSeq = React.useRef(0)
+  // 竞态防护：热榜/搜索的响应序号（旧响应到达时序号已过期则丢弃，防慢请求覆盖新结果）。
+  // 行情不再需要它：序号guard 已收敛到页面内共享行情运行时（见 store/market.js）。
   const hotSeq = React.useRef(0)
   const searchSeq = React.useRef(0)
   // 轮询闭包读当前市场（interval 闭包不随状态更新，直接捕获 state 会拿到 stale 值）
@@ -161,51 +172,60 @@ export function XueqiuPanel() {
     })
   }
 
+  // 行情（指数 + 自选）走页面内共享运行时：订阅拿快照，不再自己发 quote/watchlist.get。
+  // force=true（用户点刷新 / 同步）时绕开宿主缓存的已完成部分，并等真实的完成 Promise。
   function refreshMarket(force) {
-    const my = ++marketSeq.current
-    return Promise.all([
-      fetchWatchlist(),
-      fetchIndices(force)
-    ]).then(function (res) {
-      if (marketSeq.current !== my) return
-      const wl = (res[0] && res[0].symbols) || []
-      const status = res[1] ? res[1].status : null
-      // 空响应/临时异常没有足够信息判断盘中，不要把轮询误降到休市节奏；
-      // 下一轮成功拿到状态后再切换。
-      if (status === 5 || status === 6) setMarketOpen(true)
-      else if (status !== null && status !== undefined) setMarketOpen(false)
-      setWatchlist(wl)
-      setIndices((res[1] && res[1].list) || [])
-      setErr('')
-      if (!wl.length) return
-      return fetchQuote(wl, force).then(function (data) {
-        if (marketSeq.current !== my) return
-        const list = (data && data.list) || []
-        // 批量行情会整只丢弃无效/退市代码：补占位行（现价/涨跌全 '--'，仍可删除/查详情），
-        // 否则"加进自选却凭空消失"没有任何反馈
-        const seen = {}
-        list.forEach(function (q) { seen[q.symbol] = 1 })
-        const missing = wl.filter(function (s) { return !seen[s] }).map(function (s) { return { symbol: s } })
-        const dirs = {}
-        list.forEach(function (q) {
-          if (q.current === null || q.current === undefined) return
-          const prev = prevPrices.current[q.symbol]
-          if (prev !== undefined && q.current !== prev) dirs[q.symbol] = q.current > prev ? 1 : -1
-          prevPrices.current[q.symbol] = q.current
-        })
-        if (Object.keys(dirs).length) setFlashDir(dirs)
-        setQuotes(list.concat(missing))
-      })
-    }).catch(function (e) {
-      if (marketSeq.current === my) setErr(String((e && e.message) || e))
+    const mkt = getMarketRuntime()
+    if (!mkt) return Promise.resolve()
+    const wl = mkt.getWatchlist() || watchlist || []
+    const symbols = XQ_INDEX_SYMBOLS.concat(wl.slice(0, WATCHLIST_MAX))
+    const jobs = [mkt.refresh(symbols, { force: force === true })]
+    if (force) jobs.push(mkt.refreshWatchlist())
+    return Promise.all(jobs).catch(function (e) {
+      setErr(String((e && e.message) || e))
     })
+  }
+
+  // 一份快照 → 指数卡 + 行情表（含无效代码占位与价格闪烁）。
+  // 空响应/临时异常没有足够信息判断盘中，不要把轮询误降到休市节奏；下一轮成功拿到状态后再切换。
+  function applyIndexSnapshot() {
+    const mkt = getMarketRuntime()
+    if (!mkt) return
+    const snap = mkt.getSnapshot(XQ_INDEX_SYMBOLS)
+    setIndices(snap.list)
+    const st = snap.status
+    if (st === 5 || st === 6) setMarketOpen(true)
+    else if (st !== null && st !== undefined) setMarketOpen(false)
+  }
+  function applyWatchSnapshot() {
+    const mkt = getMarketRuntime()
+    if (!mkt) return
+    const wl = (mkt.getWatchlist() || []).slice(0, WATCHLIST_MAX)
+    setWatchlist(wl)
+    const snap = mkt.getSnapshot(wl)
+    const list = snap.list
+    // 批量行情会整只丢弃无效/退市代码：补占位行（现价/涨跌全 '--'，仍可删除/查详情），
+    // 否则"加进自选却凭空消失"没有任何反馈
+    const seen = {}
+    list.forEach(function (q) { seen[q.symbol] = 1 })
+    const missing = wl.filter(function (s) { return !seen[s] }).map(function (s) { return { symbol: s } })
+    const dirs = {}
+    list.forEach(function (q) {
+      if (q.current === null || q.current === undefined) return
+      const prev = prevPrices.current[q.symbol]
+      if (prev !== undefined && q.current !== prev) dirs[q.symbol] = q.current > prev ? 1 : -1
+      prevPrices.current[q.symbol] = q.current
+    })
+    if (Object.keys(dirs).length) setFlashDir(dirs)
+    setQuotes(list.concat(missing))
+    setErr(snap.error || '')
   }
 
   function refreshContent() {
     const my = ++hotSeq.current
     const newsMy = ++newsSeq.current
     const market = hotMarketRef.current   // 读当前市场（轮询闭包防 stale）
-    Promise.all([
+    return Promise.all([
       call(A_HOT, { market: market, size: HOT_LIST_SIZE }),
       call(A_NEWS, { count: NEWS_PAGE_SIZE })
     ]).then(function (res) {
@@ -244,7 +264,7 @@ export function XueqiuPanel() {
   React.useEffect(function () {
     setLoading(true)
     call(A_LOGIN_STATUS, {}).then(function (d) { setLoginSt(d || { loggedIn: false }) }).catch(function () { setLoginSt({ loggedIn: false }) })
-    refreshMarket().then(function () { return refreshContent() })
+    refreshContent()
       .then(function () { setLoading(false) })
       .catch(function () { setLoading(false) })
     return function () { /* 一次性 */ }
@@ -261,17 +281,30 @@ export function XueqiuPanel() {
   }, [])
 
   React.useEffect(function () {
+    // 行情节奏由页面内共享运行时驱动（一个最近到期的定时器 + 一次并集请求）；
+    // 面板 open=false 时本组件被卸载 → 它那份 20s 需求随之注销，徽章/指数条仍按 30s 运行。
     const marketMs = marketOpen ? POLL_MARKET_OPEN_MS : POLL_MARKET_CLOSED_MS
+    const mkt = getMarketRuntime()
+    if (!mkt) return function () { }
+    function onIndices() { applyIndexSnapshot() }
+    function onWatch() { applyWatchSnapshot() }
+    onIndices()
+    onWatch()
+    const offA = mkt.subscribe({ symbols: XQ_INDEX_SYMBOLS, intervalMs: marketMs }, onIndices)
+    const offB = mkt.subscribe({ watchlistLimit: WATCHLIST_MAX, needsWatchlist: true, intervalMs: marketMs }, onWatch)
+    return function () { offA(); offB() }
+  }, [marketOpen])
+
+  React.useEffect(function () {
     const contentMs = marketOpen ? POLL_CONTENT_OPEN_MS : POLL_CONTENT_CLOSED_MS
-    // 行情持续轮询；热榜/快讯在隐藏页暂停以降低请求量。
-    const stopA = rt.ctx.interval(function () { refreshMarket() }, marketMs)
+    // 热榜/快讯在隐藏页暂停以降低请求量（行情轮询留给共享运行时，它自己处理可见性恢复）。
     const stopB = rt.ctx.interval(function () { if (!pageHidden()) refreshContent() }, contentMs)
     function onVis() {
-      if (!pageHidden()) { refreshMarket(); refreshContent() }
+      if (!pageHidden()) refreshContent()
     }
     try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     return function () {
-      if (stopA) stopA(); if (stopB) stopB()
+      if (stopB) stopB()
       try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
     }
   }, [marketOpen])
@@ -389,16 +422,26 @@ export function XueqiuPanel() {
     setView(symbol)
   }
 
+  // 自选变更入口统一走这里：任何增删/登录/主动拉取都要让共享运行时知道新列表，
+  // 否则运行时还按旧列表取价（漏取新增、白取已删）。
+  function syncWatchlist(symbols) {
+    const mkt = getMarketRuntime()
+    const list = Array.isArray(symbols) ? symbols : []
+    if (mkt) mkt.applyWatchlist(list)
+    setWatchlist(list)
+    return list
+  }
+
   function addWatch(symbol) {
     call(A_WATCHLIST_ADD, { symbol: symbol }).then(function (data) {
-      setWatchlist((data && data.symbols) || [])
+      syncWatchlist((data && data.symbols) || [])
       refreshMarket()
     }).catch(function (e) { setErr(String((e && e.message) || e)) })
   }
 
   function removeWatch(symbol) {
     call(A_WATCHLIST_REMOVE, { symbol: symbol }).then(function (data) {
-      setWatchlist((data && data.symbols) || [])
+      syncWatchlist((data && data.symbols) || [])
       setQuotes(quotes.filter(function (q) { return q.symbol !== symbol }))
     }).catch(function (e) { setErr(String((e && e.message) || e)) })
   }
@@ -439,7 +482,9 @@ export function XueqiuPanel() {
       setLoginMsg({ ok: true, text: '登录成功' + ((d && d.screenName) ? '：' + d.screenName : '') + (d && d.symbols ? '，已同步云端自选 ' + d.symbols.length + ' 只' : '') })
       setCookieInput('')
       setLoginOpen(false)
-      refreshMarket()
+      // 登录会镜像云端自选：先把返回的列表应用到运行时，再刷行情
+      if (d && Array.isArray(d.symbols)) syncWatchlist(d.symbols)
+      refreshMarket(true)
     }).catch(function (e) {
       setLoginMsg({ ok: false, text: String((e && e.message) || e) })
     }).then(function () { setLoginBusy(false) })
@@ -450,6 +495,8 @@ export function XueqiuPanel() {
     call(A_LOGIN_LOGOUT, {}).then(function () {
       setLoginSt({ loggedIn: false })
       setLoginMsg({ ok: true, text: '已退出登录（本地自选股保留）' })
+      // 退出后云端镜像停止，但本地列表仍在：让运行时按本地列表继续（宿主缓存 generation 也已切换）
+      refreshMarket(true)
     }).catch(function (e) {
       setLoginMsg({ ok: false, text: String((e && e.message) || e) })
     }).then(function () { setLoginBusy(false) })
@@ -460,35 +507,47 @@ export function XueqiuPanel() {
     setLoginMsg(null)
     call(A_WATCHLIST_PULL, {}).then(function (d) {
       setLoginMsg({ ok: true, text: '已同步云端自选 ' + (((d && d.symbols) || []).length) + ' 只' })
-      refreshMarket()
+      syncWatchlist((d && d.symbols) || [])
+      refreshMarket(true)
     }).catch(function (e) {
       setLoginMsg({ ok: false, text: String((e && e.message) || e) })
     }).then(function () { setLoginBusy(false) })
   }
 
-  const tabs = el('div', { className: 'xq-tabs' }, PANEL_TABS.map(function (t) {
-    return el('button', {
-      key: t[0], className: 'xq-tab' + (tab === t[0] ? ' xq-tab-active' : ''),
-      onClick: function () { setTab(t[0]); if (view) setView(null) }
-    }, t[1])
-  }).concat([
+  const tabs = el('div', { className: 'xq-nav' }, [
+    el('div', { key: 'tabs', className: 'xq-tabs', role: 'tablist' }, PANEL_TABS.map(function (t) {
+      const on = tab === t[0]
+      return el('button', {
+        key: t[0], className: 'xq-tab' + (on ? ' xq-tab-active' : ''), role: 'tab',
+        'aria-selected': on ? 'true' : 'false',
+        onClick: function () { setTab(t[0]); if (view) setView(null) }
+      }, t[1])
+    })),
     el('span', { key: 'sp', className: 'xq-spacer' }),
-    el('button', {
-      key: 'acc', className: 'xq-btn xq-acc-btn' + (login && login.loggedIn ? ' xq-acc-on' : ''),
-      title: login && login.loggedIn ? '已登录：' + (login.screenName || login.uid || '') + '（点击管理）' : '可选：登录雪球后使用云端自选股',
-      onClick: function () { setLoginMsg(null); setLoginOpen(true) }
-    }, login && login.loggedIn ? '👤 ' + (login.screenName || '已登录') : '👤 登录'),
-    el('button', {
-      key: 'btn', className: 'xq-btn', disabled: loading, title: '刷新全部数据',
-      onClick: function () {
-        setLoading(true)
-        // 持仓/盈亏视图一并刷新（refresh 内部已做并发去重，与后台轮询不会重复请求）；
-        // force=true 绕过行情 10 秒缓存，用户点了「刷新」就该看到新价。
-        const posRt = getPositionsRuntime()
-        Promise.all([refreshMarket(true), refreshContent(), posRt ? posRt.refresh(true) : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
-      }
-    }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
-  ]))
+    // 第二层：页面导航在左，数据操作（账户 / 刷新）在右。图标用静态内联 SVG，不引图标库、不用 emoji。
+    el('div', { key: 'act', className: 'xq-nav-actions' }, [
+      el('button', {
+        key: 'acc', className: 'xq-btn xq-acc-btn' + (login && login.loggedIn ? ' xq-acc-on' : ''),
+        title: login && login.loggedIn ? '已登录：' + (login.screenName || login.uid || '') + '（点击管理）' : '可选：登录雪球后使用云端自选股',
+        'aria-label': login && login.loggedIn ? '账户：' + (login.screenName || '已登录') : '账户登录',
+        onClick: function () { setLoginMsg(null); setLoginOpen(true) }
+      }, [
+        accountIcon(),
+        el('span', { key: 't' }, login && login.loggedIn ? (login.screenName || '已登录') : '账户')
+      ]),
+      el('button', {
+        key: 'btn', className: 'xq-btn', disabled: loading, title: '刷新全部数据（行情 + 持仓/盈亏）',
+        'aria-label': '刷新全部数据',
+        onClick: function () {
+          setLoading(true)
+          // 持仓/盈亏视图一并刷新（refresh 内部已做并发去重，与后台轮询不会重复请求）；
+          // force=true 绕过行情 10 秒缓存，用户点了「刷新」就该看到新价。
+          const posRt = getPositionsRuntime()
+          Promise.all([refreshMarket(true), refreshContent(), posRt ? posRt.refresh(true) : Promise.resolve()]).then(function () { setLoading(false) }).catch(function () { setLoading(false) })
+        }
+      }, loading ? [el('span', { key: 's', className: 'xq-refresh-spin' }, '⟳'), ' 刷新中'] : '刷新')
+    ])
+  ])
 
   const errBox = err ? el('div', { className: 'xq-err' }, err) : null
   const alertBox = alertNotice.length ? el('div', { className: 'xq-alert-notice', role: 'status' }, [

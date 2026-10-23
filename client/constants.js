@@ -33,6 +33,7 @@ export const KOL_SIZE = 6                 // kol count
 export const SEARCH_STOCK_SIZE = 8        // search count
 export const SEARCH_POST_SIZE = 10        // searchPosts count
 export const BADGE_WATCH_LIMIT = 12       // 徽标主体最多展示的自选只数
+export const WATCHLIST_MAX = 200          // 面板订阅的自选上限（与宿主 watchlist 的 200 上限一致）
 
 // ---- 钳制常量 ----
 export const BADGE_W_MIN = 120            // 徽章宽下限（grip 拖动 / 水合宽度有效性判定）
@@ -59,6 +60,13 @@ export const POLL_CONTENT_CLOSED_MS = 180000 // 面板：休市热榜/快讯
 export const POLL_BADGE_MS = 30000           // 徽标
 export const POLL_TICKER_MS = 30000          // 底部指数条
 export const POLL_DOCK_SESSION_MS = 60000    // 面板头部交易时段文案重算
+// 自选列表读取节奏（客户端行情运行时）：宿主 watchlist.get 会触发 10 分钟节流的云端镜像同步，
+// 所以**必须**保留定期读取 —— 否则网页端增删自选后本页永远跟不上。这里统一 30 秒一次，
+// 且只在有自选消费者（面板/徽章）时读；无消费者时停表。
+export const WATCHLIST_POLL_MS = 30000
+// 软 TTL：同一 symbol 在这么短时间内已经取过就不再为「新挂载的组件」重复刷新。
+// 必须小于最快的行情周期（20s），否则会把用户的刷新节奏拖慢。
+export const MARKET_SOFT_TTL_MS = 5000
 // 今日盈亏（本地持仓 × 行情）：宿主回传的 next_poll_ms 缺失或过密时的兜底间隔（出错退避也用这个值）
 export const POSITIONS_POLL_FALLBACK_MS = 30000
 export const ALERT_POLL_MS = 30000

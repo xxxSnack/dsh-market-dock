@@ -14,6 +14,7 @@ import { el } from '../dom.js'
 import { colorOf } from '../format.js'
 import { call, A_PNL_VERIFY, A_PNL_CONFIG } from '../platform.js'
 import { usePositionsState, getPositionsRuntime } from '../store/positions.js'
+import { menuUpward } from '../menu.js'
 
 /** 金额：无符号 + 千分位 + 两位小数。 */
 function money(v) {
@@ -96,6 +97,40 @@ export function PositionsTab(p) {
   const [syncOpen, setSyncOpen] = React.useState(false)
   const [cookieDraft, setCookieDraft] = React.useState('')
   const [book, setBook] = React.useState(null)       // pnl.verify 的结果（凭据 / 组合 / 上次同步）
+  const [menuFor, setMenuFor] = React.useState('')   // 行内「更多」菜单：当前展开的代码（一次只开一个）
+  const [menuUp, setMenuUp] = React.useState(false)  // 向上展开（最后一行的下方没空间）
+
+  // 菜单的键盘/点击外部收起：只在有菜单展开时挂监听，避免常驻 document 监听。
+  React.useEffect(function () {
+    if (!menuFor) return function () { }
+    function onKey(e) { if (e.key === 'Escape') setMenuFor('') }
+    function onDown(e) {
+      const t = e && e.target
+      if (t && typeof t.closest === 'function' && t.closest('.xq-menu-wrap')) return
+      setMenuFor('')
+    }
+    // 持仓表在窄容器里是横向滚动容器（另一个轴也会被算成裁剪轴）：滚动后落点失效，直接收起
+    function onScroll() { setMenuFor('') }
+    try {
+      window.addEventListener('keydown', onKey)
+      document.addEventListener('pointerdown', onDown, true)
+      document.addEventListener('scroll', onScroll, true)
+    } catch (e) { /* 无 DOM 时忽略 */ }
+    return function () {
+      try {
+        window.removeEventListener('keydown', onKey)
+        document.removeEventListener('pointerdown', onDown, true)
+        document.removeEventListener('scroll', onScroll, true)
+      } catch (e) { /* ignore */ }
+    }
+  }, [menuFor])
+
+  function toggleMenu(code, e) {
+    if (menuFor === code) { setMenuFor(''); return }
+    // 表格会裁剪绝对定位的子元素：最后一行的菜单向下展开会被切掉 → 按剩余空间翻向
+    setMenuUp(menuUpward(e && e.currentTarget ? e.currentTarget : null, 0))
+    setMenuFor(code)
+  }
 
   // 打开同步区时才去校验凭据（不打开就一次账本请求都不发 —— 连校验都不做）
   React.useEffect(function () {
@@ -208,20 +243,32 @@ export function PositionsTab(p) {
     return (Number(b.value) || 0) - (Number(a.value) || 0)
   })
 
-  // ---- 合计 ----
-  const stats = [
-    ['今日盈亏', data.rows.length ? signedMoney(totals.day_profit) : '--', data.rows.length ? rateText(totals.day_rate) : '',
-      data.rows.length ? totals.day_profit : null],
-    ['持仓盈亏', rows.length ? signedMoney(totals.hold_profit) : '--', rows.length ? rateText(totals.hold_rate) : '', rows.length ? totals.hold_profit : null],
-    ['持仓市值', rows.length ? money(totals.value) : '--', '', null],
-    ['持仓成本', rows.length ? money(totals.cost_value) : '--', '', null],
-  ].map(function (it, i) {
-    const cls = it[3] === null || it[3] === undefined ? '' : (colorOf(it[3]) || '')
-    return el('div', { key: 's' + i, className: 'xq-stat' }, [
-      el('div', { key: 'k', className: 'xq-stat-k' }, it[0]),
-      el('div', { key: 'v', className: 'xq-pos-num ' + cls }, it[2] ? (it[1] + ' ' + it[2]) : it[1])
+  // ---- 合计（视觉重点：今日盈亏 / 持仓盈亏两项突出，市值与成本放右侧辅助区）----
+  const heroItem = function (key, label, amount, rate, value) {
+    const cls = (value === null || value === undefined) ? '' : (colorOf(value) || '')
+    return el('div', { key: key, className: 'xq-pos-hero-main' }, [
+      el('div', { key: 'k', className: 'xq-pos-hero-k' }, label),
+      el('div', { key: 'v', className: 'xq-pos-hero-amt ' + cls }, [
+        el('span', { key: 'a' }, amount),
+        rate ? el('span', { key: 'p', className: 'xq-pos-hero-pct' }, rate) : null
+      ])
     ])
-  })
+  }
+  const hasRows = data.rows.length > 0
+  const hero = el('div', { key: 'hero', className: 'xq-pos-hero' }, [
+    heroItem('day', '今日盈亏', hasRows ? signedMoney(totals.day_profit) : '--', hasRows ? rateText(totals.day_rate) : '', hasRows ? totals.day_profit : null),
+    heroItem('hold', '持仓盈亏', rows.length ? signedMoney(totals.hold_profit) : '--', rows.length ? rateText(totals.hold_rate) : '', rows.length ? totals.hold_profit : null),
+    el('div', { key: 'aux', className: 'xq-pos-hero-aux' }, [
+      el('div', { key: 'm' }, [
+        el('span', { key: 'k', className: 'xq-pos-aux-k' }, '持仓市值 '),
+        el('span', { key: 'v', className: 'xq-pos-aux-v' }, rows.length ? money(totals.value) : '--')
+      ]),
+      el('div', { key: 'c' }, [
+        el('span', { key: 'k', className: 'xq-pos-aux-k' }, '持仓成本 '),
+        el('span', { key: 'v', className: 'xq-pos-aux-v' }, rows.length ? money(totals.cost_value) : '--')
+      ])
+    ])
+  ])
 
   // ---- 表单（新增 / 编辑共用）----
   function field(key, label, placeholder, type) {
@@ -271,6 +318,7 @@ export function PositionsTab(p) {
     let dayTitle = '当日盈亏 / 当日涨跌幅 =（现价 − 昨收）× 股数'
     if (row.prev_close !== null && row.prev_close !== undefined) dayTitle += '；昨收 ' + priceText(row.prev_close)
     if (row.xq_symbol) dayTitle += '\n行情代码 ' + row.xq_symbol
+    const menuOpen = menuFor === row.code
     return el('div', { key: 'r' + row.code, className: 'xq-pos-grid xq-pos-row' + (cleared ? ' xq-pos-cleared' : '') }, [
       el('span', { key: 'n', className: 'xq-pos-name' }, [
         el('span', { key: 'nm', className: 'xq-pos-nm', title: row.name || row.code }, row.name || row.code || '—'),
@@ -288,7 +336,20 @@ export function PositionsTab(p) {
       el('span', { key: 'y', className: 'xq-pos-cell' }, changeCell(row.hold_profit, row.hold_rate, !cleared, '持仓盈亏 / 持仓收益率（相对成本价）')),
       el('span', { key: 'o', className: 'xq-pos-r xq-pos-ops' }, [
         el('button', { key: 'e', className: 'xq-btn-mini', disabled: busy, onClick: function () { openEdit(row) } }, '编辑'),
-        el('button', { key: 'x', className: 'xq-btn-mini', disabled: busy, onClick: function () { removeRow(row) } }, '删除')
+        // 破坏性操作收进「更多」菜单；菜单可用键盘打开（Enter/空格），Esc 或点外部关闭。
+        el('span', { key: 'm', className: 'xq-menu-wrap' }, [
+          el('button', {
+            key: 'mb', className: 'xq-btn-mini xq-icon-btn', disabled: busy,
+            title: '更多操作', 'aria-label': '更多操作', 'aria-haspopup': 'menu', 'aria-expanded': menuOpen ? 'true' : 'false',
+            onClick: function (e) { e.stopPropagation(); toggleMenu(row.code, e) }
+          }, '⋯'),
+          menuOpen ? el('div', { key: 'mu', className: 'xq-menu' + (menuUp ? ' xq-menu-up' : ''), role: 'menu' }, [
+            el('button', {
+              key: 'del', className: 'xq-menu-item xq-danger', role: 'menuitem',
+              onClick: function (e) { e.stopPropagation(); setMenuFor(''); removeRow(row) }
+            }, '删除持仓')
+          ]) : null
+        ])
       ])
     ])
   })
@@ -335,21 +396,19 @@ export function PositionsTab(p) {
 
   const headLine = el('div', { key: 'hl', className: 'xq-pos-head' }, [
     el('span', { key: 't', className: 'xq-pos-title' },
-      '共 ' + rows.length + ' 只' + (data.updated_at ? ' · 本地数据 ' + stampText(data.updated_at) : '')),
+      '持仓 ' + rows.length + ' 只' + (data.updated_at ? ' · 本地更新 ' + stampText(data.updated_at) : '')),
     el('span', { key: 'sp', className: 'xq-spacer' }),
-    el('button', { key: 'add', className: 'xq-btn-mini', disabled: busy, onClick: openAdd }, '＋ 添加持仓'),
-    el('button', { key: 'syn', className: 'xq-btn-mini', onClick: function () { setSyncOpen(!syncOpen) } }, syncOpen ? '收起同步区' : '从账本同步'),
-    el('button', { key: 'rf', className: 'xq-btn-mini', disabled: busy, onClick: refreshNow }, busy ? '刷新中…' : '刷新行情')
+    // 「添加持仓」是页面主操作，同步/刷新为次级
+    el('button', { key: 'add', className: 'xq-btn xq-btn-primary', disabled: busy, onClick: openAdd }, '＋ 添加持仓'),
+    el('button', { key: 'syn', className: 'xq-btn xq-btn-quiet', onClick: function () { setSyncOpen(!syncOpen) }, 'aria-expanded': syncOpen ? 'true' : 'false' }, syncOpen ? '收起同步' : '账本同步'),
+    el('button', { key: 'rf', className: 'xq-btn xq-btn-quiet', disabled: busy, onClick: refreshNow }, busy ? '刷新中…' : '刷新行情')
   ])
 
   const dayMissing = rows.length > 0 && rows.every(function (r) { return r.day_profit === null || r.day_profit === undefined })
 
+  // 口径说明：默认一行摘要，展开可读完整说明（触屏/键盘都能读，不藏在 tooltip 里）
   const notes = [
-    el('div', { key: 'n1', className: 'xq-pnl-note' },
-      '持仓是本地数据（可增删改）；股数 × 成本价就是「输入」，现价 / 当日盈亏 / 持仓盈亏全部由雪球行情现算，不落盘。'),
-    el('div', { key: 'n2', className: 'xq-pnl-note' },
-      '当日盈亏 =（现价 − 昨收）× 股数；持仓盈亏 =（现价 − 成本价）× 股数。合计按逐行取整后相加，' +
-      '所以和表格里每一行的数字对得上。')
+    el('div', { key: 'n1', className: 'xq-pnl-note' }, '价格与盈亏由雪球行情现算，不落盘；合计按逐行取整后相加。')
   ]
   if (dayMissing) {
     notes.push(el('div', { key: 'nq', className: 'xq-pos-hint' }, '当日盈亏暂不可用（雪球行情取数失败），其余字段不受影响'))
@@ -357,11 +416,18 @@ export function PositionsTab(p) {
   if (msg) notes.unshift(el('div', { key: 'm', className: msg.ok ? 'xq-pnl-ok' : 'xq-err' }, (msg.ok ? '✓ ' : '✗ ') + msg.text))
   if (rows.length === 0 && !formEl) {
     notes.unshift(el('div', { key: 'n0', className: 'xq-loading' },
-      '还没有持仓：点「＋ 添加持仓」手工录入，或展开「从账本同步」拉一次账本。'))
+      '还没有持仓：点「＋ 添加持仓」手工录入，或展开「账本同步」拉一次账本。'))
   }
+  notes.push(el('details', { key: 'n2', className: 'xq-pos-notes-details' }, [
+    el('summary', { key: 's', className: 'xq-pnl-note' }, '口径说明'),
+    el('div', { key: 'b', className: 'xq-pnl-note' },
+      '持仓是本地数据（可增删改）；股数 × 成本价就是「输入」，现价 / 当日盈亏 / 持仓盈亏全部由雪球行情现算，不落盘。'),
+    el('div', { key: 'c', className: 'xq-pnl-note' },
+      '当日盈亏 =（现价 − 昨收）× 股数；持仓盈亏 =（现价 − 成本价）× 股数。合计按逐行取整后相加，所以和表格里每一行的数字对得上。')
+  ]))
 
   return el('div', null, [
-    el('div', { key: 'stats', className: 'xq-pos-stats' }, stats),
+    hero,
     headLine,
     formEl,
     el('div', { key: 'tbl', className: 'xq-pos-table' }, [head].concat(body)),

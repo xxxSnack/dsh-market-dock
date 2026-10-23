@@ -36,6 +36,19 @@ export function createPositionsRuntime(ctx) {
     return ms
   }
 
+  // 宿主每次成功修改持仓都会把视图 revision +1。客户端据此丢弃「编辑前发出、编辑后才到」的旧响应：
+  // 自动刷新挂起 → 用户改股数 → 旧刷新返回，界面不能回退成旧股数。
+  function revOf(data) {
+    const rev = Number(data && data.revision)
+    return isFinite(rev) ? rev : -1
+  }
+  function stale(incoming) {
+    if (!rt.data) return false
+    const cur = revOf(rt.data)
+    const next = revOf(incoming)
+    return cur >= 0 && next >= 0 && next < cur
+  }
+
   const rt = {
     ctx: ctx,
     data: null,                    // 最近一次 positions.get 的返回对象（宿主现算的视图）
@@ -76,6 +89,8 @@ export function createPositionsRuntime(ctx) {
       if (rt.inflight) return rt.inflight
       if (rt.data === null) { rt.status = 'loading'; rt.notify() }
       const p = call(A_POSITIONS_GET, force ? { force: true } : {}).then(function (data) {
+        // 编辑成功之后才到的旧刷新：丢弃，界面保持修改后的视图（不回退成旧股数）
+        if (stale(data)) { rt.inflight = null; return rt.data }
         rt.data = data || null
         rt.status = 'ready'
         rt.error = ''
@@ -98,6 +113,8 @@ export function createPositionsRuntime(ctx) {
       const args = { row: row }
       if (originalCode) args.originalCode = originalCode
       return call(A_POSITIONS_SAVE, args).then(function (data) {
+        // 编辑结果永远采用（它是最新一版）；宿主 revision 让在途旧刷新作废
+        if (stale(data)) return rt.data
         rt.data = data
         rt.status = 'ready'
         rt.error = ''
@@ -107,6 +124,7 @@ export function createPositionsRuntime(ctx) {
     },
     remove: function (code) {
       return call(A_POSITIONS_REMOVE, { code: code }).then(function (data) {
+        if (stale(data)) return rt.data
         rt.data = data
         rt.status = 'ready'
         rt.error = ''
@@ -119,7 +137,7 @@ export function createPositionsRuntime(ctx) {
     // 返回 { ok, report, error, view }；失败时 view 仍是最新本地视图（持仓不受影响）。
     sync: function (mode) {
       return call(A_POSITIONS_SYNC, mode ? { mode: mode } : {}).then(function (res) {
-        if (res && res.view) {
+        if (res && res.view && !stale(res.view)) {
           rt.data = res.view
           rt.status = 'ready'
           rt.notify()

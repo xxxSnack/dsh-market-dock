@@ -126,7 +126,9 @@ if (pkgJsonPath) {
       '应用级幂等水合': s.includes('function hydrateUi()'),
       'MiniBadge 触发水合': s.includes('hydrateUi()   //'),
       'PNL 前台恢复立即轮询': s.includes('function onVisibility()') && s.includes("document.addEventListener('visibilitychange', onVisibility)"),
-      '行情响应序列防护': s.includes('marketSeq.current') && s.includes('refreshSeq.current') && s.includes('requestSeq.current'),
+      // 序列防护已从「每个组件各记一份 requestSeq」收敛到页面内共享行情运行时（store/market.js），
+      // 且判定粒度是**逐 symbol**（全局序号会误丢互不相交的请求，见 [7] 回归用例）
+      '行情响应序列防护': s.includes('reqSeq') && s.includes('prev.seq > my') && s.includes('逐 symbol'),
       '详情驻留刷新': s.includes('详情驻留期间也要更新报价/分时') && s.includes('force: true'),
     }
     for (const [k, v] of Object.entries(marks)) {

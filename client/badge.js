@@ -6,7 +6,7 @@ import { fmt, fmtPct, colorOf } from './format.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
 import { ensureAlertPermission } from './store/alerts-watch.js'
 import { RestorePill } from './restore.js'
-import { fetchQuote, fetchWatchlist } from './store/market.js'
+import { getMarketRuntime } from './store/market.js'
 import { BADGE_WATCH_LIMIT, BADGE_W_MIN, BADGE_W_MAX, BADGE_W_DEFAULT, BADGE_DRAG_THRESHOLD, EDGE_GAP, VIEWPORT_FALLBACK_W, VIEWPORT_FALLBACK_H, POLL_BADGE_MS } from './constants.js'
 
 // ---------- 迷你悬浮徽章（shell.overlay）：可拖动、右下角手柄调宽度 ----------
@@ -31,30 +31,18 @@ function MiniBadgeBody() {
   const rt = getUiRuntime()
   const ui = rt.ui
   const [top, setTop] = React.useState([])
-  const refreshSeq = React.useRef(0)
 
+  // 自选 + 前 12 只行情都走页面内共享运行时：不再自己 interval、不再各自读 watchlist.get。
+  // 「前 12 只」由订阅的 watchlistLimit 表达，自选增删后运行时自动跟着变。
   React.useEffect(function () {
-    let alive = true
-    function refresh() {
-      const my = ++refreshSeq.current
-      // 徽章只展示标题与自选行情；行情请求不因页面隐藏而停止。
-      fetchWatchlist().then(function (wl) {
-        if (!alive || refreshSeq.current !== my) return
-        const symbols = ((wl && wl.symbols) || []).slice(0, BADGE_WATCH_LIMIT)
-        if (!symbols.length) { setTop([]); return }
-        return fetchQuote(symbols).then(function (data) {
-          if (alive && refreshSeq.current === my) setTop((data && data.list) || [])
-        })
-      }).catch(function () { /* 静默失败：保留上一轮行情 */ })
+    const mkt = getMarketRuntime()
+    if (!mkt) return function () { }
+    function sync() {
+      const symbols = (mkt.getWatchlist() || []).slice(0, BADGE_WATCH_LIMIT)
+      setTop(mkt.getSnapshot(symbols).list)
     }
-    function onVis() { refresh() }
-    refresh()
-    const stop = rt.ctx.interval(refresh, POLL_BADGE_MS)
-    try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-    return function () {
-      alive = false; if (stop) stop()
-      try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-    }
+    sync()
+    return mkt.subscribe({ watchlistLimit: BADGE_WATCH_LIMIT, needsWatchlist: true, intervalMs: POLL_BADGE_MS }, sync)
   }, [])
 
   // 挂载后与视口变化时按真实渲染尺寸钳制徽标位置：
@@ -181,6 +169,11 @@ function MiniBadgeBody() {
   const wide = true
   const compact = ui.badgeCompact === true
   const effW = (ui.badgeW !== null && ui.badgeW !== undefined) ? ui.badgeW : BADGE_W_DEFAULT
+  // 宽度分档在 JS 里算（不能用容器查询：容器查询会把 fixed + width:auto 的胶囊宽度算成 0，
+  // 整块塌成 padding 宽，文字全飘在外面）。徽章是 content-box，inline 的 badgeW 就是内容宽度。
+  const contentW = Math.max(0, Number(effW) || 0)
+  const tight = !compact && contentW < 300   // 两列已放不下（名称 + 价格 + 涨跌幅）→ 单列
+  const tiny = !compact && contentW < 170    // 极窄 → 让出交易状态，只留品牌与按钮
   // 区域模式：前 12 只全部平铺（换行）；单行模式：轮动页（页码指示）
   function wItem(q) {
     return el('span', { key: 'w-' + q.symbol, className: 'xq-witem', title: (q.name || q.symbol) + ' ' + fmt(q.current) + (q.percent !== undefined ? '  ' + fmtPct(q.percent) : '') }, [
@@ -241,7 +234,7 @@ function MiniBadgeBody() {
   }
   const badgeEl = el('div', {
     ref: badgeRef,
-    className: 'xq-badge' + (compact ? ' xq-badge-compact' : ''),
+    className: 'xq-badge' + (compact ? ' xq-badge-compact' : '') + (tight ? ' xq-tight' : '') + (tiny ? ' xq-tiny' : ''),
     style: style,
     title: compact ? '点击胶囊恢复行情列表 · 拖动调整位置' : '点击开合行情面板 · 拖动调整位置 · 右下角 ⤡ 调宽度（双击复位）',
     onPointerDown: onDown, onPointerMove: onMove, onPointerUp: onUp, onPointerCancel: onCancel

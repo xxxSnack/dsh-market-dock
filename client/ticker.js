@@ -5,9 +5,9 @@
 import { el } from './dom.js'
 import { fmt, fmtPct, colorOf } from './format.js'
 import { getUiRuntime, hydrateUi } from './store/ui.js'
-import { fetchIndices } from './store/market.js'
+import { getMarketRuntime } from './store/market.js'
 import { PnlChip, usePnlState } from './panel/pnl.js'
-import { POLL_TICKER_MS } from './constants.js'
+import { XQ_INDEX_SYMBOLS, POLL_TICKER_MS } from './constants.js'
 
 // ---------- 独占一行：宿主那条 .dock 是「不换行的 flex 行」 ----------
 // 指数条注册在 conversation.composer.dock，宿主把它铺在输入框下方那条 .dock 行里
@@ -118,25 +118,15 @@ function TickerBody() {
   const ui = rt.ui
   const [indices, setIndices] = React.useState([])
   const pnl = usePnlState()
-  const requestSeq = React.useRef(0)
   const rootRef = React.useRef(null)
+  // 指数行情走页面内共享运行时：与面板指数卡共用同一份数据/同一个请求，
+  // 指数条不再自己 interval（改造前它与面板各刷一遍同一组指数）。
   React.useEffect(function () {
-    let alive = true
-    function refresh() {
-      // 底部行情条持续读取，隐藏页的浏览器 timer 可能仍被节流。
-      const my = ++requestSeq.current
-      fetchIndices().then(function (data) {
-        if (alive && requestSeq.current === my) setIndices((data && data.list) || [])
-      }).catch(function () { /* 静默失败 */ })
-    }
-    function onVis() { refresh() }
-    refresh()
-    const stop = rt.ctx.interval(refresh, POLL_TICKER_MS)
-    try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-    return function () {
-      alive = false; if (stop) stop()
-      try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-    }
+    const mkt = getMarketRuntime()
+    if (!mkt) return function () { }
+    function sync() { setIndices(mkt.getSnapshot(XQ_INDEX_SYMBOLS).list) }
+    sync()
+    return mkt.subscribe({ symbols: XQ_INDEX_SYMBOLS, intervalMs: POLL_TICKER_MS }, sync)
   }, [])
   // 指数拉不到时不再整条消失：只要盈亏还有东西可说，这一行就有意义。
   const showPnl = pnl.data !== null || pnl.status === 'loading' || pnl.status === 'error'

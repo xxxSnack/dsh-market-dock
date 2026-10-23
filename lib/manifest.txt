@@ -7,6 +7,7 @@ cache.js          # URL 工具 enc/toQuery + TTL 缓存 + in-flight 去重（装
 gate.js           # 请求调度闸门：并发 2 / 最小间隔 / 30s 看门狗（装到 core）
 shell.js          # 纯函数：shell 前台执行的跨版本兼容层（run → execute+result）
 http.js           # classifyError + curl / ensureCookie / getJSON（含重试链，装到 core）
+quotes.js         # 共享行情服务：按 symbol 缓存 + 短窗口合批 + per-symbol 在途共享（装到 core）
 state.js          # 状态文件落点：稳定目录优先、工作区回退、旧路径回读（装到 core）
 login.js          # 可选登录：Cookie 解析/落盘/云端自选读写与迁移（装到 core）
 watchlist.js      # 本地自选表 + 云端为准的后台自动同步（装到 core）

@@ -270,10 +270,16 @@ section('3. positions.json 只存输入字段')
 /* ---------------- 4. 改股数 / 改代码 / 重名 / 删除 ---------------- */
 section('4. 编辑：改股数、改代码、重名拒绝、删除')
 {
+  const before = await data('positions.get', {})
   const up = await data('positions.save', { row: { code: '600519', qty: 200, cost: 1201.3 }, originalCode: '600519' })
   check('改股数后 1 行（不新增）', up.rows.length === 1, JSON.stringify(up.rows.map(r => r.code)))
   check('股数 200、当日盈亏随之翻倍', up.rows[0].qty === 200 && up.rows[0].day_profit === 10932, JSON.stringify(up.rows[0]))
   check('写盘也是 200', readPos().rows[0].qty === 200, String(readPos().rows[0].qty))
+  // 旧视图保护：成功修改后 revision 递增，客户端据此丢弃「编辑前发出、编辑后才到」的刷新
+  check('视图带 revision 字段（数字）', typeof up.revision === 'number', String(up.revision))
+  check('成功修改后 revision 递增', up.revision > before.revision, 'before=' + before.revision + ' after=' + up.revision)
+  const again = await data('positions.get', {})
+  check('紧接着的读取不是编辑前那一版（revision 不回退）', again.revision >= up.revision && again.rows[0].qty === 200, 'rev=' + again.revision + ' qty=' + again.rows[0].qty)
 
   // 名称：用户填的优先，不被行情覆盖
   const named = await data('positions.save', { row: { code: '600519', name: '茅台(自定义)', qty: 200, cost: 1201.3 } })
